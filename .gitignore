@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python bytecode (the Hermes plugin)
+__pycache__/
+*.pyc
+
+# Local runtime / secrets
+.parler/
+*.creds
+*.seed
+
+# Scratch (reference clone, downloaded binaries) — also gitignored by the workspace
+.context/
+
+# Personal learning notes (not part of the project)
+/COTAL-ARCHITECTURE.md
+
+.DS_Store
