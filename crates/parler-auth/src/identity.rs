@@ -5,7 +5,7 @@
 //! goes on the wire and is folded into a creds file the endpoint loads to authenticate as this id.
 
 use crate::error::AuthError;
-use data_encoding::BASE64URL_NOPAD;
+use data_encoding::{BASE64, BASE64URL_NOPAD};
 use nkeys::KeyPair;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,28 @@ pub fn new_identity() -> Result<Identity, AuthError> {
         id: kp.public_key(),
         seed,
     })
+}
+
+/// Sign `msg` with an nkey `seed` (`SU…`), returning the base64 (standard) Ed25519 signature.
+///
+/// Used to self-sign an agent's discovery card: the signature is verifiable against the agent's id
+/// (its public key), so a hub that stores the card cannot forge or tamper with it.
+pub fn sign(seed: &str, msg: &[u8]) -> Result<String, AuthError> {
+    let kp = KeyPair::from_seed(seed).map_err(|e| AuthError::Nkeys(e.to_string()))?;
+    let sig = kp.sign(msg).map_err(|e| AuthError::Nkeys(e.to_string()))?;
+    Ok(BASE64.encode(&sig))
+}
+
+/// Verify a base64 Ed25519 signature over `msg` against an nkey public key `id` (`U…`).
+/// Returns `false` for a bad key, malformed signature, or a verification mismatch (never errors).
+pub fn verify(id: &str, msg: &[u8], sig_b64: &str) -> bool {
+    let Ok(kp) = KeyPair::from_public_key(id) else {
+        return false;
+    };
+    let Ok(sig) = BASE64.decode(sig_b64.as_bytes()) else {
+        return false;
+    };
+    kp.verify(msg, &sig).is_ok()
 }
 
 /// The stable id carried by a creds file: the agent's nkey public key, derived from the seed block
@@ -77,5 +99,16 @@ mod tests {
         // The seed re-derives the same public key.
         let kp = KeyPair::from_seed(&id.seed).unwrap();
         assert_eq!(kp.public_key(), id.id);
+    }
+
+    #[test]
+    fn sign_verify_round_trips_and_rejects_tampering() {
+        let id = new_identity().unwrap();
+        let sig = sign(&id.seed, b"card-bytes").unwrap();
+        assert!(verify(&id.id, b"card-bytes", &sig));
+        // A different message, a different signer, or a garbled signature all fail closed.
+        assert!(!verify(&id.id, b"tampered", &sig));
+        assert!(!verify(&new_identity().unwrap().id, b"card-bytes", &sig));
+        assert!(!verify(&id.id, b"card-bytes", "not-base64!!"));
     }
 }

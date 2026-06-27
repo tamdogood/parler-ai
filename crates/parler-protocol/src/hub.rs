@@ -6,7 +6,7 @@
 //! client and the server share one definition of the protocol. JSON field names that are multi-word
 //! are camelCase to match the rest of the Parler envelope.
 
-use crate::types::{EndpointRef, Part};
+use crate::types::{AgentCard, EndpointRef, Part};
 use serde::{Deserialize, Serialize};
 
 /// What kind of room a name refers to. The three delivery patterns are all just rooms with
@@ -37,6 +37,75 @@ impl RoomKind {
             _ => None,
         }
     }
+}
+
+/// Who may discover an agent in the hub's directory. **Secure by default:** an agent is
+/// [`Visibility::Private`] unless it explicitly opts into [`Visibility::Public`].
+///
+/// - [`Visibility::Public`] — listed in the hub's world-readable public directory; discoverable by
+///   any agent (and by anyone hitting the public REST API).
+/// - [`Visibility::Private`] — discoverable only by agents in the **same hub** (an authenticated
+///   member, or a holder of a read-scoped directory token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Public,
+    #[default]
+    Private,
+}
+
+impl Visibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Visibility::Public),
+            "private" => Some(Visibility::Private),
+            _ => None,
+        }
+    }
+}
+
+/// The scope of a [`ClientFrame::Discover`] query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoverScope {
+    /// Every agent in this hub (public + private) — the "same private hub" view. Available to any
+    /// authenticated member.
+    #[default]
+    Hub,
+    /// Only this hub's `public` agents — the world-readable directory.
+    Public,
+}
+
+/// A directory record as the hub returns it on [`ServerFrame::Directory`] / [`ServerFrame::Card`].
+///
+/// The `card` is the agent's self-described [`AgentCard`]; `sig` is the agent's detached nkey
+/// signature over [`canonical_card_bytes`] of that card. Because an agent's `id` *is* its public
+/// key, any consumer can verify `sig` and know the hub did not forge or alter the card — `verified`
+/// is the hub's own check of exactly that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub card: AgentCard,
+    pub visibility: Visibility,
+    /// Last-known presence status (`idle`/`working`/`waiting`/`offline`).
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// The hub (workspace) this agent registered in.
+    pub hub: String,
+    /// Whether the hub verified `sig` against `card.id` at registration.
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+    #[serde(rename = "firstSeen")]
+    pub first_seen: i64,
+    #[serde(rename = "lastSeen")]
+    pub last_seen: i64,
 }
 
 /// Where a [`ClientFrame::Send`] is addressed. The hub resolves each to the concrete room it stores
@@ -148,6 +217,41 @@ pub enum ClientFrame {
     Redeem { code: String },
     /// Join/create a service room as a worker, so `Send`/`Pull` on it are authorized.
     Serve { service: String },
+    /// Publish (or refresh) this agent's directory card. `card.id` must equal the authenticated
+    /// agent id; `sig` is the agent's nkey signature over [`canonical_card_bytes`] of `card`, which
+    /// the hub verifies so the stored entry is tamper-evident.
+    Register {
+        card: AgentCard,
+        #[serde(default)]
+        visibility: Visibility,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
+    },
+    /// Search the directory. [`DiscoverScope::Hub`] returns every agent in this hub;
+    /// [`DiscoverScope::Public`] returns only its `public` agents. Optional `query`/`tag`/`skill`/
+    /// `status` narrow the result.
+    Discover {
+        #[serde(default)]
+        scope: DiscoverScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Fetch a single agent's directory card by id.
+    Lookup { id: String },
+    /// Mint a read-scoped, expiring directory token (a bearer the website pastes to view this hub's
+    /// private directory over the REST API).
+    MintDirectoryToken {
+        #[serde(default, rename = "ttlSecs", skip_serializing_if = "Option::is_none")]
+        ttl_secs: Option<u64>,
+    },
     /// Publish a message to a target.
     Send {
         target: Target,
@@ -210,6 +314,23 @@ pub enum ServerFrame {
         room: String,
         kind: RoomKind,
     },
+    Registered {
+        id: String,
+        visibility: Visibility,
+        verified: bool,
+    },
+    Directory {
+        agents: Vec<DirectoryEntry>,
+    },
+    Card {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<DirectoryEntry>,
+    },
+    DirectoryToken {
+        token: String,
+        #[serde(rename = "expiresAt")]
+        expires_at: i64,
+    },
     Sent {
         id: String,
         seq: i64,
@@ -240,9 +361,143 @@ pub enum ServerFrame {
     },
 }
 
+/// The canonical byte encoding of an [`AgentCard`] for signing/verification.
+///
+/// Produces a deterministic, whitespace-free JSON with **recursively key-sorted** objects (an
+/// RFC 8785 / JCS-style canonical form, robust even if `serde_json` is built with `preserve_order`).
+/// Both the signer (the agent) and the verifier (the hub, or any client) feed these exact bytes to
+/// the nkey sign/verify so a card cannot be silently altered after signing.
+pub fn canonical_card_bytes(card: &AgentCard) -> Vec<u8> {
+    let v = serde_json::to_value(card).unwrap_or(serde_json::Value::Null);
+    serde_json::to_vec(&canonicalize(&v)).unwrap_or_default()
+}
+
+/// Recursively rebuild a JSON value with object keys in sorted order.
+fn canonicalize(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::with_capacity(m.len());
+            for k in keys {
+                sorted.insert(k.clone(), canonicalize(&m[k]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(canonicalize).collect()),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AgentSkill, EndpointKind};
+    use std::collections::BTreeMap;
+
+    fn sample_card() -> AgentCard {
+        let mut meta = BTreeMap::new();
+        meta.insert("zone".to_string(), serde_json::json!("us-east"));
+        meta.insert("region".to_string(), serde_json::json!("global"));
+        AgentCard {
+            id: "UABC".into(),
+            name: "alice".into(),
+            kind: EndpointKind::Agent,
+            role: Some("planner".into()),
+            description: Some("plans things".into()),
+            tags: Some(vec!["planning".into(), "ops".into()]),
+            skills: Some(vec![AgentSkill {
+                id: "plan".into(),
+                name: "Planning".into(),
+                description: None,
+            }]),
+            meta: Some(meta),
+            protocol_version: Some("0.2".into()),
+        }
+    }
+
+    #[test]
+    fn canonical_card_bytes_is_deterministic_and_key_sorted() {
+        let card = sample_card();
+        let a = canonical_card_bytes(&card);
+        let b = canonical_card_bytes(&card.clone());
+        assert_eq!(a, b, "canonicalization must be stable");
+        let s = String::from_utf8(a).unwrap();
+        // Object keys are sorted: `description` precedes `id` precedes `name`; nested meta `region`
+        // precedes `zone`. And there is no insignificant whitespace.
+        assert!(s.find("\"description\"").unwrap() < s.find("\"id\"").unwrap());
+        assert!(s.find("\"region\"").unwrap() < s.find("\"zone\"").unwrap());
+        assert!(!s.contains(": "));
+    }
+
+    #[test]
+    fn directory_entry_round_trips_camelcase() {
+        let entry = DirectoryEntry {
+            card: sample_card(),
+            visibility: Visibility::Public,
+            status: "working".into(),
+            activity: Some("planning the sprint".into()),
+            hub: "Parler Public".into(),
+            verified: true,
+            sig: Some("AAAA".into()),
+            first_seen: 10,
+            last_seen: 20,
+        };
+        let j = serde_json::to_value(&entry).unwrap();
+        assert_eq!(j["visibility"], "public");
+        assert_eq!(j["verified"], true);
+        assert_eq!(j["firstSeen"], 10);
+        assert_eq!(j["lastSeen"], 20);
+        assert_eq!(j["card"]["id"], "UABC");
+        let back: DirectoryEntry = serde_json::from_value(j).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn discovery_frames_round_trip() {
+        let reg = ClientFrame::Register {
+            card: sample_card(),
+            visibility: Visibility::Public,
+            sig: Some("SIG".into()),
+        };
+        let j = serde_json::to_value(&reg).unwrap();
+        assert_eq!(j["op"], "register");
+        assert_eq!(j["visibility"], "public");
+        assert_eq!(serde_json::from_value::<ClientFrame>(j).unwrap(), reg);
+
+        let disc = ClientFrame::Discover {
+            scope: DiscoverScope::Public,
+            query: Some("plan".into()),
+            tag: None,
+            skill: Some("review".into()),
+            status: None,
+            limit: Some(20),
+        };
+        let j = serde_json::to_value(&disc).unwrap();
+        assert_eq!(j["op"], "discover");
+        assert_eq!(j["scope"], "public");
+        assert_eq!(serde_json::from_value::<ClientFrame>(j).unwrap(), disc);
+    }
+
+    #[test]
+    fn visibility_defaults_to_private() {
+        assert_eq!(Visibility::default(), Visibility::Private);
+        // An absent `visibility`/`scope` deserializes to the secure-by-default values.
+        let reg: ClientFrame =
+            serde_json::from_value(serde_json::json!({"op":"register","card":sample_card()}))
+                .unwrap();
+        match reg {
+            ClientFrame::Register { visibility, .. } => assert_eq!(visibility, Visibility::Private),
+            _ => panic!("expected register"),
+        }
+        let disc: ClientFrame =
+            serde_json::from_value(serde_json::json!({"op":"discover"})).unwrap();
+        match disc {
+            ClientFrame::Discover { scope, .. } => assert_eq!(scope, DiscoverScope::Hub),
+            _ => panic!("expected discover"),
+        }
+    }
 
     #[test]
     fn client_frame_round_trips_with_op_tag() {

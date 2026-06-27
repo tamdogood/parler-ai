@@ -6,9 +6,11 @@
 
 use crate::{Config, HubClient, MeshTransport};
 use anyhow::{bail, Result};
+use parler_auth::Identity;
 use parler_protocol::{
-    ClientFrame, Fact, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, ServerFrame, StoredMessage,
-    Target,
+    canonical_card_bytes, AgentCard, AgentSkill, ClientFrame, DirectoryEntry, DiscoverScope,
+    EndpointKind, Fact, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, ServerFrame,
+    StoredMessage, Target, Visibility,
 };
 
 /// A freshly minted invite — the code/link the human pastes to another agent.
@@ -27,6 +29,9 @@ pub struct MeshAgent {
     pub name: String,
     pub role: Option<String>,
     pub hub_url: String,
+    /// The local identity (nkey seed) — present when connected from a [`Config`]; required to sign a
+    /// discovery card in [`MeshAgent::register`].
+    identity: Option<Identity>,
 }
 
 impl MeshAgent {
@@ -40,10 +45,12 @@ impl MeshAgent {
             name: cfg.name.clone(),
             role: cfg.role.clone(),
             hub_url: cfg.hub_url.clone(),
+            identity: Some(cfg.identity.clone()),
         })
     }
 
-    /// Build an agent over any transport (used by tests with an in-process transport).
+    /// Build an agent over any transport (used by tests with an in-process transport). Without an
+    /// identity, [`MeshAgent::register`] is unavailable (nothing to sign the card with).
     pub fn with_transport(
         transport: Box<dyn MeshTransport>,
         id: String,
@@ -51,7 +58,7 @@ impl MeshAgent {
         role: Option<String>,
         hub_url: String,
     ) -> MeshAgent {
-        MeshAgent { transport, id, name, role, hub_url }
+        MeshAgent { transport, id, name, role, hub_url, identity: None }
     }
 
     /// Mint an invite. `kind` is `Dm` for a 1:1 hand-off, `Channel` for a group room, `Service` for
@@ -181,6 +188,80 @@ impl MeshAgent {
         {
             ServerFrame::PresenceOk => Ok(()),
             other => bail!("unexpected reply to presence: {other:?}"),
+        }
+    }
+
+    // ---- discovery ----
+
+    /// Publish (or refresh) this agent's directory card. Builds an [`AgentCard`] from the agent's
+    /// identity + the supplied `tags`/`skills`/`description`, **signs** its canonical bytes with the
+    /// local nkey seed, and registers it. Returns the stored `(visibility, verified)`.
+    pub async fn register(
+        &mut self,
+        visibility: Visibility,
+        tags: Vec<String>,
+        skills: Vec<AgentSkill>,
+        description: Option<String>,
+    ) -> Result<(Visibility, bool)> {
+        let identity = self.identity.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("no local identity to sign the card — connect from a Config")
+        })?;
+        let card = AgentCard {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            kind: EndpointKind::Agent,
+            role: self.role.clone(),
+            description,
+            tags: (!tags.is_empty()).then_some(tags),
+            skills: (!skills.is_empty()).then_some(skills),
+            meta: None,
+            protocol_version: Some(parler_protocol::PROTOCOL_VERSION.to_string()),
+        };
+        let sig = parler_auth::sign(&identity.seed, &canonical_card_bytes(&card))?;
+        match self
+            .transport
+            .request(ClientFrame::Register { card, visibility, sig: Some(sig) })
+            .await?
+        {
+            ServerFrame::Registered { visibility, verified, .. } => Ok((visibility, verified)),
+            other => bail!("unexpected reply to register: {other:?}"),
+        }
+    }
+
+    /// Search the hub's directory. [`DiscoverScope::Public`] returns only public agents;
+    /// [`DiscoverScope::Hub`] returns every agent in the hub.
+    pub async fn discover(
+        &mut self,
+        scope: DiscoverScope,
+        query: Option<String>,
+        tag: Option<String>,
+        skill: Option<String>,
+        status: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        match self
+            .transport
+            .request(ClientFrame::Discover { scope, query, tag, skill, status, limit })
+            .await?
+        {
+            ServerFrame::Directory { agents } => Ok(agents),
+            other => bail!("unexpected reply to discover: {other:?}"),
+        }
+    }
+
+    /// Fetch a single agent's directory card by id.
+    pub async fn lookup(&mut self, id: &str) -> Result<Option<DirectoryEntry>> {
+        match self.transport.request(ClientFrame::Lookup { id: id.to_string() }).await? {
+            ServerFrame::Card { entry } => Ok(entry),
+            other => bail!("unexpected reply to lookup: {other:?}"),
+        }
+    }
+
+    /// Mint a read-scoped, expiring directory token (paste into the website to view a private hub).
+    pub async fn mint_directory_token(&mut self, ttl_secs: Option<u64>) -> Result<(String, i64)> {
+        match self.transport.request(ClientFrame::MintDirectoryToken { ttl_secs }).await? {
+            ServerFrame::DirectoryToken { token, expires_at } => Ok((token, expires_at)),
+            other => bail!("unexpected reply to mint token: {other:?}"),
         }
     }
 }

@@ -18,7 +18,7 @@
 pub mod server;
 pub mod store;
 
-pub use server::{app, serve, HubState};
+pub use server::{app, serve, HubMode, HubState};
 pub use store::Store;
 
 use std::time::{SystemTime, UNIX_EPOCH};
