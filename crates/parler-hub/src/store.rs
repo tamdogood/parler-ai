@@ -7,8 +7,11 @@
 //! it directly.
 
 use anyhow::{anyhow, bail, Result};
-use parler_protocol::{EndpointRef, Fact, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, StoredMessage};
-use rusqlite::{params, Connection, OptionalExtension};
+use parler_protocol::{
+    AgentCard, DirectoryEntry, DiscoverScope, EndpointRef, Fact, Part, RecallHit, RoomInfo,
+    RoomKind, RosterEntry, StoredMessage, Visibility,
+};
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -94,7 +97,36 @@ CREATE TABLE IF NOT EXISTS invites (
   created_by TEXT NOT NULL,
   created    INTEGER NOT NULL
 );
+
+-- The discovery directory: one signed AgentCard per agent, plus denormalized tags/skills (lowercased,
+-- space-delimited) for cheap LIKE filtering. `registered` is the first publish; `updated` each refresh.
+CREATE TABLE IF NOT EXISTS directory (
+  agent      TEXT PRIMARY KEY,
+  visibility TEXT NOT NULL DEFAULT 'private',
+  card_json  TEXT NOT NULL,
+  card_sig   TEXT,
+  verified   INTEGER NOT NULL DEFAULT 0,
+  tags       TEXT NOT NULL DEFAULT '',
+  skills     TEXT NOT NULL DEFAULT '',
+  registered INTEGER NOT NULL,
+  updated    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_directory_visibility ON directory(visibility);
+
+-- Read-scoped, expiring bearer tokens that unlock a private hub's directory over the REST API.
+CREATE TABLE IF NOT EXISTS directory_tokens (
+  token      TEXT PRIMARY KEY,
+  scope      TEXT NOT NULL,
+  expires    INTEGER NOT NULL,
+  created_by TEXT NOT NULL,
+  created    INTEGER NOT NULL
+);
 "#;
+
+/// Self-reported presence older than this (epoch-ms gap to "now") reads as `offline`. Presence is
+/// self-reported and persists across disconnects; liveness is *derived* from this window — matching
+/// the protocol's intent that `offline` is "derived by observers, not self-set while live".
+pub const PRESENCE_STALE_MS: i64 = 300_000;
 
 /// The durable store. Cheaply cloneable (shares one connection behind an `Arc<Mutex<…>>`).
 #[derive(Clone)]
@@ -217,7 +249,7 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn roster(&self, room: &str) -> Result<Vec<RosterEntry>> {
+    pub fn roster(&self, room: &str, now: i64) -> Result<Vec<RosterEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT a.id, a.name, a.role, p.status, p.activity, p.ts, a.last_seen
@@ -228,14 +260,19 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![room], |r| {
-                let status: Option<String> = r.get(3)?;
+                let raw_status: Option<String> = r.get(3)?;
                 let p_ts: Option<i64> = r.get(5)?;
                 let last_seen: i64 = r.get(6)?;
+                // Self-reported status, decayed to `offline` once the heartbeat goes stale.
+                let status = match (raw_status, p_ts) {
+                    (Some(s), Some(ts)) if now - ts <= PRESENCE_STALE_MS => s,
+                    _ => "offline".to_string(),
+                };
                 Ok(RosterEntry {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     role: r.get(2)?,
-                    status: status.unwrap_or_else(|| "offline".into()),
+                    status,
                     activity: r.get(4)?,
                     last_seen: p_ts.unwrap_or(last_seen),
                 })
@@ -383,6 +420,172 @@ impl Store {
         Ok((room, kind))
     }
 
+    // ---- directory (discovery) ----
+
+    /// Publish or refresh an agent's directory card. `card.id` is the primary key; `registered` is
+    /// kept from the first publish, `updated` bumped each time. `tags`/`skills` are denormalized
+    /// (lowercased) for cheap filtering.
+    pub fn register_card(
+        &self,
+        card: &AgentCard,
+        sig: Option<&str>,
+        verified: bool,
+        visibility: Visibility,
+        now: i64,
+    ) -> Result<()> {
+        let card_json = serde_json::to_string(card)?;
+        let (tags, skills) = card_filter_blobs(card);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO directory (agent, visibility, card_json, card_sig, verified, tags, skills, registered, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(agent) DO UPDATE SET
+               visibility = excluded.visibility, card_json = excluded.card_json,
+               card_sig = excluded.card_sig, verified = excluded.verified,
+               tags = excluded.tags, skills = excluded.skills, updated = excluded.updated",
+            params![card.id, visibility.as_str(), card_json, sig, verified as i64, tags, skills, now],
+        )?;
+        Ok(())
+    }
+
+    /// Search the directory. [`DiscoverScope::Public`] limits to `public` agents; [`DiscoverScope::Hub`]
+    /// returns every registered agent. Optional filters narrow by free-text (name/tags/skills),
+    /// `tag`, `skill`, or presence `status`. `hub` stamps each returned entry with the hub name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn discover(
+        &self,
+        scope: DiscoverScope,
+        hub: &str,
+        query: Option<&str>,
+        tag: Option<&str>,
+        skill: Option<&str>,
+        status: Option<&str>,
+        limit: Option<u32>,
+        now: i64,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let public_only = matches!(scope, DiscoverScope::Public) as i64;
+        let q = query.map(|s| format!("%{}%", s.to_lowercase()));
+        let tagp = tag.map(|s| format!("%{}%", s.to_lowercase()));
+        let skillp = skill.map(|s| format!("%{}%", s.to_lowercase()));
+        let want_status = status.map(|s| s.to_lowercase());
+        let lim = limit.unwrap_or(200).min(1000) as usize;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.card_json, d.visibility, d.card_sig, d.verified,
+                    p.status, p.activity, p.ts, a.first_seen, a.last_seen
+               FROM directory d
+               JOIN agents a ON a.id = d.agent
+               LEFT JOIN presence p ON p.agent = d.agent
+              WHERE (:public_only = 0 OR d.visibility = 'public')
+                AND (:q IS NULL OR LOWER(a.name) LIKE :q OR d.tags LIKE :q OR d.skills LIKE :q)
+                AND (:tag IS NULL OR d.tags LIKE :tag)
+                AND (:skill IS NULL OR d.skills LIKE :skill)
+              ORDER BY a.last_seen DESC",
+        )?;
+        let raws = stmt
+            .query_map(
+                named_params! { ":public_only": public_only, ":q": q, ":tag": tagp, ":skill": skillp },
+                RawDir::from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Derive presence staleness + apply the status filter and limit after, since `offline` is
+        // computed (not stored).
+        let mut out = Vec::new();
+        for r in &raws {
+            let entry = r.to_entry(hub, now)?;
+            if let Some(ws) = &want_status {
+                if entry.status.to_lowercase() != *ws {
+                    continue;
+                }
+            }
+            out.push(entry);
+            if out.len() >= lim {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch one agent's directory entry by id. A `public` card is always returned; a `private` one
+    /// only when `hub_scope` (the caller is an authenticated member / holds a valid directory token).
+    pub fn lookup_card(&self, id: &str, hub: &str, hub_scope: bool, now: i64) -> Result<Option<DirectoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<RawDir> = conn
+            .query_row(
+                "SELECT d.card_json, d.visibility, d.card_sig, d.verified,
+                        p.status, p.activity, p.ts, a.first_seen, a.last_seen
+                   FROM directory d
+                   JOIN agents a ON a.id = d.agent
+                   LEFT JOIN presence p ON p.agent = d.agent
+                  WHERE d.agent = ?1",
+                params![id],
+                RawDir::from_row,
+            )
+            .optional()?;
+        match raw {
+            Some(r) if hub_scope || r.visibility == "public" => Ok(Some(r.to_entry(hub, now)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The visibility of an agent's directory card, or `None` if it never registered one.
+    /// Used to decide whether a peer may open a DM by id: a registered agent is *reachable*.
+    pub fn directory_visibility(&self, agent: &str) -> Result<Option<Visibility>> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT visibility FROM directory WHERE agent = ?1",
+                params![agent],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|s| Visibility::parse(&s)))
+    }
+
+    /// `(total registered, public)` agent counts — for the `/api/hub` summary.
+    pub fn directory_counts(&self) -> Result<(i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM directory", [], |r| r.get(0))?;
+        let public: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM directory WHERE visibility = 'public'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((total, public))
+    }
+
+    // ---- directory tokens (private-hub read access for the website) ----
+
+    pub fn mint_directory_token(
+        &self,
+        token: &str,
+        scope: &str,
+        expires: i64,
+        created_by: &str,
+        now: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO directory_tokens (token, scope, expires, created_by, created)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![token, scope, expires, created_by, now],
+        )?;
+        Ok(())
+    }
+
+    /// `true` when `token` exists and has not expired.
+    pub fn validate_directory_token(&self, token: &str, now: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exp: Option<i64> = conn
+            .query_row(
+                "SELECT expires FROM directory_tokens WHERE token = ?1",
+                params![token],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(matches!(exp, Some(e) if now <= e))
+    }
+
     // ---- memory (facts) ----
 
     /// Write a fact. With a `key`, this upserts within (author, room, key) — idempotent updates.
@@ -510,9 +713,87 @@ impl RawMsg {
     }
 }
 
+/// Lowercased, space-delimited `(tags, skills)` blobs derived from a card for `LIKE` filtering.
+/// Leading/trailing spaces let a `%term%` pattern match a whole token.
+fn card_filter_blobs(card: &AgentCard) -> (String, String) {
+    let mut tags = String::new();
+    if let Some(ts) = &card.tags {
+        for t in ts {
+            tags.push(' ');
+            tags.push_str(&t.to_lowercase());
+        }
+        if !tags.is_empty() {
+            tags.push(' ');
+        }
+    }
+    let mut skills = String::new();
+    if let Some(sk) = &card.skills {
+        for s in sk {
+            skills.push(' ');
+            skills.push_str(&s.id.to_lowercase());
+            skills.push(' ');
+            skills.push_str(&s.name.to_lowercase());
+        }
+        if !skills.is_empty() {
+            skills.push(' ');
+        }
+    }
+    (tags, skills)
+}
+
+/// Raw directory columns, joined across `directory` + `agents` + `presence`.
+struct RawDir {
+    card_json: String,
+    visibility: String,
+    sig: Option<String>,
+    verified: i64,
+    raw_status: Option<String>,
+    activity: Option<String>,
+    presence_ts: Option<i64>,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+impl RawDir {
+    fn from_row(r: &rusqlite::Row) -> rusqlite::Result<RawDir> {
+        Ok(RawDir {
+            card_json: r.get(0)?,
+            visibility: r.get(1)?,
+            sig: r.get(2)?,
+            verified: r.get(3)?,
+            raw_status: r.get(4)?,
+            activity: r.get(5)?,
+            presence_ts: r.get(6)?,
+            first_seen: r.get(7)?,
+            last_seen: r.get(8)?,
+        })
+    }
+
+    fn to_entry(&self, hub: &str, now: i64) -> Result<DirectoryEntry> {
+        let card: AgentCard = serde_json::from_str(&self.card_json)?;
+        // Self-reported status, decayed to `offline` once the heartbeat goes stale.
+        let status = match (&self.raw_status, self.presence_ts) {
+            (Some(s), Some(ts)) if now - ts <= PRESENCE_STALE_MS => s.clone(),
+            _ => "offline".to_string(),
+        };
+        Ok(DirectoryEntry {
+            card,
+            visibility: Visibility::parse(&self.visibility).unwrap_or(Visibility::Private),
+            status,
+            activity: self.activity.clone(),
+            hub: hub.to_string(),
+            verified: self.verified != 0,
+            sig: self.sig.clone(),
+            first_seen: self.first_seen,
+            last_seen: self.last_seen,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parler_protocol::{AgentCard, EndpointKind};
 
     fn eref(id: &str, name: &str) -> EndpointRef {
         EndpointRef { id: id.into(), name: name.into(), role: None }
@@ -581,5 +862,100 @@ mod tests {
         s.add_member("dm.x", "U_B", 1).unwrap();
         assert_eq!(s.find_dm_room("U_A", "U_B").unwrap().as_deref(), Some("dm.x"));
         assert_eq!(s.find_dm_room("U_A", "U_C").unwrap(), None);
+    }
+
+    fn card(id: &str, name: &str, tags: &[&str], skills: &[&str]) -> AgentCard {
+        AgentCard {
+            id: id.into(),
+            name: name.into(),
+            kind: EndpointKind::Agent,
+            role: Some("planner".into()),
+            description: None,
+            tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+            skills: Some(
+                skills
+                    .iter()
+                    .map(|k| parler_protocol::AgentSkill {
+                        id: k.to_string(),
+                        name: k.to_string(),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+            meta: None,
+            protocol_version: None,
+        }
+    }
+
+    #[test]
+    fn register_and_discover_respects_scope_and_filters() {
+        let s = Store::open(None).unwrap();
+        s.upsert_agent("U_PUB", "alice", Some("planner"), 10).unwrap();
+        s.upsert_agent("U_PRIV", "bob", None, 11).unwrap();
+        s.touch_presence("U_PUB", "working", Some("planning"), 12).unwrap();
+
+        s.register_card(&card("U_PUB", "alice", &["planning", "ops"], &["plan"]), Some("sig"), true, Visibility::Public, 12).unwrap();
+        s.register_card(&card("U_PRIV", "bob", &["review"], &["audit"]), None, false, Visibility::Private, 13).unwrap();
+
+        // `now` close to the presence ts so the working status is live (not decayed to offline).
+        let now = 20;
+
+        // Public scope sees only the public agent.
+        let pubd = s.discover(DiscoverScope::Public, "hubz", None, None, None, None, None, now).unwrap();
+        assert_eq!(pubd.len(), 1);
+        assert_eq!(pubd[0].card.id, "U_PUB");
+        assert!(pubd[0].verified);
+        assert_eq!(pubd[0].status, "working");
+        assert_eq!(pubd[0].hub, "hubz");
+
+        // Hub scope sees both (same-hub view).
+        assert_eq!(s.discover(DiscoverScope::Hub, "hubz", None, None, None, None, None, now).unwrap().len(), 2);
+
+        // Tag/skill/text filters.
+        let by_tag = s.discover(DiscoverScope::Hub, "hubz", None, Some("review"), None, None, None, now).unwrap();
+        assert_eq!(by_tag.len(), 1);
+        assert_eq!(by_tag[0].card.id, "U_PRIV");
+        let by_skill = s.discover(DiscoverScope::Hub, "hubz", None, None, Some("plan"), None, None, now).unwrap();
+        assert_eq!(by_skill.len(), 1);
+        assert_eq!(by_skill[0].card.id, "U_PUB");
+        let by_text = s.discover(DiscoverScope::Public, "hubz", Some("alice"), None, None, None, None, now).unwrap();
+        assert_eq!(by_text.len(), 1);
+        let by_status = s.discover(DiscoverScope::Hub, "hubz", None, None, None, Some("working"), None, now).unwrap();
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0].card.id, "U_PUB");
+
+        // bob never reported presence, so he reads as offline (and the offline filter finds him).
+        let offline = s.discover(DiscoverScope::Hub, "hubz", None, None, None, Some("offline"), None, now).unwrap();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].card.id, "U_PRIV");
+
+        // Far in the future, even alice's working status has decayed to offline.
+        let stale = s.discover(DiscoverScope::Public, "hubz", None, None, None, None, None, 12 + PRESENCE_STALE_MS + 1).unwrap();
+        assert_eq!(stale[0].status, "offline");
+    }
+
+    #[test]
+    fn lookup_respects_visibility_and_register_is_idempotent() {
+        let s = Store::open(None).unwrap();
+        s.upsert_agent("U_PRIV", "bob", None, 1).unwrap();
+        s.register_card(&card("U_PRIV", "bob", &["x"], &[]), None, false, Visibility::Private, 1).unwrap();
+        // Private card hidden from anonymous lookup, visible in hub scope.
+        assert!(s.lookup_card("U_PRIV", "h", false, 1).unwrap().is_none());
+        assert!(s.lookup_card("U_PRIV", "h", true, 1).unwrap().is_some());
+
+        // Re-register flips visibility but keeps a single row + the original `registered` time.
+        s.register_card(&card("U_PRIV", "bob", &["x"], &[]), None, false, Visibility::Public, 99).unwrap();
+        assert!(s.lookup_card("U_PRIV", "h", false, 1).unwrap().is_some());
+        assert_eq!(s.directory_counts().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn directory_token_mint_validate_and_expiry() {
+        let s = Store::open(None).unwrap();
+        s.mint_directory_token("TKN", "hub", 1_000, "U_A", 1).unwrap();
+        assert!(s.validate_directory_token("TKN", 500).unwrap());
+        assert!(s.validate_directory_token("TKN", 1_000).unwrap());
+        assert!(!s.validate_directory_token("TKN", 1_001).unwrap()); // expired
+        assert!(!s.validate_directory_token("NOPE", 1).unwrap()); // unknown
     }
 }

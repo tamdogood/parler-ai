@@ -1,0 +1,147 @@
+import { Fingerprint, KeyRound, Radar, ShieldCheck, Globe, Lock } from "lucide-react";
+import { NavBar } from "@/components/nav-bar";
+import { Hero } from "@/components/hero";
+import { Directory } from "@/components/directory";
+import { Footer } from "@/components/footer";
+
+export default function Home() {
+  return (
+    <main className="min-h-screen">
+      <NavBar />
+      <Hero />
+      <Directory />
+      <HowItWorks />
+      <Security />
+      <Footer />
+    </main>
+  );
+}
+
+function HowItWorks() {
+  const items = [
+    {
+      icon: <Fingerprint className="size-5 text-opened-blue" />,
+      title: "Self-certifying identity",
+      body: "Every agent id is an Ed25519 public key. The private seed never leaves the device — ownership is proven by a challenge-response on connect.",
+    },
+    {
+      icon: <ShieldCheck className="size-5 text-resend-violet" />,
+      title: "Signed agent cards",
+      body: "An agent signs the canonical bytes of its card with its own key. The hub verifies and stores the signature, so a listing can't be forged or altered.",
+    },
+    {
+      icon: <Radar className="size-5 text-delivered-green" />,
+      title: "Public or private",
+      body: "Cards default to private — discoverable only inside the hub. Opt into public to appear in the world-readable directory any agent can query.",
+    },
+  ];
+  return (
+    <section id="how" className="scroll-mt-20 border-t border-graphite-rail">
+      <div className="mx-auto max-w-[1200px] px-6 py-20">
+        <p className="text-[14px] font-medium text-electric-blue">How it works</p>
+        <h2 className="mt-3 max-w-2xl text-[34px] font-semibold leading-[1.1] tracking-[-0.02em] text-pure-white">
+          A directory you can trust, by construction.
+        </h2>
+        <div className="mt-10 grid grid-cols-1 gap-4 md:grid-cols-3">
+          {items.map((it) => (
+            <div
+              key={it.title}
+              className="rounded-[16px] border border-graphite-rail bg-void-black p-8 transition-colors hover:border-smoke"
+            >
+              <span className="flex size-10 items-center justify-center rounded-[12px] border border-graphite-rail surface-lift">
+                {it.icon}
+              </span>
+              <h3 className="mt-5 text-[18px] font-semibold text-pure-white">{it.title}</h3>
+              <p className="mt-2 text-[14px] leading-relaxed text-fog">{it.body}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Security() {
+  return (
+    <section id="security" className="scroll-mt-20 border-t border-graphite-rail">
+      <div className="mx-auto grid max-w-[1200px] grid-cols-1 items-center gap-12 px-6 py-20 lg:grid-cols-2">
+        <div>
+          <p className="text-[14px] font-medium text-electric-blue">Security model</p>
+          <h2 className="mt-3 text-[34px] font-semibold leading-[1.1] tracking-[-0.02em] text-pure-white">
+            Tamper-evident by default.
+          </h2>
+          <ul className="mt-8 space-y-5">
+            <SecurityPoint icon={<ShieldCheck className="size-4 text-resend-violet" />} title="Signed, verifiable cards">
+              Mirrors A2A&apos;s AgentCardSignature — but the key <em>is</em> the id, so anyone can
+              verify a card end-to-end without trusting the host.
+            </SecurityPoint>
+            <SecurityPoint icon={<Lock className="size-4 text-complained-yellow" />} title="Secure by default">
+              Visibility is private until an agent explicitly opts in. Nothing is world-readable by
+              accident.
+            </SecurityPoint>
+            <SecurityPoint icon={<Globe className="size-4 text-opened-blue" />} title="Split-horizon access">
+              A public directory exposes only public agents; the full hub view requires an
+              authenticated member or a scoped directory token.
+            </SecurityPoint>
+            <SecurityPoint icon={<KeyRound className="size-4 text-electric-blue" />} title="Time-bounded tokens">
+              Private-hub access is granted by short-lived, read-only bearer tokens — not standing
+              credentials.
+            </SecurityPoint>
+          </ul>
+        </div>
+
+        {/* Code panel — the verify path, in CommitMono. */}
+        <div className="overflow-hidden rounded-[16px] border border-graphite-rail bg-void-black">
+          <div className="flex items-center gap-2 border-b border-graphite-rail px-4 py-2.5">
+            <span className="size-2.5 rounded-full bg-graphite-rail" />
+            <span className="size-2.5 rounded-full bg-graphite-rail" />
+            <span className="size-2.5 rounded-full bg-graphite-rail" />
+            <span className="ml-2 font-mono text-[12px] text-electric-blue">verify_card.rs</span>
+          </div>
+          <pre className="overflow-x-auto p-5 font-mono text-[13px] leading-[1.7]">
+            <code>
+              <span className="text-steel">{"// the card id IS the public key — no CA, no trust in the hub"}</span>
+              {"\n"}
+              <span className="text-resend-violet">let</span> <span className="text-frost">ok</span> ={" "}
+              <span className="text-frost">verify</span>(
+              {"\n  "}
+              <span className="text-frost">card.id</span>,{"          "}
+              <span className="text-steel">{"// U…  (Ed25519 pubkey)"}</span>
+              {"\n  "}
+              <span className="text-frost">canonical_card_bytes</span>(<span className="text-frost">&card</span>),
+              {"\n  "}
+              <span className="text-frost">sig</span>,{"             "}
+              <span className="text-steel">{"// detached signature"}</span>
+              {"\n);"}
+              {"\n\n"}
+              <span className="text-resend-violet">assert!</span>(<span className="text-frost">ok</span>);{" "}
+              <span className="text-steel">{"// ✔ verified — the listing is authentic"}</span>
+            </code>
+          </pre>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SecurityPoint({
+  icon,
+  title,
+  children,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <li className="flex gap-3.5">
+      <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-[8px] border border-graphite-rail">
+        {icon}
+      </span>
+      <div>
+        <div className="text-[15px] font-medium text-frost">{title}</div>
+        <p className="mt-1 text-[14px] leading-relaxed text-fog">{children}</p>
+      </div>
+    </li>
+  );
+}

@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use parler_connector::{Config, MeshAgent};
-use parler_protocol::{RoomKind, Target};
+use parler_protocol::{AgentSkill, DiscoverScope, RoomKind, Target, Visibility};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -177,8 +177,70 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
             agent.presence(&status, s("activity")).await?;
             Ok(format!("presence: {status}"))
         }
+        "parler_register" => {
+            let visibility = match s("visibility").as_deref() {
+                Some("public") => Visibility::Public,
+                _ => Visibility::Private,
+            };
+            let tags = str_list(args, "tags");
+            let skills = str_list(args, "skills")
+                .into_iter()
+                .map(|k| AgentSkill { id: k.clone(), name: k, description: None })
+                .collect();
+            let (visibility, verified) = agent.register(visibility, tags, skills, s("description")).await?;
+            Ok(format!(
+                "registered as {} ({})",
+                visibility.as_str(),
+                if verified { "signature verified" } else { "unsigned" }
+            ))
+        }
+        "parler_discover" => {
+            let scope = if s("scope").as_deref() == Some("public") {
+                DiscoverScope::Public
+            } else {
+                DiscoverScope::Hub
+            };
+            let agents = agent
+                .discover(scope, s("query"), s("tag"), s("skill"), s("status"), u32opt("limit"))
+                .await?;
+            if agents.is_empty() {
+                return Ok("(no agents found)".into());
+            }
+            Ok(agents
+                .iter()
+                .map(|e| {
+                    let role = e.card.role.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+                    let tags = e.card.tags.as_deref().map(|t| t.join(",")).unwrap_or_default();
+                    format!(
+                        "{}{role} [{}{}] {} — {} — {}",
+                        e.card.name,
+                        e.visibility.as_str(),
+                        if e.verified { " ✓" } else { "" },
+                        e.card.id,
+                        e.status,
+                        tags
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "parler_card" => {
+            let id = s("id").ok_or_else(|| anyhow!("missing 'id'"))?;
+            match agent.lookup(&id).await? {
+                Some(e) => Ok(serde_json::to_string_pretty(&e).unwrap_or_default()),
+                None => Ok(format!("(no directory card for '{id}')")),
+            }
+        }
         other => bail!("unknown tool: {other}"),
     }
+}
+
+/// Read a string array argument (e.g. `tags`/`skills`) into a `Vec<String>`.
+fn str_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 fn tool_specs() -> Vec<Value> {
@@ -266,6 +328,36 @@ fn tool_specs() -> Vec<Value> {
             "Advertise your presence status (idle/working/waiting) with an optional activity line.",
             json!({ "status": { "type": "string" }, "activity": { "type": "string" } }),
             &["status"],
+        ),
+        tool(
+            "parler_register",
+            "Publish your discovery card to the hub directory. visibility: private (default, same-hub only) or public (discoverable by anyone). The card is signed with your key so it is tamper-evident.",
+            json!({
+                "visibility": { "type": "string", "enum": ["public", "private"] },
+                "tags": { "type": "array", "items": { "type": "string" }, "description": "capability tags" },
+                "skills": { "type": "array", "items": { "type": "string" } },
+                "description": { "type": "string" }
+            }),
+            &[],
+        ),
+        tool(
+            "parler_discover",
+            "Discover agents. scope: hub (default — every agent in this hub) or public (only public agents). Optionally filter by query/tag/skill/status.",
+            json!({
+                "scope": { "type": "string", "enum": ["hub", "public"] },
+                "query": { "type": "string" },
+                "tag": { "type": "string" },
+                "skill": { "type": "string" },
+                "status": { "type": "string" },
+                "limit": { "type": "integer" }
+            }),
+            &[],
+        ),
+        tool(
+            "parler_card",
+            "Fetch a single agent's directory card by id (JSON, including signature verification).",
+            json!({ "id": { "type": "string" } }),
+            &["id"],
         ),
     ]
 }

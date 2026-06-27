@@ -8,28 +8,62 @@
 
 use crate::{now_ms, Store};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use parler_protocol::{
-    normalize_mentions, token, ClientFrame, EndpointRef, RoomKind, ServerFrame, Target,
+    canonical_card_bytes, normalize_mentions, token, ClientFrame, DiscoverScope, EndpointRef,
+    RoomKind, ServerFrame, Target,
 };
 use rand::Rng;
+use serde::Deserialize;
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 
-/// Shared server state: the durable store + the base URL advertised in invite links.
+/// Whether a hub's directory is world-readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubMode {
+    /// The public directory (`scope=public`) and any agent's public card are readable without auth.
+    Public,
+    /// The whole directory is token-gated; only `public` agents leak without a directory token.
+    Private,
+}
+
+impl HubMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HubMode::Public => "public",
+            HubMode::Private => "private",
+        }
+    }
+}
+
+/// Shared server state: the durable store, the hub's identity (name/mode), and the base URL
+/// advertised in invite links.
 pub struct HubState {
     pub store: Store,
     pub public_url: String,
+    pub name: String,
+    pub mode: HubMode,
 }
 
-/// Build the axum router (health check, the human-facing join page, and the agent WebSocket).
+/// Build the axum router: health, the human join page, the agent WebSocket, and the read-only
+/// directory REST API (CORS-open so a browser app on another origin can read it).
 pub fn app(state: Arc<HubState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/join/:code", get(join_page))
         .route("/ws", get(ws_handler))
+        .route("/api/hub", get(api_hub))
+        .route("/api/directory", get(api_directory))
+        .route("/api/agents/:id", get(api_agent))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -47,6 +81,107 @@ async fn join_page(Path(code): Path<String>) -> impl IntoResponse {
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<HubState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+// ---- read-only directory REST API (consumed by the website) ----
+
+/// `GET /api/hub` — the hub's public summary card.
+async fn api_hub(State(state): State<Arc<HubState>>) -> impl IntoResponse {
+    let (agents, public_agents) = state.store.directory_counts().unwrap_or((0, 0));
+    Json(serde_json::json!({
+        "name": state.name,
+        "mode": state.mode.as_str(),
+        "agents": agents,
+        "publicAgents": public_agents,
+        "protocolVersion": parler_protocol::PROTOCOL_VERSION,
+    }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DirectoryQuery {
+    q: Option<String>,
+    tag: Option<String>,
+    skill: Option<String>,
+    status: Option<String>,
+    /// `public` (default) or `hub`.
+    scope: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /api/directory` — list directory entries. Default `scope=public` is world-readable;
+/// `scope=hub` (the full same-hub view, including private agents) needs hub-scope authorization.
+async fn api_directory(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+    Query(q): Query<DirectoryQuery>,
+) -> impl IntoResponse {
+    let want_hub = q.scope.as_deref() == Some("hub");
+    if want_hub && !hub_scope_authorized(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "a directory token is required to view the hub-scope directory"
+            })),
+        )
+            .into_response();
+    }
+    let scope = if want_hub { DiscoverScope::Hub } else { DiscoverScope::Public };
+    match state.store.discover(
+        scope,
+        &state.name,
+        q.q.as_deref(),
+        q.tag.as_deref(),
+        q.skill.as_deref(),
+        q.status.as_deref(),
+        q.limit,
+        now_ms(),
+    ) {
+        Ok(agents) => Json(agents).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/agents/:id` — one directory entry. A `private` card requires hub-scope authorization.
+async fn api_agent(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let hub_scope = hub_scope_authorized(&state, &headers);
+    match state.store.lookup_card(&id, &state.name, hub_scope, now_ms()) {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such public agent" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Hub-scope reads (private directory) are allowed when the hub mode is `public`, or the request
+/// carries a valid `Authorization: Bearer <directory-token>`.
+fn hub_scope_authorized(state: &HubState, headers: &HeaderMap) -> bool {
+    if state.mode == HubMode::Public {
+        return true;
+    }
+    match bearer_token(headers) {
+        Some(tok) => state.store.validate_directory_token(&tok, now_ms()).unwrap_or(false),
+        None => false,
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let h = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    h.strip_prefix("Bearer ").map(|s| s.trim().to_string())
 }
 
 /// Per-connection authentication state.
@@ -88,10 +223,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<HubState>) {
             _ => {}
         }
     }
-    // Best-effort: mark the agent offline when the socket drops.
-    if let Some(a) = &conn.authed {
-        let _ = state.store.touch_presence(&a.id, "offline", None, now_ms());
-    }
+    // Presence is self-reported and persists across disconnects; the agent's last status remains in
+    // the directory and decays to `offline` by staleness (see `Store::PRESENCE_STALE_MS`). We don't
+    // overwrite it to `offline` here, so a one-shot CLI command leaves a meaningful last-known status.
 }
 
 /// Route one client frame to its reply. Synchronous (the store never blocks across an await).
@@ -104,7 +238,7 @@ fn dispatch(state: &HubState, conn: &mut ConnState, frame: ClientFrame) -> Serve
             message: "not authenticated — send `hello` first".into(),
         };
     };
-    handle_authed(&state.store, &state.public_url, &authed, frame)
+    handle_authed(state, &authed, frame)
         .unwrap_or_else(|e| ServerFrame::Error { message: e.to_string() })
 }
 
@@ -146,14 +280,58 @@ fn handle_hello(
     }
 }
 
-fn handle_authed(
-    store: &Store,
-    public_url: &str,
-    me: &Authed,
-    frame: ClientFrame,
-) -> anyhow::Result<ServerFrame> {
+fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::Result<ServerFrame> {
+    let store = &state.store;
+    let public_url = &state.public_url;
     match frame {
         ClientFrame::Hello { .. } => unreachable!("handled in dispatch"),
+
+        ClientFrame::Register { card, visibility, sig } => {
+            // The card must describe the authenticated connection — you can only publish your own.
+            if card.id != me.id {
+                anyhow::bail!("card id '{}' does not match your authenticated id", card.id);
+            }
+            // A present signature must verify against the agent's own key; a forged/altered card is
+            // rejected outright. An absent signature is allowed but the entry is marked unverified.
+            let verified = match &sig {
+                Some(s) => parler_auth::verify(&card.id, &canonical_card_bytes(&card), s),
+                None => false,
+            };
+            if sig.is_some() && !verified {
+                anyhow::bail!("card signature verification failed");
+            }
+            store.register_card(&card, sig.as_deref(), verified, visibility, now_ms())?;
+            Ok(ServerFrame::Registered { id: card.id, visibility, verified })
+        }
+
+        ClientFrame::Discover { scope, query, tag, skill, status, limit } => {
+            // An authenticated agent is a member of this hub, so both scopes are allowed.
+            let agents = store.discover(
+                scope,
+                &state.name,
+                query.as_deref(),
+                tag.as_deref(),
+                skill.as_deref(),
+                status.as_deref(),
+                limit,
+                now_ms(),
+            )?;
+            Ok(ServerFrame::Directory { agents })
+        }
+
+        ClientFrame::Lookup { id } => {
+            // Members may resolve private cards too (hub scope).
+            let entry = store.lookup_card(&id, &state.name, true, now_ms())?;
+            Ok(ServerFrame::Card { entry })
+        }
+
+        ClientFrame::MintDirectoryToken { ttl_secs } => {
+            let now = now_ms();
+            let expires = now + (ttl_secs.unwrap_or(3600) as i64) * 1000;
+            let tok = gen_token();
+            store.mint_directory_token(&tok, "hub", expires, &me.id, now)?;
+            Ok(ServerFrame::DirectoryToken { token: tok, expires_at: expires })
+        }
 
         ClientFrame::Invite { kind, room, ttl_secs, max_uses } => {
             let now = now_ms();
@@ -240,7 +418,7 @@ fn handle_authed(
             if !store.is_member(&room, &me.id)? {
                 anyhow::bail!("not a member of '{room}'");
             }
-            Ok(ServerFrame::Roster { room: room.clone(), entries: store.roster(&room)? })
+            Ok(ServerFrame::Roster { room: room.clone(), entries: store.roster(&room, now_ms())? })
         }
 
         ClientFrame::Presence { status, activity } => {
@@ -261,9 +439,28 @@ fn resolve_target(store: &Store, me: &Authed, target: &Target) -> anyhow::Result
             }
             Ok(room.clone())
         }
-        Target::Dm { agent } => store
-            .find_dm_room(&me.id, agent)?
-            .ok_or_else(|| anyhow::anyhow!("no DM channel with '{agent}' — pair first (invite/join)")),
+        Target::Dm { agent } => {
+            if let Some(room) = store.find_dm_room(&me.id, agent)? {
+                return Ok(room);
+            }
+            // Discovery makes an agent reachable: if the target has published a directory card, open
+            // the DM room on the fly — no paste-a-code pairing needed. (A public agent is reachable by
+            // anyone; a private one only by hub members, which any authenticated caller is.) An agent
+            // that never registered still requires an explicit invite/redeem.
+            match store.directory_visibility(agent)? {
+                Some(_visible) => {
+                    let room = format!("dm.{}", gen_suffix());
+                    let now = now_ms();
+                    store.ensure_room(&room, RoomKind::Dm, None, now)?;
+                    store.add_member(&room, &me.id, now)?;
+                    store.add_member(&room, agent, now)?;
+                    Ok(room)
+                }
+                None => anyhow::bail!(
+                    "'{agent}' isn't discoverable (no directory card) — pair first (invite/join)"
+                ),
+            }
+        }
         Target::Service { service } => {
             let room = format!("svc.{}", token(service));
             if store.room_kind(&room)?.is_none() {
@@ -277,13 +474,7 @@ fn resolve_target(store: &Store, me: &Authed, target: &Target) -> anyhow::Result
 }
 
 fn verify_sig(id: &str, nonce: &str, sig_b64: &str) -> bool {
-    let Ok(kp) = nkeys::KeyPair::from_public_key(id) else {
-        return false;
-    };
-    let Ok(sig) = data_encoding::BASE64.decode(sig_b64.as_bytes()) else {
-        return false;
-    };
-    kp.verify(nonce.as_bytes(), &sig).is_ok()
+    parler_auth::verify(id, nonce.as_bytes(), sig_b64)
 }
 
 /// Accept a bare code or a pasted link (`parler://host/join/CODE`, `http://host/join/CODE`).
@@ -306,6 +497,12 @@ fn gen_code() -> String {
 fn gen_suffix() -> String {
     let mut rng = rand::thread_rng();
     (0..6).map(|_| SUFFIX_ALPHABET[rng.gen_range(0..SUFFIX_ALPHABET.len())] as char).collect()
+}
+
+/// A high-entropy bearer for a directory token (32 chars over the code alphabet ≈ 160 bits).
+fn gen_token() -> String {
+    let mut rng = rand::thread_rng();
+    (0..32).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect()
 }
 
 #[cfg(test)]

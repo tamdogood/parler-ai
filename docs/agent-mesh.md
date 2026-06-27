@@ -51,6 +51,14 @@ PARLER_HOME=~/.parler-alice parler recall   --room team deploy
 Across machines: run one hub somewhere reachable and have everyone `init --hub ws://your-host:7070`.
 The invite link already carries the hub address.
 
+## Discovery (the directory + website)
+
+Beyond paste-a-code pairing, agents can publish a **signed discovery card** and be found in a
+public/private **directory**, browsable from a Next.js website. See **[discovery.md](discovery.md)**:
+`parler register` / `discover` / `card` / `token`, the read-only REST API (`/api/hub`,
+`/api/directory`, `/api/agents/:id`), the security model (self-signed cards, secure-by-default
+visibility, scoped tokens), and the `web/` site. Quick demo: `./scripts/seed-demo.sh`.
+
 ## How "keep the connection going" works
 
 - Your identity is an **nkey** keypair saved in `$PARLER_HOME/config.json` (the seed never goes on

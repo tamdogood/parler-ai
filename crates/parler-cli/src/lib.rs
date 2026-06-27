@@ -9,7 +9,9 @@ pub mod mcp;
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use parler_connector::{Config, MeshAgent};
-use parler_protocol::{Part, RoomKind, StoredMessage, Target};
+use parler_protocol::{
+    AgentSkill, DirectoryEntry, DiscoverScope, Part, RoomKind, StoredMessage, Target, Visibility,
+};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -40,6 +42,16 @@ enum Cmd {
     Serve {
         service: String,
     },
+    /// Publish this agent's discovery card to the hub directory (default: private).
+    Register(RegisterArgs),
+    /// Discover agents — the whole hub (default) or just the public directory (--public).
+    Discover(DiscoverArgs),
+    /// Show a single agent's directory card by id.
+    Card {
+        id: String,
+    },
+    /// Mint a directory token to paste into the website to view this hub's private directory.
+    Token(TokenArgs),
     /// Send a message (one of --room / --to / --service).
     Send(SendArgs),
     /// Pull new messages for a room (advances your cursor unless --since/--all).
@@ -78,6 +90,12 @@ struct HubArgs {
     /// Public base URL advertised in invite links. Defaults to `parler://<addr>`.
     #[arg(long, env = "PARLER_HUB_URL")]
     url: Option<String>,
+    /// Display name for this hub (the workspace name shown in the directory/site).
+    #[arg(long, env = "PARLER_HUB_NAME", default_value = "Parler Hub")]
+    name: String,
+    /// Run a public hub (world-readable directory). Omit for a private, token-gated hub.
+    #[arg(long, env = "PARLER_HUB_PUBLIC")]
+    public: bool,
 }
 
 #[derive(Args)]
@@ -165,6 +183,50 @@ struct RecallArgs {
     query: Vec<String>,
 }
 
+#[derive(Args)]
+struct RegisterArgs {
+    /// Make this agent discoverable by anyone (public directory). Default: private (same-hub only).
+    #[arg(long)]
+    public: bool,
+    /// A capability tag (repeatable): --tag planning --tag ops.
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// A skill id (repeatable): --skill code-review.
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    /// A short description of what this agent does.
+    #[arg(long)]
+    describe: Option<String>,
+}
+
+#[derive(Args)]
+struct DiscoverArgs {
+    /// Search only the public directory (default: the whole hub).
+    #[arg(long)]
+    public: bool,
+    /// Filter by a capability tag.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Filter by a skill.
+    #[arg(long)]
+    skill: Option<String>,
+    /// Filter by presence status (idle/working/waiting/offline).
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    limit: Option<u32>,
+    /// Free-text query over name / tags / skills.
+    #[arg(trailing_var_arg = true)]
+    query: Vec<String>,
+}
+
+#[derive(Args)]
+struct TokenArgs {
+    /// Token lifetime in seconds (default 3600).
+    #[arg(long)]
+    ttl: Option<u64>,
+}
+
 /// Entry point for the `parler` binary.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -174,6 +236,10 @@ pub async fn run() -> Result<()> {
         Cmd::Invite(a) => cmd_invite(a).await,
         Cmd::Join { code } => cmd_join(code).await,
         Cmd::Serve { service } => cmd_serve(service).await,
+        Cmd::Register(a) => cmd_register(a).await,
+        Cmd::Discover(a) => cmd_discover(a).await,
+        Cmd::Card { id } => cmd_card(id).await,
+        Cmd::Token(a) => cmd_token(a).await,
         Cmd::Send(a) => cmd_send(a).await,
         Cmd::Recv(a) => cmd_recv(a).await,
         Cmd::Remember(a) => cmd_remember(a).await,
@@ -197,11 +263,14 @@ async fn cmd_hub(a: HubArgs) -> Result<()> {
         .try_init();
     let store = parler_hub::Store::open(a.db.as_deref().map(std::path::Path::new))?;
     let public_url = a.url.unwrap_or_else(|| format!("parler://{}", a.addr));
-    let state = Arc::new(parler_hub::HubState { store, public_url });
+    let mode = if a.public { parler_hub::HubMode::Public } else { parler_hub::HubMode::Private };
+    let state = Arc::new(parler_hub::HubState { store, public_url, name: a.name, mode });
     let listener = tokio::net::TcpListener::bind(&a.addr).await?;
     let actual = listener.local_addr()?;
     println!(
-        "parler-hub up · ws://{actual}/ws · db: {}",
+        "parler-hub up · ws://{actual}/ws · {} hub '{}' · db: {}",
+        state.mode.as_str(),
+        state.name,
         a.db.as_deref().unwrap_or(":memory:")
     );
     parler_hub::serve(listener, state).await
@@ -263,6 +332,58 @@ async fn cmd_serve(service: String) -> Result<()> {
     let room = ag.serve(&service).await?;
     println!("✓ serving '{service}' (room '{room}')");
     println!("  receive tasks with:  parler recv --room {room}");
+    Ok(())
+}
+
+async fn cmd_register(a: RegisterArgs) -> Result<()> {
+    let visibility = if a.public { Visibility::Public } else { Visibility::Private };
+    let skills = a
+        .skills
+        .into_iter()
+        .map(|s| AgentSkill { id: s.clone(), name: s, description: None })
+        .collect();
+    let mut ag = connect().await?;
+    let (visibility, verified) = ag.register(visibility, a.tags, skills, a.describe).await?;
+    let sig = if verified { "signature verified ✓" } else { "unsigned" };
+    println!("✓ registered in the directory as {} ({sig})", visibility.as_str());
+    println!("  discover with:  parler discover{}", if visibility == Visibility::Public { " --public" } else { "" });
+    Ok(())
+}
+
+async fn cmd_discover(a: DiscoverArgs) -> Result<()> {
+    let scope = if a.public { DiscoverScope::Public } else { DiscoverScope::Hub };
+    let query = (!a.query.is_empty()).then(|| a.query.join(" "));
+    let mut ag = connect().await?;
+    let agents = ag.discover(scope, query, a.tag, a.skill, a.status, a.limit).await?;
+    if agents.is_empty() {
+        println!("(no agents found)");
+        return Ok(());
+    }
+    let scope_label = if a.public { "public directory" } else { "hub" };
+    println!("{} agent(s) in the {scope_label}:", agents.len());
+    for e in &agents {
+        println!("{}", render_entry(e));
+    }
+    Ok(())
+}
+
+async fn cmd_card(id: String) -> Result<()> {
+    let mut ag = connect().await?;
+    match ag.lookup(&id).await? {
+        Some(e) => print!("{}", render_entry_full(&e)),
+        None => println!("(no directory card for '{id}')"),
+    }
+    Ok(())
+}
+
+async fn cmd_token(a: TokenArgs) -> Result<()> {
+    let mut ag = connect().await?;
+    let (token, expires_at) = ag.mint_directory_token(a.ttl).await?;
+    println!("✓ directory token (expires at {expires_at}):");
+    println!();
+    println!("    {token}");
+    println!();
+    println!("Paste it into the website's \"hub view\" to browse this hub's private directory.");
     Ok(())
 }
 
@@ -363,6 +484,54 @@ fn cmd_whoami() -> Result<()> {
     );
     println!("hub:  {}", cfg.hub_url);
     Ok(())
+}
+
+/// One-line directory entry: `● name (role)  Uid…  [public ✓]  working  #tag …`.
+fn render_entry(e: &DirectoryEntry) -> String {
+    let role = e.card.role.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+    let vis = if e.verified {
+        format!("{} ✓", e.visibility.as_str())
+    } else {
+        e.visibility.as_str().to_string()
+    };
+    let tags = e
+        .card
+        .tags
+        .as_deref()
+        .map(|t| t.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    format!(
+        "● {}{role}  {}  [{}]  {}  {}",
+        e.card.name, e.card.id, vis, e.status, tags
+    )
+}
+
+/// Multi-line directory card for `parler card <id>`.
+fn render_entry_full(e: &DirectoryEntry) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("name:    {}\n", e.card.name));
+    out.push_str(&format!("id:      {}\n", e.card.id));
+    if let Some(role) = &e.card.role {
+        out.push_str(&format!("role:    {role}\n"));
+    }
+    out.push_str(&format!("hub:     {}\n", e.hub));
+    out.push_str(&format!(
+        "visible: {} ({})\n",
+        e.visibility.as_str(),
+        if e.verified { "signature verified ✓" } else { "unverified" }
+    ));
+    out.push_str(&format!("status:  {}\n", e.status));
+    if let Some(d) = &e.card.description {
+        out.push_str(&format!("about:   {d}\n"));
+    }
+    if let Some(tags) = &e.card.tags {
+        out.push_str(&format!("tags:    {}\n", tags.join(", ")));
+    }
+    if let Some(skills) = &e.card.skills {
+        let s = skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("skills:  {s}\n"));
+    }
+    out
 }
 
 /// Render the text of a message's parts (text joined; data/extension parts noted).

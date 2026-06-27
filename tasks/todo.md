@@ -1,3 +1,49 @@
+# Feature: Agent Discovery — directory + signed cards + Next.js site (2026-06-27)
+
+**User ask:** the best discovery hub — agents register with a uuid + a public/private visibility
+(public = discoverable by any agent; private = same-hub only), Slack-like, with a strong security
+protocol, plus a Next.js + shadcn dark-theme website (Resend styling) to browse a hub or the public
+directory. Confirmed: one hub binary in public/private mode; private-hub viewing via a short-lived
+directory token; ship a runnable demo. Plan: `~/.claude/plans/recursive-hatching-hearth.md`.
+
+### Built
+- [x] **Protocol** (`parler-protocol::hub`): `Visibility{public,private}` (default private),
+  `DiscoverScope{hub,public}`, `DirectoryEntry`, frames `Register/Discover/Lookup/MintDirectoryToken`
+  + `Registered/Directory/Card/DirectoryToken`, and `canonical_card_bytes` (RFC-8785-style).
+- [x] **Auth**: `parler_auth::{sign,verify}` (nkey Ed25519), reused by hub + connector + tests.
+- [x] **Hub store**: `directory` + `directory_tokens` tables; `register_card`, `discover`
+  (scope/tag/skill/status filters), `lookup_card`, token mint/validate; presence now self-reported
+  and **decayed to offline by staleness** (`PRESENCE_STALE_MS`) instead of forced on disconnect.
+- [x] **Hub server**: WS ops (verify signature, bind `card.id == authed id`); read-only REST
+  `/api/hub`, `/api/directory`, `/api/agents/:id` with `tower-http` CORS + bearer-token gating for
+  `scope=hub`; `--name`/`--public` flags + `HubMode`.
+- [x] **Connector + CLI + MCP**: `MeshAgent::{register,discover,lookup,mint_directory_token}`
+  (signs the card with the local seed); CLI `register/discover/card/token`; MCP `parler_register/
+  parler_discover/parler_card`.
+- [x] **Website** (`web/`): Next.js 15 + Tailwind v4 + shadcn-style, Resend dark theme — nav/hero,
+  hub header, scope toggle, search + filters, signed agent cards with status + verified badges, a
+  detail sheet, and a token-unlock dialog. Builds clean; screenshot-verified against a live hub.
+- [x] **Demo + docs**: `scripts/seed-demo.sh` (public hub + 7 signed agents, 5 public/2 private),
+  `docs/discovery.md`, pointer in `docs/agent-mesh.md`.
+- [x] **Discovery → conversation bridge** (follow-up): a `register`ed agent is *reachable* — a peer
+  can `send --to <id>` cold and the hub opens the DM room (no paste-a-code). `resolve_target` falls
+  back to pairing only for agents with no directory card. Verified with a live two-agent round-trip
+  (atlas DMs probe by id → probe reads + replies). Tests +2 in `discovery_e2e`.
+
+### Review — 2026-06-27
+- **Tests:** `cargo test --workspace --no-fail-fast` = **69 passed / 1 failed**; the single failure
+  is the pre-existing `parler-auth` `auth_live` test (needs a vendored `nats-server`, unrelated).
+  New: protocol +4 (frames/canonicalization/default), auth +1 (sign/verify), hub +3 (scope split,
+  visibility/idempotent register, token expiry), connector +3 e2e (`discovery_e2e`: public-vs-hub
+  visibility, forged/tampered/unsigned card handling, token mint).
+- **Live demo verified:** `/api/hub` → public hub "Parler Public", 7 agents/5 public; public
+  directory returns the 5 public agents (all `verified:true`); hub scope returns all 7; `parler
+  discover --public` matches; the website renders the cards (headless-Chrome screenshot).
+- **Security highlight:** cards are self-signed by the agent's own nkey; the hub stores + verifies
+  but cannot forge them — `verified` is independently checkable by any client.
+
+---
+
 # Feature: Agent Mesh — "Slack for agents" (focused build)
 
 **2026-06-27 — user redirected scope.** Not a full Cotal copy. Deliver a focused feature: any agent

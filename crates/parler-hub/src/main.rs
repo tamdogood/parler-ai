@@ -5,7 +5,7 @@
 //! ```
 
 use clap::Parser;
-use parler_hub::{serve, HubState, Store};
+use parler_hub::{serve, HubMode, HubState, Store};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -22,6 +22,15 @@ struct Args {
     /// Public base URL advertised in invite links. Defaults to `parler://<addr>`.
     #[arg(long, env = "PARLER_HUB_URL")]
     url: Option<String>,
+
+    /// Display name for this hub (the workspace name shown in the directory/site).
+    #[arg(long, env = "PARLER_HUB_NAME", default_value = "Parler Hub")]
+    name: String,
+
+    /// Run a public hub: its directory is world-readable (no token needed for the hub-scope view).
+    /// Omit for a private hub, where the full directory is gated behind a directory token.
+    #[arg(long, env = "PARLER_HUB_PUBLIC")]
+    public: bool,
 }
 
 #[tokio::main]
@@ -33,13 +42,16 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let store = Store::open(args.db.as_deref().map(std::path::Path::new))?;
     let public_url = args.url.unwrap_or_else(|| format!("parler://{}", args.addr));
-    let state = Arc::new(HubState { store, public_url });
+    let mode = if args.public { HubMode::Public } else { HubMode::Private };
+    let state = Arc::new(HubState { store, public_url, name: args.name, mode });
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     let actual = listener.local_addr()?;
     tracing::info!("parler-hub listening on ws://{actual}/ws");
     println!(
-        "parler-hub up · ws://{actual}/ws · db: {}",
+        "parler-hub up · ws://{actual}/ws · {} hub '{}' · db: {}",
+        state.mode.as_str(),
+        state.name,
         args.db.as_deref().unwrap_or(":memory:")
     );
 

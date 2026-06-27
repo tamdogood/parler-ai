@@ -47,6 +47,7 @@ futures = "0.3"
 
 # Hub transport + storage (the "Slack for agents" feature)
 axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
 tokio-tungstenite = "0.23"
 rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive", "env"] }

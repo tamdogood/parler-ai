@@ -11,6 +11,14 @@ __pycache__/
 *.creds
 *.seed
 
+# Demo runtime (seed-demo.sh) + website build artifacts
+/.demo/
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/next-env.d.ts
+/web/*.tsbuildinfo
+
 # Scratch (reference clone, downloaded binaries) — also gitignored by the workspace
 .context/
 

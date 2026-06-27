@@ -11,6 +11,8 @@ async fn start_hub() -> String {
     let state = Arc::new(parler_hub::HubState {
         store,
         public_url: "parler://test".into(),
+        name: "Test Hub".into(),
+        mode: parler_hub::HubMode::Private,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
