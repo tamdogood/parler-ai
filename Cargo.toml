@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Parler contributors"]
-repository = "https://github.com/parler/parler"
+repository = "https://github.com/tamdogood/parler-ai"
 description = "Parler — an open standard for AI agent coordination (Rust)"
 
 [workspace.dependencies]
