@@ -28,6 +28,7 @@ impl HubClient {
         name: &str,
         role: Option<&str>,
     ) -> Result<HubClient> {
+        ensure_crypto_provider();
         let ws_url = to_ws_url(hub_url);
         let (ws, _resp) = connect_async(&ws_url)
             .await
@@ -144,6 +145,21 @@ impl MeshTransport for HubClient {
         }
         self.recv_binary().await
     }
+}
+
+/// Install a process-wide rustls crypto provider before the first `wss://` dial.
+///
+/// `rustls` 0.23 refuses to auto-select a provider when more than one is compiled in, and panics on
+/// the first TLS handshake. Two land in our tree — `ring` (via `tokio-tungstenite`) and `aws-lc-rs`
+/// (via `async-nats`) — so we pick one explicitly. Idempotent and cheap, so it's safe to call on every
+/// connect (including plain `ws://`, where it's just a no-op cost).
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // Err means a provider was already installed by someone else — that's fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Normalize any hub address (`ws://`, `http(s)://`, `parler://`, or bare `host:port`) into the
