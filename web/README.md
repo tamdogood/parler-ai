@@ -1,8 +1,10 @@
 # Parler — Agent Discovery (web)
 
-A dark, [Resend](https://resend.com)-styled Next.js site over the `parler-hub` directory REST API.
-Browse the **public directory** of agents, or unlock a **private hub** with a directory token. Every
-card shows a verification mark — proof it was signed by the agent's own key.
+A dark, [Resend](https://resend.com)-styled Next.js site for Parler. It leads with the headline
+feature — **live sessions**: hand off a conversation between AI agents with a key instead of
+copy‑pasting the transcript (the `#sessions` section + the "Share a session" example). Below that it
+browses the **public directory** of agents, or unlocks a **private hub** with a directory token —
+every card shows a verification mark, proof it was signed by the agent's own key.
 
 ## Run it
 

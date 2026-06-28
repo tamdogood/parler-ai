@@ -4,6 +4,7 @@
 use parler_connector::{BundleMeta, Config, MeshAgent};
 use parler_protocol::{BundleRef, Part, RoomKind, StoredMessage, Target};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Start an in-memory hub on an ephemeral port; return its ws:// URL.
 async fn start_hub() -> String {
@@ -14,6 +15,25 @@ async fn start_hub() -> String {
         "Test Hub".into(),
         parler_hub::HubMode::Private,
     ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = parler_hub::serve(listener, state).await;
+    });
+    format!("ws://{addr}")
+}
+
+/// Start an in-memory hub with a specific authenticated-idle timeout (`None` disables it).
+async fn start_hub_with_idle(idle: Option<Duration>) -> String {
+    let store = parler_hub::Store::open(None).unwrap();
+    let mut state = parler_hub::HubState::new(
+        store,
+        "parler://test".into(),
+        "Test Hub".into(),
+        parler_hub::HubMode::Private,
+    );
+    state.idle_timeout = idle;
+    let state = Arc::new(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -211,4 +231,144 @@ async fn non_member_cannot_read_a_room() {
 
     // eve never redeemed the invite → not a member → reads are refused.
     assert!(eve.pull(&inv.room, None, None).await.is_err());
+}
+
+// ---- live multi-agent sessions (the publish-key / join-with-context flow) ----
+
+#[tokio::test]
+async fn live_session_handoff_shares_context_with_many() {
+    // The session flow the MCP `parler_open_session` / `parler_join_session` tools compose:
+    // a multi-use channel invite (the "key") + a seeded context message + a backlog pull on join.
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", Some("planner")).await;
+
+    // Alice opens a session: mint the key, then seed it with the conversation context.
+    let inv = alice.invite(RoomKind::Channel, Some("design".into()), None, None).await.unwrap();
+    alice
+        .send_text(
+            Target::Room { room: inv.room.clone() },
+            "📋 session context: we are designing the auth flow; see src/auth.rs",
+        )
+        .await
+        .unwrap();
+
+    // Bob joins with the key and pulls the backlog → he is caught up with the context.
+    let mut bob = agent(&hub, "bob", None).await;
+    let (broom, kind) = bob.join(&inv.code).await.unwrap();
+    assert_eq!(kind, RoomKind::Channel);
+    let (bmsgs, _) = bob.pull(&broom, None, None).await.unwrap();
+    assert!(texts(&bmsgs).iter().any(|t| t.contains("designing the auth flow")));
+
+    // Carol joins the SAME key → also caught up (N agents share one session, multi-use key).
+    let mut carol = agent(&hub, "carol", None).await;
+    carol.join(&inv.code).await.unwrap();
+    let (cmsgs, _) = carol.pull(&inv.room, None, None).await.unwrap();
+    assert!(texts(&cmsgs).iter().any(|t| t.contains("designing the auth flow")));
+
+    // Bob replies; Alice sees it on her next pull (the conversation is shared, not peer-to-peer).
+    bob.send_text(Target::Room { room: broom }, "got it — I'll take the token refresh").await.unwrap();
+    let (amsgs, _) = alice.pull(&inv.room, None, None).await.unwrap();
+    assert!(texts(&amsgs).iter().any(|t| t == "got it — I'll take the token refresh"));
+}
+
+#[tokio::test]
+async fn session_key_joins_via_full_link() {
+    // A joiner can paste the full invite link (parler://host/join/CODE), not just the bare code —
+    // the hub normalizes it on redeem. This is what `parler_join_session` / `parler session join`
+    // accept.
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let mut bob = agent(&hub, "bob", None).await;
+
+    let inv = alice.invite(RoomKind::Channel, Some("design".into()), None, None).await.unwrap();
+    assert!(inv.url.contains("/join/"));
+    let (room, _kind) = bob.join(&inv.url).await.unwrap();
+    assert_eq!(room, inv.room);
+}
+
+#[tokio::test]
+async fn session_catchup_advances_cursor_without_duplicates() {
+    // join_session pulls with since=None, which advances the cursor to the live edge — so after the
+    // one-shot catch-up a later pull returns only genuinely new messages, never the backlog again.
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let mut bob = agent(&hub, "bob", None).await;
+    let mut carol = agent(&hub, "carol", None).await;
+
+    let inv = alice.invite(RoomKind::Channel, Some("design".into()), None, None).await.unwrap();
+    alice.send_text(Target::Room { room: inv.room.clone() }, "seed context").await.unwrap();
+
+    bob.join(&inv.code).await.unwrap();
+    let (backlog, _) = bob.pull(&inv.room, None, None).await.unwrap(); // catch-up, advances cursor
+    assert!(texts(&backlog).iter().any(|t| t == "seed context"));
+
+    carol.join(&inv.code).await.unwrap();
+    carol.send_text(Target::Room { room: inv.room.clone() }, "new note").await.unwrap();
+
+    let (delta, _) = bob.pull(&inv.room, None, None).await.unwrap(); // only what arrived since
+    assert_eq!(texts(&delta), vec!["new note"]);
+}
+
+#[tokio::test]
+async fn invite_max_uses_is_enforced() {
+    // A single-use key admits one joiner; a second redemption is refused.
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let mut bob = agent(&hub, "bob", None).await;
+    let mut carol = agent(&hub, "carol", None).await;
+
+    let inv = alice.invite(RoomKind::Channel, Some("oneshot".into()), None, Some(1)).await.unwrap();
+    bob.join(&inv.code).await.unwrap(); // first redemption: ok
+    assert!(carol.join(&inv.code).await.is_err()); // exhausted
+}
+
+#[tokio::test]
+async fn expired_invite_is_rejected() {
+    // A key with ttl=0 is already expired by the time anyone tries to redeem it.
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let mut bob = agent(&hub, "bob", None).await;
+
+    let inv = alice.invite(RoomKind::Channel, Some("ephemeral".into()), Some(0), None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(bob.join(&inv.code).await.is_err());
+}
+
+// ---- idle auto-disconnect ----
+
+#[tokio::test]
+async fn idle_authenticated_connection_is_disconnected() {
+    // A connection silent past the idle timeout is dropped by the hub.
+    let hub = start_hub_with_idle(Some(Duration::from_millis(200))).await;
+    let mut alice = agent(&hub, "alice", None).await;
+
+    // Stay silent well past the timeout, then any request should fail (the hub closed the socket).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(alice.rooms().await.is_err());
+}
+
+#[tokio::test]
+async fn idle_timeout_resets_on_activity() {
+    // The idle deadline is measured from the last received frame, so an agent that keeps acting
+    // (gaps shorter than the timeout) stays connected — then is dropped once it goes quiet.
+    let hub = start_hub_with_idle(Some(Duration::from_millis(400))).await;
+    let mut alice = agent(&hub, "alice", None).await;
+
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(150)).await; // < 400ms: resets the deadline
+        alice.rooms().await.expect("still connected while active");
+    }
+
+    tokio::time::sleep(Duration::from_millis(700)).await; // now go silent past the timeout
+    assert!(alice.rooms().await.is_err());
+}
+
+#[tokio::test]
+async fn idle_timeout_none_keeps_connection_open() {
+    // With the idle timeout disabled, a silent connection survives.
+    let hub = start_hub_with_idle(None).await;
+    let mut alice = agent(&hub, "alice", None).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(alice.rooms().await.is_ok());
 }

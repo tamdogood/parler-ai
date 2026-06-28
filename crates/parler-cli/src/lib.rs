@@ -44,6 +44,9 @@ enum Cmd {
     Serve {
         service: String,
     },
+    /// Open or join a shared live session — hand a key to another agent mid-conversation.
+    #[command(subcommand)]
+    Session(SessionCmd),
     /// Publish this agent's discovery card to the hub directory (default: private).
     Register(RegisterArgs),
     /// Discover agents — the whole hub (default) or just the public directory (--public).
@@ -109,6 +112,34 @@ struct HubArgs {
     /// `PARLER_JOIN_SECRET`.
     #[arg(long, env = "PARLER_HUB_JOIN_SECRET")]
     join_secret: Option<String>,
+    /// Disconnect an authenticated agent after this many seconds of silence (it can reconnect and
+    /// resume from its durable cursor). `0` disables the timeout. Default: 1800 (30 min).
+    #[arg(long, env = "PARLER_HUB_IDLE_TIMEOUT_SECS", default_value_t = 1800)]
+    idle_timeout_secs: u64,
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Open a shared session and print a KEY to hand to other agents.
+    Open {
+        /// A recap of the conversation/state to seed the session with (posted as its first message).
+        #[arg(long)]
+        context: Option<String>,
+        /// An optional short name for the session.
+        #[arg(long)]
+        topic: Option<String>,
+        /// How long the key stays valid, in seconds (default 86400).
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// How many agents may join with the key (default 50).
+        #[arg(long)]
+        max_uses: Option<u32>,
+    },
+    /// Join a shared session with a key and print the context so far.
+    Join {
+        /// The session key (or full link) you were given.
+        key: String,
+    },
 }
 
 #[derive(Args)]
@@ -289,6 +320,7 @@ pub async fn run() -> Result<()> {
         Cmd::Invite(a) => cmd_invite(a).await,
         Cmd::Join { code } => cmd_join(code).await,
         Cmd::Serve { service } => cmd_serve(service).await,
+        Cmd::Session(c) => cmd_session(c).await,
         Cmd::Register(a) => cmd_register(a).await,
         Cmd::Discover(a) => cmd_discover(a).await,
         Cmd::Card { id } => cmd_card(id).await,
@@ -325,6 +357,8 @@ async fn cmd_hub(a: HubArgs) -> Result<()> {
         state.blob_dir = std::path::PathBuf::from(format!("{db}.blobs"));
     }
     state.join_secret = a.join_secret.filter(|s| !s.is_empty());
+    state.idle_timeout =
+        (a.idle_timeout_secs != 0).then(|| std::time::Duration::from_secs(a.idle_timeout_secs));
     let state = Arc::new(state);
     let listener = tokio::net::TcpListener::bind(&a.addr).await?;
     let actual = listener.local_addr()?;
@@ -393,6 +427,44 @@ async fn cmd_serve(service: String) -> Result<()> {
     let room = ag.serve(&service).await?;
     println!("✓ serving '{service}' (room '{room}')");
     println!("  receive tasks with:  parler recv --room {room}");
+    Ok(())
+}
+
+async fn cmd_session(c: SessionCmd) -> Result<()> {
+    let mut ag = connect().await?;
+    match c {
+        SessionCmd::Open { context, topic, ttl, max_uses } => {
+            let inv = ag.invite(RoomKind::Channel, topic, ttl, max_uses).await?;
+            // Seed the room with the context snapshot so a late joiner catches up by reading history.
+            if let Some(ctx) = context.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                let seed = format!("📋 session context (from {}):\n{ctx}", ag.name);
+                ag.send_text(Target::Room { room: inv.room.clone() }, &seed).await?;
+            }
+            println!("✓ session open — room '{}'", inv.room);
+            println!();
+            println!("    KEY:  {}", inv.code);
+            println!("    link: {}", inv.url);
+            println!();
+            println!("Hand the key to another agent:  parler session join {}", inv.code);
+            println!("…or launch its MCP server with env  PARLER_SESSION_KEY={}", inv.code);
+        }
+        SessionCmd::Join { key } => {
+            let (room, _kind) = ag.join(&key).await?;
+            // since=None advances the fresh cursor to the live edge after backfilling the context.
+            let (msgs, _cursor) = ag.pull(&room, None, None).await?;
+            println!("✓ joined session — room '{room}'");
+            if msgs.is_empty() {
+                println!("(no prior context yet)");
+            } else {
+                println!("--- context so far ---");
+                for m in &msgs {
+                    println!("{}", render_message(m));
+                }
+                println!("--- end context ---");
+            }
+            println!("send with:  parler send --room {room} \"…\"    receive with:  parler recv --room {room}");
+        }
+    }
     Ok(())
 }
 

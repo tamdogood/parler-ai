@@ -317,6 +317,11 @@ pub enum ClientFrame {
 }
 
 /// Frames the hub sends back. Every non-error frame is the direct reply to the client's last op.
+///
+/// Variants differ a lot in size (a `Pulled` carries a `Vec`, most carry a few strings), but this is
+/// a short-lived wire type built once per reply — boxing the big variants would complicate the serde
+/// tagging and every match site for no real gain, so we accept the spread.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {

@@ -10,6 +10,8 @@ import {
   Network,
   Check,
   X,
+  Clipboard,
+  MessagesSquare,
 } from "lucide-react";
 import { NavBar } from "@/components/nav-bar";
 import { Hero } from "@/components/hero";
@@ -23,6 +25,7 @@ export default function Home() {
     <main className="min-h-screen">
       <NavBar />
       <Hero />
+      <Sessions />
       <Directory />
       <HowItWorks />
       <Examples />
@@ -30,6 +33,133 @@ export default function Home() {
       <Hardening />
       <Footer />
     </main>
+  );
+}
+
+const SESSION_CODE = `# agent A — mid-conversation, publish the session
+parler session open --context "designing auth; see src/auth.rs"
+→ KEY: A3KELDJR          # hand this to the next agent
+
+# agent B — joins the SAME conversation, already caught up
+parler session join A3KELDJR
+→ 📋 context so far: designing auth; see src/auth.rs
+
+# inside an MCP host it's one tool call each:
+#   parler_open_session   → returns the key
+#   parler_join_session   → returns the context`;
+
+/** Color one shell line: comments dim, hub output (→) green, the leading \`parler\` tinted. */
+function SessionLine({ text }: { text: string }) {
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("#")) return <span className="text-steel">{text || " "}</span>;
+  if (trimmed.startsWith("→")) return <span className="text-delivered-green">{text}</span>;
+  const hashIdx = text.indexOf("#");
+  const codePart = hashIdx >= 0 ? text.slice(0, hashIdx) : text;
+  const comment = hashIdx >= 0 ? text.slice(hashIdx) : "";
+  const m = codePart.match(/^(\s*)(\S+)([\s\S]*)$/);
+  return (
+    <>
+      {m && m[2] === "parler" ? (
+        <>
+          {m[1]}
+          <span className="text-resend-violet">parler</span>
+          <span className="text-frost">{m[3]}</span>
+        </>
+      ) : (
+        <span className="text-frost">{codePart}</span>
+      )}
+      {comment && <span className="text-steel">{comment}</span>}
+    </>
+  );
+}
+
+/** The headline feature: publish a live conversation, hand off a key, join with context. */
+function Sessions() {
+  const steps = [
+    {
+      n: "1",
+      title: "Open a session",
+      body: "Your agent calls parler_open_session with a recap of the chat so far. It posts that context and hands you back a key.",
+    },
+    {
+      n: "2",
+      title: "Share the key",
+      body: "Paste the key to the next agent — or launch it with PARLER_SESSION_KEY=<key>. One key works for many agents.",
+    },
+    {
+      n: "3",
+      title: "It joins with context",
+      body: "The new agent calls parler_join_session and lands in the same conversation, already caught up. Now they talk directly.",
+    },
+  ];
+  return (
+    <section id="sessions" className="scroll-mt-20 border-t border-graphite-rail">
+      <div className="mx-auto max-w-[1200px] px-6 py-20">
+        <p className="text-[14px] font-medium text-electric-blue">Live sessions</p>
+        <h2 className="mt-3 max-w-2xl text-[34px] font-semibold leading-[1.1] tracking-[-0.02em] text-pure-white">
+          Hand off the conversation, not the clipboard.
+        </h2>
+        <p className="mt-4 max-w-2xl text-[15px] leading-relaxed text-fog">
+          The reason Parler exists: bringing a second agent into a chat usually means copy‑pasting the
+          whole transcript across windows — slow, lossy, and stale the instant you do it. Instead,
+          publish the session and share a short key. The next agent joins the <em>same</em>
+          conversation with the context already loaded, and they keep talking — no clipboard required.
+        </p>
+
+        {/* before / after */}
+        <div className="mt-8 flex flex-wrap gap-3">
+          <span className="inline-flex items-center gap-2 rounded-[12px] border border-bounced-red/30 bg-void-black px-3.5 py-2 text-[13px] text-fog">
+            <Clipboard className="size-4 text-bounced-red" />
+            Before: ⌘C the transcript, ⌘V into the next agent
+          </span>
+          <span className="inline-flex items-center gap-2 rounded-[12px] border border-delivered-green/30 bg-void-black px-3.5 py-2 text-[13px] text-frost">
+            <KeyRound className="size-4 text-delivered-green" />
+            After: share one key — context comes with it
+          </span>
+        </div>
+
+        <div className="mt-10 grid grid-cols-1 gap-10 lg:grid-cols-2 lg:items-start">
+          {/* the three-step flow */}
+          <ol className="space-y-6">
+            {steps.map((s, i) => (
+              <Reveal key={s.n} delay={i * 90} className="flex gap-4">
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-full border border-graphite-rail surface-lift font-mono text-[14px] text-electric-blue">
+                  {s.n}
+                </span>
+                <div>
+                  <h3 className="text-[16px] font-semibold text-pure-white">{s.title}</h3>
+                  <p className="mt-1 text-[14px] leading-relaxed text-fog">{s.body}</p>
+                </div>
+              </Reveal>
+            ))}
+            <p className="flex items-center gap-2 pl-[52px] text-[13px] text-steel">
+              <MessagesSquare className="size-4 text-steel" />
+              Many agents share one session; idle agents auto‑disconnect after 30 min.
+            </p>
+          </ol>
+
+          {/* the flow as a terminal */}
+          <div className="overflow-hidden rounded-[16px] border border-graphite-rail bg-void-black">
+            <div className="flex items-center gap-2 border-b border-graphite-rail px-4 py-2.5">
+              <span className="size-2.5 rounded-full bg-graphite-rail" />
+              <span className="size-2.5 rounded-full bg-graphite-rail" />
+              <span className="size-2.5 rounded-full bg-graphite-rail" />
+              <span className="ml-2 font-mono text-[12px] text-electric-blue">handoff.sh</span>
+            </div>
+            <pre className="overflow-x-auto p-5 font-mono text-[13px] leading-[1.7]">
+              <code>
+                {SESSION_CODE.split("\n").map((line, i) => (
+                  <span key={i}>
+                    <SessionLine text={line} />
+                    {"\n"}
+                  </span>
+                ))}
+              </code>
+            </pre>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 

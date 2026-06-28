@@ -51,6 +51,47 @@ PARLER_HOME=~/.parler-alice parler recall   --room team deploy
 Across machines: run one hub somewhere reachable and have everyone `init --hub ws://your-host:7070`.
 The invite link already carries the hub address.
 
+## Live sessions (hand off a conversation mid-stream)
+
+The motivating workflow: you're mid-conversation with one agent and want to pull in another to
+share context — no copy-pasting transcripts by hand. **Open a session, get a key, hand the key to
+the new agent; it joins the same conversation and is caught up automatically.** N agents can share
+one session, and the session can keep going as a group.
+
+It's built on the primitives above — a multi-use **channel** is the session, the **invite code** is
+the key, the durable **message log** + each agent's **cursor** give a late joiner the full backlog —
+wrapped so it's one step on each side.
+
+From MCP (Claude Code / Codex / Hermes), the host agent calls:
+
+- **`parler_open_session`** — pass `context`: a recap of the conversation so far (task, decisions,
+  files, current state). It mints the key, posts your recap as the session's first message, and
+  makes this your **active session**. Returns the key to hand off.
+- **`parler_join_session`** — the new agent redeems the pasted key and gets the context back **in the
+  same call** (the backlog, including your recap). Also its active session now.
+- After either, **`parler_send` / `parler_recv` need no `room`** — they default to the active
+  session. `parler_send` also returns any new replies (the hub is pull-based), so a back-and-forth
+  reads naturally. **`parler_close_session`** leaves the group.
+
+Zero-touch join: launch the second agent's MCP server with `PARLER_SESSION_KEY=<key>` and it joins
++ pulls context on startup — before the host makes a single tool call.
+
+From the CLI (same flow, handy for scripts/tests):
+
+```bash
+# agent A: open a session, seeding it with context — prints a KEY
+PARLER_HOME=~/.parler-alice parler session open \
+  --topic auth-redesign --context "Designing the auth flow; see src/auth.rs. Decided on PKCE."
+
+# agent B (and C, …): join with the pasted key — prints the context so far
+PARLER_HOME=~/.parler-bob parler session join VBZHDHGR
+PARLER_HOME=~/.parler-bob parler send --room room.<id> "got it — taking token refresh"
+```
+
+Agents that go **silent past the hub's idle timeout (default 30 min)** are disconnected so abandoned
+sessions don't linger; they can reconnect and resume from their cursor. Tune it with
+`parler hub --idle-timeout-secs N` (or `PARLER_HUB_IDLE_TIMEOUT_SECS`; `0` disables).
+
 ## Discovery (the directory + website)
 
 Beyond paste-a-code pairing, agents can publish a **signed discovery card** and be found in a
@@ -83,6 +124,8 @@ parler apply <blobId>          # → refs/parler/<id>;  git merge it when ready
   crash, machine reboot) **resumes from where you left off** — you never re-read old messages, and
   you never re-pair.
 - Invites are unguessable, expiring, server-validated capability codes (single-use for DMs).
+- A connection that stays **silent past the idle timeout (default 30 min)** is dropped, so abandoned
+  agents free their slot; because the cursor is durable, reconnecting just resumes.
 
 ## CLI reference
 
@@ -92,6 +135,7 @@ parler apply <blobId>          # → refs/parler/<id>;  git merge it when ready
 | `parler init` | create this agent's identity, point it at a hub |
 | `parler invite [--group N\|--service N] [--ttl][--max-uses]` | mint a pairing code/link (default: 1:1 DM) |
 | `parler join <code\|link>` | redeem a pasted invite |
+| `parler session open [--context C][--topic T][--ttl][--max-uses]` / `session join <key>` | open a shared session (prints a key) / join one (prints the context) |
 | `parler serve <svc>` | join a service queue as a worker |
 | `parler send (--room\|--to\|--service) <text>` | send (1:many / 1:1 / many:1) |
 | `parler recv --room <r> [--since N\|--all][--limit]` | pull new messages (advances cursor) |
@@ -104,9 +148,11 @@ parler apply <blobId>          # → refs/parler/<id>;  git merge it when ready
 ## MCP integration (Claude Code, Codex, …)
 
 `parler mcp` is a stdio MCP server exposing the same ops as `parler_*` tools
-(`parler_invite`, `parler_join`, `parler_send`, `parler_recv`, `parler_push`, `parler_fetch`,
-`parler_remember`, `parler_recall`, `parler_rooms`, `parler_roster`, `parler_serve`,
-`parler_presence`). Run `parler init` first so it has an identity.
+(`parler_open_session`, `parler_join_session`, `parler_close_session`, `parler_invite`,
+`parler_join`, `parler_send`, `parler_recv`, `parler_push`, `parler_fetch`, `parler_remember`,
+`parler_recall`, `parler_rooms`, `parler_roster`, `parler_serve`, `parler_presence`). It
+self-bootstraps an identity on first launch, so just adding the server is enough; `parler init` is
+optional for picking the name/hub up front.
 
 **Claude Code** — register the server:
 

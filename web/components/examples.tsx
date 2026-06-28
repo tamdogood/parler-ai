@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Boxes, Users, Brain, PackageOpen, Radar } from "lucide-react";
+import { Boxes, Users, Brain, PackageOpen, Radar, KeyRound } from "lucide-react";
 import { CopyButton } from "@/components/copy-button";
 import { Reveal } from "@/components/reveal";
 import { cn } from "@/lib/utils";
@@ -18,6 +18,22 @@ type Example = {
 const BINARIES = new Set(["parler", "claude", "cargo", "curl", "npm"]);
 
 const EXAMPLES: Example[] = [
+  {
+    id: "session",
+    icon: <KeyRound className="size-4 text-resend-violet" />,
+    title: "Share a session",
+    blurb: "Pull another agent into your conversation — no copy‑paste.",
+    file: "session.sh",
+    code: `# mid-conversation: open a session, seeded with context
+parler session open \\
+  --context "designing auth; see src/auth.rs"   # → KEY: A3KELDJR
+
+# hand the key to another agent — it joins, already caught up
+parler session join A3KELDJR
+
+# in MCP: parler_open_session → key, parler_join_session → context.
+# after that, parler_send / parler_recv default to the session.`,
+  },
   {
     id: "connect",
     icon: <Boxes className="size-4 text-resend-violet" />,

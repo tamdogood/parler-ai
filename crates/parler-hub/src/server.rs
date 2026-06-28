@@ -43,6 +43,12 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// slow-loris connections that open a socket and never authenticate.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Default idle timeout for an *authenticated* connection: 30 minutes. A connection that sends no
+/// frame for this long is disconnected and its slot freed, so silent/abandoned agents don't linger
+/// in the hub. The agent can reconnect at any time and resume from its durable cursor. `None`
+/// disables the bound (see [`HubState::idle_timeout`]).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
+
 /// Hard ceiling on any client-supplied TTL (invites, directory tokens): 365 days. Prevents an
 /// attacker-supplied `ttl_secs` from overflowing the millisecond expiry math.
 const MAX_TTL_SECS: u64 = 365 * 24 * 3600;
@@ -115,6 +121,9 @@ pub struct HubState {
     pub max_message_bytes: usize,
     /// Ceiling on concurrent connections; once reached, new sockets are refused.
     pub max_connections: usize,
+    /// How long an authenticated connection may stay silent before the hub drops it. `None` keeps
+    /// connections open indefinitely. Defaults to [`DEFAULT_IDLE_TIMEOUT_SECS`].
+    pub idle_timeout: Option<Duration>,
     /// Optional shared join secret. When set, a connection must present a matching `secret` on its
     /// signed `Hello` to authenticate — the access gate for a closed/private hub. `None` ⇒ open.
     pub join_secret: Option<String>,
@@ -142,6 +151,7 @@ impl HubState {
             max_blob_dir_bytes: DEFAULT_MAX_BLOB_DIR_BYTES,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            idle_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
             join_secret: None,
             limits: RateLimits::default(),
             rate: Mutex::new(HashMap::new()),
@@ -510,23 +520,29 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<HubState>) {
 
     let mut conn = ConnState::default();
     loop {
-        // Until authenticated, bound how long a socket may sit idle — a slow-loris that never
-        // completes the handshake is dropped. Authenticated agents are pull-based and may idle, so
-        // no timeout applies once `authed`.
-        let next = if conn.authed.is_some() {
-            socket.recv().await
-        } else {
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv()).await {
+        // Bound how long a socket may sit idle. Before authentication the bound is short — a
+        // slow-loris that never completes the handshake is dropped. After authentication the bound
+        // is the (longer, configurable) idle timeout: agents are pull-based and may idle between
+        // actions, but one silent past the timeout is dropped so abandoned agents don't linger (it
+        // reconnects and resumes from its durable cursor). The deadline resets each iteration, so
+        // it measures silence since the last received frame. An authed `idle_timeout` of `None`
+        // disables the bound entirely.
+        let bound = if conn.authed.is_some() { state.idle_timeout } else { Some(HANDSHAKE_TIMEOUT) };
+        let next = match bound {
+            None => socket.recv().await,
+            Some(d) => match tokio::time::timeout(d, socket.recv()).await {
                 Ok(msg) => msg,
                 Err(_) => {
-                    let _ = send_frame(
-                        &mut socket,
-                        &ServerFrame::Error { message: "handshake timed out".into() },
-                    )
-                    .await;
+                    let reason = if conn.authed.is_some() {
+                        "idle timeout — disconnecting after inactivity"
+                    } else {
+                        "handshake timed out"
+                    };
+                    let _ =
+                        send_frame(&mut socket, &ServerFrame::Error { message: reason.into() }).await;
                     break;
                 }
-            }
+            },
         };
         let Some(Ok(msg)) = next else { break };
         match msg {
