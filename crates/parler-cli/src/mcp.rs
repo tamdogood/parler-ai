@@ -149,6 +149,12 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
     }
 }
 
+fn parse_embedding(v: Option<&Value>) -> Option<Vec<f32>> {
+    v.and_then(Value::as_array).map(|a| {
+        a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()
+    })
+}
+
 async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<String> {
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     let u32opt = |k: &str| args.get(k).and_then(Value::as_u64).map(|x| x as u32);
@@ -222,12 +228,14 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
         }
         "parler_remember" => {
             let text = s("text").ok_or_else(|| anyhow!("missing 'text'"))?;
-            agent.remember(&text, s("key"), s("room")).await?;
+            let embedding = parse_embedding(args.get("embedding"));
+            agent.remember(&text, s("key"), s("room"), embedding, s("embedding_model")).await?;
             Ok("remembered".into())
         }
         "parler_recall" => {
             let query = s("query").ok_or_else(|| anyhow!("missing 'query'"))?;
-            let hits = agent.recall(&query, s("room"), u32opt("limit")).await?;
+            let embedding = parse_embedding(args.get("embedding"));
+            let hits = agent.recall(&query, s("room"), u32opt("limit"), embedding).await?;
             if hits.is_empty() {
                 return Ok(format!("(nothing recalled for '{query}')"));
             }
@@ -710,21 +718,24 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_remember",
-            "Save a fact to shared memory. With a key, re-saving the same key overwrites (idempotent). Optionally scope to a room.",
+            "Save a fact to shared memory. With a key, re-saving the same key overwrites (idempotent). Optionally scope to a room. Pass an embedding vector for semantic recall (hybrid BM25 + vector search).",
             json!({
                 "text": { "type": "string" },
                 "key": { "type": "string" },
-                "room": { "type": "string" }
+                "room": { "type": "string" },
+                "embedding": { "type": "array", "items": { "type": "number" }, "description": "embedding vector (float32 array, must match hub dimension)" },
+                "embedding_model": { "type": "string", "description": "which model produced the embedding (e.g. text-embedding-3-small)" }
             }),
             &["text"],
         ),
         tool(
             "parler_recall",
-            "Full-text recall from memory — returns only the relevant facts (low token cost).",
+            "Recall from memory. Text-only runs BM25 full-text; with an embedding, runs hybrid BM25 + vector KNN (Reciprocal Rank Fusion). Either or both may be provided.",
             json!({
                 "query": { "type": "string" },
                 "room": { "type": "string" },
-                "limit": { "type": "integer" }
+                "limit": { "type": "integer" },
+                "embedding": { "type": "array", "items": { "type": "number" }, "description": "query embedding vector for semantic recall" }
             }),
             &["query"],
         ),

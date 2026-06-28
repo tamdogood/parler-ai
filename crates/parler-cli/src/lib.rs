@@ -733,7 +733,7 @@ async fn cmd_recv(a: RecvArgs) -> Result<()> {
 async fn cmd_remember(a: RememberArgs) -> Result<()> {
     let text = a.text.join(" ");
     let mut ag = connect().await?;
-    ag.remember(&text, a.key, a.room).await?;
+    ag.remember(&text, a.key, a.room, None, None).await?;
     println!("✓ remembered");
     Ok(())
 }
@@ -741,7 +741,7 @@ async fn cmd_remember(a: RememberArgs) -> Result<()> {
 async fn cmd_recall(a: RecallArgs) -> Result<()> {
     let query = a.query.join(" ");
     let mut ag = connect().await?;
-    let hits = ag.recall(&query, a.room, a.limit).await?;
+    let hits = ag.recall(&query, a.room, a.limit, None).await?;
     if hits.is_empty() {
         println!("(nothing recalled for '{query}')");
         return Ok(());

@@ -310,15 +310,28 @@ pub enum ClientFrame {
         limit: Option<u32>,
     },
     /// Write a fact to the memory store.
-    Remember { fact: Fact },
-    /// Full-text recall from the memory store (scoped to `room` if given, else the agent's reachable
-    /// memory: its private facts plus the rooms it belongs to).
+    Remember {
+        fact: Fact,
+        /// Client-supplied embedding vector for semantic recall. The hub stores it alongside the
+        /// fact; dimension must match the hub's configured `vec_dimension` (default 768).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<Vec<f32>>,
+        /// Which model produced the embedding (e.g. `"text-embedding-3-small"`), stored so
+        /// mixed models are detectable. Informational; the hub does not interpret it.
+        #[serde(default, rename = "embeddingModel", skip_serializing_if = "Option::is_none")]
+        embedding_model: Option<String>,
+    },
+    /// Recall from the memory store. Pure text runs FTS5/BM25; with an `embedding`, the hub runs
+    /// hybrid BM25 + vector KNN fused via Reciprocal Rank Fusion (best of both). Text-only or
+    /// vector-only also works — either field may be empty/absent for graceful degradation.
     Recall {
         query: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<Vec<f32>>,
     },
     /// List the rooms the agent belongs to.
     Rooms,

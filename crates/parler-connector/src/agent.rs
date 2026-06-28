@@ -291,10 +291,21 @@ impl MeshAgent {
     }
 
     /// Write a fact to the memory store (idempotent when `key` is set).
-    pub async fn remember(&mut self, text: &str, key: Option<String>, room: Option<String>) -> Result<()> {
+    pub async fn remember(
+        &mut self,
+        text: &str,
+        key: Option<String>,
+        room: Option<String>,
+        embedding: Option<Vec<f32>>,
+        embedding_model: Option<String>,
+    ) -> Result<()> {
         match self
             .transport
-            .request(ClientFrame::Remember { fact: Fact { key, text: text.to_string(), room } })
+            .request(ClientFrame::Remember {
+                fact: Fact { key, text: text.to_string(), room },
+                embedding,
+                embedding_model,
+            })
             .await?
         {
             ServerFrame::Remembered { .. } => Ok(()),
@@ -302,11 +313,18 @@ impl MeshAgent {
         }
     }
 
-    /// Full-text recall from the memory store.
-    pub async fn recall(&mut self, query: &str, room: Option<String>, limit: Option<u32>) -> Result<Vec<RecallHit>> {
+    /// Recall from the memory store. Pure text runs BM25; with an embedding, runs hybrid
+    /// BM25 + vector KNN fused via Reciprocal Rank Fusion.
+    pub async fn recall(
+        &mut self,
+        query: &str,
+        room: Option<String>,
+        limit: Option<u32>,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<Vec<RecallHit>> {
         match self
             .transport
-            .request(ClientFrame::Recall { query: query.to_string(), room, limit })
+            .request(ClientFrame::Recall { query: query.to_string(), room, limit, embedding })
             .await?
         {
             ServerFrame::Recalled { hits } => Ok(hits),
