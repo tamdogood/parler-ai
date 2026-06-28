@@ -67,6 +67,37 @@ impl Default for RateLimits {
     }
 }
 
+/// Background-janitor retention policy — how the hub bounds its otherwise append-only growth. Every
+/// trimming window defaults to *disabled*, so a deployed hub keeps every message/fact/blob until an
+/// operator opts in; only the always-safe expired-invite/token sweep (and an incremental vacuum) runs
+/// unconditionally. See [`Store::prune_messages`], [`Store::prune_facts`], [`Store::gc_blobs`].
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    /// Delete messages older than this. `None` ⇒ keep all message history.
+    pub message_max_age: Option<Duration>,
+    /// Always keep at least this many newest messages per room (the floor for `message_max_age`).
+    pub keep_messages_per_room: i64,
+    /// Keep only this many newest *unkeyed* facts per (author, room). `None` ⇒ keep all.
+    pub keep_unkeyed_facts: Option<i64>,
+    /// Delete blob bytes neither fetched nor created within this window. `None` ⇒ keep until the disk
+    /// budget fills.
+    pub blob_max_idle: Option<Duration>,
+    /// How often the janitor runs.
+    pub interval: Duration,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention {
+            message_max_age: None,
+            keep_messages_per_room: 10_000,
+            keep_unkeyed_facts: None,
+            blob_max_idle: None,
+            interval: Duration::from_secs(3600),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RateKind {
     Send,
@@ -129,6 +160,8 @@ pub struct HubState {
     pub join_secret: Option<String>,
     /// Per-agent flood limits.
     pub limits: RateLimits,
+    /// How the background janitor bounds append-only growth (defaults to keep-everything).
+    pub retention: Retention,
     /// In-memory rate-limit counters, keyed by agent id (resets on restart).
     rate: Mutex<HashMap<String, AgentRate>>,
     /// Live connection count, for the `max_connections` ceiling.
@@ -154,6 +187,7 @@ impl HubState {
             idle_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
             join_secret: None,
             limits: RateLimits::default(),
+            retention: Retention::default(),
             rate: Mutex::new(HashMap::new()),
             conn_count: AtomicUsize::new(0),
         }
@@ -208,8 +242,73 @@ pub fn app(state: Arc<HubState>) -> Router {
 /// Serve the hub on an already-bound listener (so tests can bind port 0).
 pub async fn serve(listener: tokio::net::TcpListener, state: Arc<HubState>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&state.blob_dir)?;
+    tokio::spawn(run_janitor(state.clone()));
     axum::serve(listener, app(state).into_make_service()).await?;
     Ok(())
+}
+
+/// The periodic store janitor: sweeps expired invites/tokens, applies any opted-in retention, GCs
+/// stale blob bytes off disk, and reclaims free pages. All DB work runs on the blocking pool so a
+/// large prune never stalls the async runtime; only the (off-lock) file unlinks happen out here.
+async fn run_janitor(state: Arc<HubState>) {
+    let r = state.retention;
+    let mut tick = tokio::time::interval(r.interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick so startup isn't taxed; the first sweep happens one interval in.
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let now = now_ms();
+        let store = state.store.clone();
+        let stale_blobs = match tokio::task::spawn_blocking(move || janitor_pass(&store, &r, now)).await {
+            Ok(Ok(stale)) => stale,
+            Ok(Err(e)) => {
+                tracing::warn!("janitor pass failed: {e}");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("janitor task panicked: {e}");
+                continue;
+            }
+        };
+        // Unlink GC'd blob bytes off the DB lock; a missing file is fine (already gone).
+        for id in &stale_blobs {
+            match tokio::fs::remove_file(state.blob_dir.join(id)).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("janitor: unlink blob {id}: {e}"),
+            }
+        }
+        if !stale_blobs.is_empty() {
+            tracing::info!("janitor: gc'd {} stale blobs", stale_blobs.len());
+        }
+    }
+}
+
+/// One synchronous janitor pass over the store; returns the content ids whose disk bytes to unlink.
+fn janitor_pass(store: &Store, r: &Retention, now: i64) -> anyhow::Result<Vec<String>> {
+    let swept = store.sweep_expired(now)?;
+    if swept > 0 {
+        tracing::info!("janitor: swept {swept} expired invites/tokens");
+    }
+    if let Some(age) = r.message_max_age {
+        let n = store.prune_messages(age.as_millis() as i64, r.keep_messages_per_room, now)?;
+        if n > 0 {
+            tracing::info!("janitor: pruned {n} old messages");
+        }
+    }
+    if let Some(keep) = r.keep_unkeyed_facts {
+        let n = store.prune_facts(keep)?;
+        if n > 0 {
+            tracing::info!("janitor: pruned {n} unkeyed facts");
+        }
+    }
+    let stale = match r.blob_max_idle {
+        Some(idle) => store.gc_blobs(idle.as_millis() as i64, now)?,
+        None => Vec::new(),
+    };
+    store.incremental_vacuum()?;
+    Ok(stale)
 }
 
 /// `GET /` — a small, self-documenting landing page. Hitting the hub's URL in a browser should
@@ -687,6 +786,8 @@ fn handle_get_blob(state: &HubState, me: &Authed, id: &str) -> anyhow::Result<Re
     if !state.store.blob_readable_by(id, &me.id)? {
         anyhow::bail!("not authorized to fetch blob '{id}'");
     }
+    // Record the fetch as the LRU signal for blob GC; never fail a download over a bookkeeping write.
+    let _ = state.store.touch_blob_fetched(id, now_ms());
     // `id` is already proven to be a stored content id (it has a `blobs` row), so it's a 64-char hex
     // string — `join` here can't escape `blob_dir`.
     Ok(Reply::FrameThenFile(
@@ -1037,6 +1138,20 @@ fn gen_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn janitor_pass_sweeps_expired_and_gcs_idle_blobs() {
+        let store = Store::open(None).unwrap();
+        store.ensure_room("r", RoomKind::Channel, None, 1).unwrap();
+        store.create_invite("C", "r", RoomKind::Channel, None, 1, 100, "U", 1).unwrap();
+        store.put_blob_meta("idleblob", "r", "U", None, 8, 100).unwrap();
+        let r = Retention { blob_max_idle: Some(Duration::from_secs(1)), ..Retention::default() };
+        // At now=10_000ms the invite (expires 100) is swept and the blob (created 100) is GC'd.
+        let stale = janitor_pass(&store, &r, 10_000).unwrap();
+        assert_eq!(stale, vec!["idleblob".to_string()]);
+        assert!(store.redeem_invite("C", "U2", 10_000).is_err()); // invite gone
+        assert!(store.blob_meta("idleblob").unwrap().is_none()); // blob row gone
+    }
 
     #[test]
     fn normalize_code_extracts_from_links() {

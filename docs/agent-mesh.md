@@ -198,7 +198,8 @@ Hermes gets the same behavior through its existing plugin (the `MeshHandle` seam
 
 - **`parler-protocol`** — the wire types, incl. `hub.rs` (the client⇄hub frames). Pure, transport-agnostic.
 - **`parler-hub`** — axum WebSocket server + `store.rs` (SQLite: rooms, members, message log with a
-  monotonic `seq`/cursor, FTS5 `facts`, invites).
+  monotonic `seq`/cursor, FTS5 `facts`, invites). Storage/scalability design, audit, retention, and the
+  vector-search (`sqlite-vec`) decision: [`storage-and-memory.md`](./storage-and-memory.md).
 - **`parler-connector`** — the `MeshAgent` core, the `MeshTransport` seam, the `HubClient` (WS), and
   local identity/config.
 - **`parler-cli`** / **`parler-bin`** — the `parler` binary (subcommands + `parler mcp`).

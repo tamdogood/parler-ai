@@ -18,7 +18,7 @@
 pub mod server;
 pub mod store;
 
-pub use server::{app, serve, HubMode, HubState, RateLimits, DEFAULT_MAX_BLOB_BYTES};
+pub use server::{app, serve, HubMode, HubState, RateLimits, Retention, DEFAULT_MAX_BLOB_BYTES};
 pub use store::{BlobMeta, Store};
 
 use std::time::{SystemTime, UNIX_EPOCH};
