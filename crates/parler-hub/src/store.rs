@@ -121,6 +121,25 @@ CREATE TABLE IF NOT EXISTS directory_tokens (
   created_by TEXT NOT NULL,
   created    INTEGER NOT NULL
 );
+
+-- Content-addressed blob store (code handoff). Bytes live on disk under `<blob_dir>/<id>`; this is
+-- just metadata, keyed by `id` = lowercase-hex SHA-256, so identical bytes dedup to one row.
+CREATE TABLE IF NOT EXISTS blobs (
+  id         TEXT PRIMARY KEY,
+  media_type TEXT,
+  size       INTEGER NOT NULL,
+  created    INTEGER NOT NULL
+);
+
+-- Which rooms a blob was posted to (a blob may be handed off in several rooms, possibly by different
+-- authors, even though the bytes are one). Download is authorized by membership of any such room.
+CREATE TABLE IF NOT EXISTS blob_rooms (
+  blob    TEXT NOT NULL,
+  room    TEXT NOT NULL,
+  author  TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  PRIMARY KEY (blob, room)
+);
 "#;
 
 /// Self-reported presence older than this (epoch-ms gap to "now") reads as `offline`. Presence is
@@ -594,6 +613,67 @@ impl Store {
         Ok(matches!(exp, Some(e) if now <= e))
     }
 
+    // ---- blobs (code handoff) ----
+
+    /// Record a stored blob's metadata and bind it to `room` (idempotent: same bytes/room reuse the
+    /// rows). The bytes themselves are written to disk by the caller, keyed by `id`.
+    pub fn put_blob_meta(
+        &self,
+        id: &str,
+        room: &str,
+        author: &str,
+        media_type: Option<&str>,
+        size: i64,
+        now: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO blobs (id, media_type, size, created) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, media_type, size, now],
+        )?;
+        conn.execute(
+            "INSERT INTO blob_rooms (blob, room, author, created) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(blob, room) DO NOTHING",
+            params![id, room, author, now],
+        )?;
+        Ok(())
+    }
+
+    /// A stored blob's metadata (bytes length + media type), or `None` if unknown.
+    pub fn blob_meta(&self, id: &str) -> Result<Option<BlobMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let m = conn
+            .query_row(
+                "SELECT id, media_type, size, created FROM blobs WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(BlobMeta {
+                        id: r.get(0)?,
+                        media_type: r.get(1)?,
+                        size: r.get(2)?,
+                        created: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(m)
+    }
+
+    /// Whether `agent` may download blob `id` — true iff it is a member of a room the blob was
+    /// posted to.
+    pub fn blob_readable_by(&self, id: &str, agent: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM blob_rooms br
+               JOIN members m ON m.room = br.room
+              WHERE br.blob = ?1 AND m.agent = ?2",
+            params![id, agent],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     // ---- memory (facts) ----
 
     /// Write a fact. With a `key`, this upserts within (author, room, key) — idempotent updates.
@@ -682,6 +762,15 @@ fn build_fts_query(q: &str) -> String {
         .map(|s| format!("{}*", s.to_lowercase()))
         .collect();
     terms.join(" OR ")
+}
+
+/// Metadata for a content-addressed blob (the bytes live on disk under `<blob_dir>/<id>`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlobMeta {
+    pub id: String,
+    pub media_type: Option<String>,
+    pub size: i64,
+    pub created: i64,
 }
 
 struct RawMsg {
@@ -871,6 +960,32 @@ mod tests {
         assert!(s.is_member("dm.x", "U_B").unwrap());
         // Single-use invite is now spent.
         assert!(s.redeem_invite("CODE1", "U_C", 3).is_err());
+    }
+
+    #[test]
+    fn blob_meta_and_room_binding() {
+        let s = Store::open(None).unwrap();
+        s.ensure_room("dev", RoomKind::Channel, None, 1).unwrap();
+        s.add_member("dev", "U_A", 1).unwrap();
+
+        s.put_blob_meta("deadbeef", "dev", "U_A", Some("application/x-git-bundle"), 42, 1).unwrap();
+        // Idempotent: same bytes + room re-recorded without error or duplication.
+        s.put_blob_meta("deadbeef", "dev", "U_A", Some("application/x-git-bundle"), 42, 2).unwrap();
+
+        let m = s.blob_meta("deadbeef").unwrap().unwrap();
+        assert_eq!(m.size, 42);
+        assert_eq!(m.media_type.as_deref(), Some("application/x-git-bundle"));
+        assert!(s.blob_meta("nope").unwrap().is_none());
+
+        // Members of a bound room can read; everyone else cannot.
+        assert!(s.blob_readable_by("deadbeef", "U_A").unwrap());
+        assert!(!s.blob_readable_by("deadbeef", "U_B").unwrap());
+
+        // Binding the same blob to a second room a new member belongs to opens access for them.
+        s.ensure_room("ops", RoomKind::Channel, None, 1).unwrap();
+        s.add_member("ops", "U_B", 1).unwrap();
+        s.put_blob_meta("deadbeef", "ops", "U_B", None, 42, 3).unwrap();
+        assert!(s.blob_readable_by("deadbeef", "U_B").unwrap());
     }
 
     #[test]

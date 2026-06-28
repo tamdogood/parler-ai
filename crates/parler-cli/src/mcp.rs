@@ -6,7 +6,7 @@
 //! surface tiny and gives exact control over the wire, which matters more than an SDK here.
 
 use anyhow::{anyhow, bail, Result};
-use parler_connector::{Config, MeshAgent};
+use parler_connector::{BundleMeta, Config, MeshAgent};
 use parler_protocol::{AgentSkill, DiscoverScope, RoomKind, Target, Visibility};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -121,6 +121,44 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
             };
             let (_id, seq, room) = agent.send_text(target, &text).await?;
             Ok(format!("sent to '{room}' (seq {seq})"))
+        }
+        "parler_push" => {
+            let target = if let Some(r) = s("room") {
+                Target::Room { room: r }
+            } else if let Some(t) = s("to") {
+                Target::Dm { agent: t }
+            } else if let Some(sv) = s("service") {
+                Target::Service { service: sv }
+            } else {
+                bail!("provide exactly one of room / to / service");
+            };
+            let gitref = s("gitref").unwrap_or_else(|| "HEAD".into());
+            let (bytes, tip, summary) =
+                crate::build_git_bundle(s("repo").as_deref(), &gitref, s("base").as_deref(), s("summary"))?;
+            let meta = BundleMeta {
+                vcs: "git".into(),
+                tip: Some(tip.clone()),
+                base: s("base"),
+                summary: (!summary.is_empty()).then(|| summary.clone()),
+                media_type: Some("application/x-git-bundle".into()),
+            };
+            let r = agent.push(target, &bytes, meta, s("note")).await?;
+            Ok(format!(
+                "pushed git bundle to '{}' (seq {}, {} bytes).\ntip: {} {summary}\nblob: {}\nThe peer can run: parler apply {}",
+                r.room,
+                r.seq,
+                bytes.len(),
+                tip,
+                r.blob_id,
+                r.blob_id
+            ))
+        }
+        "parler_fetch" => {
+            let id = s("id").ok_or_else(|| anyhow!("missing 'id'"))?;
+            let bytes = agent.fetch_blob(&id).await?;
+            let out = s("out").unwrap_or_else(|| format!("{}.bundle", &id[..id.len().min(12)]));
+            std::fs::write(&out, &bytes)?;
+            Ok(format!("wrote {} bytes to {out} (apply with: git bundle verify {out} && git fetch {out})", bytes.len()))
         }
         "parler_recv" => {
             let room = s("room").ok_or_else(|| anyhow!("missing 'room'"))?;
@@ -315,6 +353,30 @@ fn tool_specs() -> Vec<Value> {
                 "limit": { "type": "integer" }
             }),
             &["query"],
+        ),
+        tool(
+            "parler_push",
+            "Hand off code: build a git bundle from the current repo and push it to a room/peer/service. Provide exactly one of room / to / service. With base, bundle only base..gitref (a thin patch series). The peer applies it with `parler apply <blob>`.",
+            json!({
+                "room": { "type": "string" },
+                "to": { "type": "string" },
+                "service": { "type": "string" },
+                "gitref": { "type": "string", "description": "ref/tip to bundle (default HEAD)" },
+                "base": { "type": "string", "description": "only bundle commits after this ref, e.g. origin/main" },
+                "summary": { "type": "string" },
+                "note": { "type": "string" },
+                "repo": { "type": "string", "description": "repo path (default: current directory)" }
+            }),
+            &[],
+        ),
+        tool(
+            "parler_fetch",
+            "Download a pushed bundle's bytes by its blob id (from a com.parler.bundle message) and write them to a file. Does NOT apply — verify and fetch with git yourself.",
+            json!({
+                "id": { "type": "string" },
+                "out": { "type": "string", "description": "output file (default: <blob>.bundle)" }
+            }),
+            &["id"],
         ),
         tool("parler_rooms", "List the rooms you belong to, with unread counts.", json!({}), &[]),
         tool(

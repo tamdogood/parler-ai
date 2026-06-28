@@ -1,3 +1,55 @@
+# Feature: Code Handoff — git-bundle artifact passing (2026-06-27, BUILT)
+
+**User ask:** investigate [ottogin/agenthub](https://github.com/ottogin/agenthub) and borrow the good
+stuff. Conclusion: Parler is the *communication* plane (Slack); agenthub is the *artifact* plane
+(GitHub). The gap worth filling is that agents can pass messages/facts but **not work artifacts**.
+Borrowed the **git-bundle transport** (not agenthub's commit-DAG/GitHub metaphor). Full spec:
+`docs/code-handoff.md`.
+
+Design in one line: a handoff = a content-addressed **blob** (sha256 of a git bundle, on the hub's
+disk, bound to its room) + an ordinary room message carrying a `Part::Extension { kind:
+"com.parler.bundle", ... }`. Bytes move over the **already-authenticated WebSocket as binary frames**
+(no new HTTP channel, no new dep, no capability tokens). `send`/`recv`/cursor/wake all work unchanged.
+
+## Phase 1 — blob handoff (MVP)
+- [x] `parler-protocol::hub`: `PutBlob`/`GetBlob` (`ClientFrame`); `BlobReady`/`BlobStored`/`BlobIncoming` (`ServerFrame`)
+- [x] `parler-protocol::hub`: `BUNDLE_KIND` const + `BundleRef::{to_part,from_part}` (+ round-trip test)
+- [x] `parler-hub::store`: `blobs` + `blob_rooms` tables (metadata; bytes on disk); `BlobMeta`/`put_blob_meta`/`blob_meta`/`blob_readable_by` (+ test)
+- [x] `parler-hub::server`: `PutBlob` (resolve `Target` + member + size → `BlobReady`) → consume one Binary frame (verify sha256+len) → persist → `BlobStored`
+- [x] `parler-hub::server`: `GetBlob` (member-of-any-bound-room check → `BlobIncoming` + Binary frame)
+- [x] `parler-hub`: `HubState::new` + `{blob_dir,max_blob_bytes}` + flags/env; `serve` creates the dir
+- [x] `parler-connector::client`: `recv_binary` + `MeshTransport::{upload_blob,download_blob}`
+- [x] `parler-connector::agent`: `push(target, bundle, meta, note)`, `fetch_blob(id)`, `BundleMeta`, `PushReceipt`
+- [x] `parler-cli`: `push` (git bundle create → upload → post message), `fetch` (bytes only), `apply` (verify+fetch into `refs/parler/*`, never auto-merge)
+- [x] `parler-cli`: `recv` renders a `com.parler.bundle` part (📦, full blob id in the apply hint)
+- [x] `parler-cli::mcp`: `parler_push`, `parler_fetch` (NO apply)
+- [x] e2e test: push → recv (sees bundle part) → fetch_blob → bytes match → non-member denied
+- [x] content-address helper `parler_auth::content_id` (single source of truth for hub + connector)
+
+## Phase 2 — defense (borrowed from agenthub)
+- [x] `max_blob_bytes` enforced (default 25 MiB, `--max-blob-bytes`/env) at PutBlob + on the received frame
+- [x] per-agent in-memory fixed-window rate limits (`RateLimits`: 240 sends/min, 120 blobs/hour) on `HubState`
+
+## Phase 3 — frontier (deferred; possible scope creep)
+- [ ] index latest bundle per room (tip/summary/author); `parler frontier --room R`; surface in `rooms`/website
+
+## Review — 2026-06-27
+Built Phase 1 + Phase 2. Decisions: **WS-binary** transport (no new dep/HTTP/token surface),
+**single-frame** blobs, **25 MiB** cap, Phase 3 deferred.
+- **Tests:** `--no-fail-fast` across touched crates green — protocol **24** (+blob frames, +BundleRef
+  round-trip), hub **10** (+blob meta/room binding), connector e2e **7** (+`code_handoff_*`) & discovery
+  **5**. Only failure is the pre-existing `parler-auth` `auth_live` (needs a vendored `nats-server`).
+- **Live, real git:** two `parler` agents over a real hub — `push` a real git bundle → peer `recv`s
+  the 📦 handoff → `apply` lands the **exact tip** in a fresh repo (both commits present) → non-member
+  `fetch` denied → blobs persisted content-addressed under `<db>.blobs/`.
+- **Clippy:** clean except a **pre-existing** `large_enum_variant` on `ServerFrame::Card` (DirectoryEntry),
+  unrelated to this feature; new variants are tiny.
+- **Additive / backward-compatible:** new frames + one extension kind; old clients render an unknown
+  bundle part gracefully. Docs: `docs/code-handoff.md` (full spec, "as built"), `docs/agent-mesh.md`,
+  `README.md` updated.
+
+---
+
 # Feature: The first public hub — deploy + wss:// (2026-06-27)
 
 **User ask:** create the first server anyone can publish their agents onto, so it's the first live
