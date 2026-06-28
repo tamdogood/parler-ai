@@ -1,19 +1,19 @@
 //! End-to-end: a real in-process hub + real WebSocket clients exercising the whole feature —
 //! the three delivery patterns, paste-a-code pairing, memory scoping, durable resume, and authz.
 
-use parler_connector::{Config, MeshAgent};
-use parler_protocol::{Part, RoomKind, StoredMessage, Target};
+use parler_connector::{BundleMeta, Config, MeshAgent};
+use parler_protocol::{BundleRef, Part, RoomKind, StoredMessage, Target};
 use std::sync::Arc;
 
 /// Start an in-memory hub on an ephemeral port; return its ws:// URL.
 async fn start_hub() -> String {
     let store = parler_hub::Store::open(None).unwrap();
-    let state = Arc::new(parler_hub::HubState {
+    let state = Arc::new(parler_hub::HubState::new(
         store,
-        public_url: "parler://test".into(),
-        name: "Test Hub".into(),
-        mode: parler_hub::HubMode::Private,
-    });
+        "parler://test".into(),
+        "Test Hub".into(),
+        parler_hub::HubMode::Private,
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -155,6 +155,49 @@ async fn reconnect_resumes_from_durable_cursor() {
     let mut bob2 = MeshAgent::connect(&bob_cfg).await.unwrap();
     let (m2, _) = bob2.pull(&room, None, None).await.unwrap();
     assert_eq!(texts(&m2), vec!["second"]);
+}
+
+#[tokio::test]
+async fn code_handoff_push_recv_fetch_round_trips() {
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let mut bob = agent(&hub, "bob", None).await;
+    let inv = alice.invite(RoomKind::Channel, Some("dev".into()), None, None).await.unwrap();
+    bob.join(&inv.code).await.unwrap();
+
+    // The hub treats the bundle as opaque bytes, so any payload exercises the transport.
+    let bundle = b"PARLER-FAKE-GIT-BUNDLE\x00\x01\x02 some commits here".to_vec();
+    let meta = BundleMeta {
+        vcs: "git".into(),
+        tip: Some("abc123def".into()),
+        base: None,
+        summary: Some("feat: add the thing".into()),
+        media_type: Some("application/x-git-bundle".into()),
+    };
+    let receipt = alice
+        .push(Target::Room { room: inv.room.clone() }, &bundle, meta, Some("here's the patch".into()))
+        .await
+        .unwrap();
+
+    // Bob sees the handoff as an ordinary message carrying a bundle reference (+ the note).
+    let (msgs, _) = bob.pull(&inv.room, None, None).await.unwrap();
+    assert_eq!(texts(&msgs), vec!["here's the patch"]);
+    let bref = msgs
+        .iter()
+        .flat_map(|m| &m.parts)
+        .find_map(BundleRef::from_part)
+        .expect("a com.parler.bundle part");
+    assert_eq!(bref.blob, receipt.blob_id);
+    assert_eq!(bref.summary.as_deref(), Some("feat: add the thing"));
+    assert_eq!(bref.size, bundle.len() as u64);
+
+    // Bob fetches the bytes by content id and they match exactly.
+    let got = bob.fetch_blob(&bref.blob).await.unwrap();
+    assert_eq!(got, bundle);
+
+    // A non-member of the room cannot fetch the blob.
+    let mut eve = agent(&hub, "eve", None).await;
+    assert!(eve.fetch_blob(&bref.blob).await.is_err());
 }
 
 #[tokio::test]

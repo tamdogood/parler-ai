@@ -5,8 +5,9 @@
 //! goes on the wire and is folded into a creds file the endpoint loads to authenticate as this id.
 
 use crate::error::AuthError;
-use data_encoding::{BASE64, BASE64URL_NOPAD};
+use data_encoding::{BASE64, BASE64URL_NOPAD, HEXLOWER};
 use nkeys::KeyPair;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
@@ -46,6 +47,15 @@ pub fn verify(id: &str, msg: &[u8], sig_b64: &str) -> bool {
         return false;
     };
     kp.verify(msg, &sig).is_ok()
+}
+
+/// The **content address** of a blob: lowercase-hex SHA-256 of its bytes.
+///
+/// Used to name and verify artifacts handed off through a hub (e.g. git bundles): the id *is* the
+/// hash, so a stored blob dedups by content and any consumer can re-verify the bytes match the id.
+/// The hashing is defined here so the uploader (connector) and the verifier (hub) agree byte-for-byte.
+pub fn content_id(bytes: &[u8]) -> String {
+    HEXLOWER.encode(&Sha256::digest(bytes))
 }
 
 /// The stable id carried by a creds file: the agent's nkey public key, derived from the seed block

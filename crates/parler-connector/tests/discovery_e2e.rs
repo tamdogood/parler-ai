@@ -31,12 +31,12 @@ async fn start_hub(public: bool) -> String {
     } else {
         parler_hub::HubMode::Private
     };
-    let state = Arc::new(parler_hub::HubState {
+    let state = Arc::new(parler_hub::HubState::new(
         store,
-        public_url: "parler://test".into(),
-        name: "Parler Public".into(),
+        "parler://test".into(),
+        "Parler Public".into(),
         mode,
-    });
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

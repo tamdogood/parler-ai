@@ -19,8 +19,46 @@ use parler_protocol::{
 };
 use rand::Rng;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
+
+/// Default cap on a single handed-off blob (git bundle): 25 MiB.
+pub const DEFAULT_MAX_BLOB_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Per-agent flood limits (fixed-window). `0` disables a limit. State is in-memory and resets on
+/// hub restart — a deliberately simple posture for a low-ops bus.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimits {
+    pub max_sends_per_min: u32,
+    pub max_blobs_per_hour: u32,
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        RateLimits { max_sends_per_min: 240, max_blobs_per_hour: 120 }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RateKind {
+    Send,
+    Blob,
+}
+
+/// A single fixed-window counter.
+#[derive(Default, Clone, Copy)]
+struct Window {
+    start: i64,
+    count: u32,
+}
+
+#[derive(Default)]
+struct AgentRate {
+    sends: Window,
+    blobs: Window,
+}
 
 /// Whether a hub's directory is world-readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,13 +78,66 @@ impl HubMode {
     }
 }
 
-/// Shared server state: the durable store, the hub's identity (name/mode), and the base URL
-/// advertised in invite links.
+/// Shared server state: the durable store, the hub's identity (name/mode), the base URL advertised in
+/// invite links, the on-disk blob directory, and per-agent flood limits.
 pub struct HubState {
     pub store: Store,
     pub public_url: String,
     pub name: String,
     pub mode: HubMode,
+    /// Where handed-off blob bytes are written, one file per content id.
+    pub blob_dir: PathBuf,
+    /// Largest single blob the hub accepts.
+    pub max_blob_bytes: u64,
+    /// Per-agent flood limits.
+    pub limits: RateLimits,
+    /// In-memory rate-limit counters, keyed by agent id (resets on restart).
+    rate: Mutex<HashMap<String, AgentRate>>,
+}
+
+impl HubState {
+    /// Build state with default blob settings (a unique temp `blob_dir`, [`DEFAULT_MAX_BLOB_BYTES`],
+    /// default [`RateLimits`]). Callers may override the public `blob_dir`/`max_blob_bytes`/`limits`
+    /// fields before serving.
+    pub fn new(store: Store, public_url: String, name: String, mode: HubMode) -> HubState {
+        let blob_dir = std::env::temp_dir().join(format!("parler-blobs-{}", uuid::Uuid::new_v4()));
+        HubState {
+            store,
+            public_url,
+            name,
+            mode,
+            blob_dir,
+            max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
+            limits: RateLimits::default(),
+            rate: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Charge one event of `kind` against `agent`'s fixed window; `true` if it is within the limit.
+    fn rate_allows(&self, agent: &str, kind: RateKind, now: i64) -> bool {
+        let (limit, window_ms) = match kind {
+            RateKind::Send => (self.limits.max_sends_per_min, 60_000),
+            RateKind::Blob => (self.limits.max_blobs_per_hour, 3_600_000),
+        };
+        if limit == 0 {
+            return true;
+        }
+        let mut map = self.rate.lock().unwrap();
+        let ar = map.entry(agent.to_string()).or_default();
+        let w = match kind {
+            RateKind::Send => &mut ar.sends,
+            RateKind::Blob => &mut ar.blobs,
+        };
+        if now - w.start >= window_ms {
+            w.start = now;
+            w.count = 0;
+        }
+        if w.count >= limit {
+            return false;
+        }
+        w.count += 1;
+        true
+    }
 }
 
 /// Build the axum router: health, the human join page, the agent WebSocket, and the read-only
@@ -69,6 +160,7 @@ pub fn app(state: Arc<HubState>) -> Router {
 
 /// Serve the hub on an already-bound listener (so tests can bind port 0).
 pub async fn serve(listener: tokio::net::TcpListener, state: Arc<HubState>) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&state.blob_dir)?;
     axum::serve(listener, app(state).into_make_service()).await?;
     Ok(())
 }
@@ -189,6 +281,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 struct ConnState {
     nonce: Option<String>,
     authed: Option<Authed>,
+    /// A reserved upload awaiting its bytes (set by `PutBlob`, consumed by the next binary frame).
+    pending: Option<PendingUpload>,
 }
 
 #[derive(Clone)]
@@ -198,6 +292,21 @@ struct Authed {
     role: Option<String>,
 }
 
+/// An accepted `PutBlob` whose bytes the next binary frame must deliver.
+struct PendingUpload {
+    id: String,
+    room: String,
+    author: String,
+    size: u64,
+    media_type: Option<String>,
+}
+
+/// What the connection should send back: a single frame, or a frame followed by a binary blob.
+enum Reply {
+    Frame(ServerFrame),
+    FrameThenBlob(ServerFrame, Vec<u8>),
+}
+
 async fn handle_socket(mut socket: WebSocket, state: Arc<HubState>) {
     let mut conn = ConnState::default();
     while let Some(Ok(msg)) = socket.recv().await {
@@ -205,14 +314,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<HubState>) {
             WsMessage::Text(txt) => {
                 let reply = match serde_json::from_str::<ClientFrame>(&txt) {
                     Ok(frame) => dispatch(&state, &mut conn, frame),
-                    Err(e) => ServerFrame::Error {
+                    Err(e) => Reply::Frame(ServerFrame::Error {
                         message: format!("malformed frame: {e}"),
-                    },
+                    }),
                 };
-                let out = serde_json::to_string(&reply).unwrap_or_else(|_| {
-                    "{\"type\":\"error\",\"message\":\"reply serialize failed\"}".into()
-                });
-                if socket.send(WsMessage::Text(out)).await.is_err() {
+                if !send_reply(&mut socket, reply).await {
+                    break;
+                }
+            }
+            WsMessage::Binary(data) => {
+                let reply = Reply::Frame(handle_blob_upload(&state, &mut conn, data));
+                if !send_reply(&mut socket, reply).await {
                     break;
                 }
             }
@@ -228,18 +340,121 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<HubState>) {
     // overwrite it to `offline` here, so a one-shot CLI command leaves a meaningful last-known status.
 }
 
+/// Send a [`Reply`]; returns `false` if the socket died (caller should stop).
+async fn send_reply(socket: &mut WebSocket, reply: Reply) -> bool {
+    match reply {
+        Reply::Frame(f) => send_frame(socket, &f).await,
+        Reply::FrameThenBlob(f, bytes) => {
+            send_frame(socket, &f).await && socket.send(WsMessage::Binary(bytes)).await.is_ok()
+        }
+    }
+}
+
+async fn send_frame(socket: &mut WebSocket, f: &ServerFrame) -> bool {
+    let out = serde_json::to_string(f).unwrap_or_else(|_| {
+        "{\"type\":\"error\",\"message\":\"reply serialize failed\"}".into()
+    });
+    socket.send(WsMessage::Text(out)).await.is_ok()
+}
+
 /// Route one client frame to its reply. Synchronous (the store never blocks across an await).
-fn dispatch(state: &HubState, conn: &mut ConnState, frame: ClientFrame) -> ServerFrame {
+fn dispatch(state: &HubState, conn: &mut ConnState, frame: ClientFrame) -> Reply {
     if let ClientFrame::Hello { id, name, role, sig, .. } = frame {
-        return handle_hello(state, conn, id, name, role, sig);
+        return Reply::Frame(handle_hello(state, conn, id, name, role, sig));
     }
     let Some(authed) = conn.authed.clone() else {
-        return ServerFrame::Error {
+        return Reply::Frame(ServerFrame::Error {
             message: "not authenticated — send `hello` first".into(),
+        });
+    };
+    // The two blob ops need the connection (to stash a pending upload) or a two-part reply, so they
+    // are handled here; everything else is a plain one-frame request/reply.
+    let result = match frame {
+        ClientFrame::PutBlob { target, sha256, size, media_type } => {
+            handle_put_blob(state, conn, &authed, target, sha256, size, media_type)
+        }
+        ClientFrame::GetBlob { id } => handle_get_blob(state, &authed, &id),
+        other => handle_authed(state, &authed, other).map(Reply::Frame),
+    };
+    result.unwrap_or_else(|e| Reply::Frame(ServerFrame::Error { message: e.to_string() }))
+}
+
+/// Accept a `PutBlob`: enforce the size cap + blob rate limit, resolve the target to a room (which
+/// also creates a DM / joins a service as needed), and stash a [`PendingUpload`] for the bytes.
+fn handle_put_blob(
+    state: &HubState,
+    conn: &mut ConnState,
+    me: &Authed,
+    target: Target,
+    sha256: String,
+    size: u64,
+    media_type: Option<String>,
+) -> anyhow::Result<Reply> {
+    if size > state.max_blob_bytes {
+        anyhow::bail!("blob too large: {size} bytes > limit {}", state.max_blob_bytes);
+    }
+    if !state.rate_allows(&me.id, RateKind::Blob, now_ms()) {
+        anyhow::bail!("rate limit: too many blob uploads — slow down");
+    }
+    let room = resolve_target(&state.store, me, &target)?;
+    conn.pending = Some(PendingUpload { id: sha256.clone(), room, author: me.id.clone(), size, media_type });
+    Ok(Reply::Frame(ServerFrame::BlobReady { id: sha256 }))
+}
+
+/// Serve a `GetBlob`: authorize by room membership, then reply with the metadata frame followed by
+/// the bytes.
+fn handle_get_blob(state: &HubState, me: &Authed, id: &str) -> anyhow::Result<Reply> {
+    let meta = state
+        .store
+        .blob_meta(id)?
+        .ok_or_else(|| anyhow::anyhow!("no such blob '{id}'"))?;
+    if !state.store.blob_readable_by(id, &me.id)? {
+        anyhow::bail!("not authorized to fetch blob '{id}'");
+    }
+    let bytes = std::fs::read(state.blob_dir.join(id))
+        .map_err(|e| anyhow::anyhow!("blob bytes unavailable: {e}"))?;
+    Ok(Reply::FrameThenBlob(
+        ServerFrame::BlobIncoming { id: id.to_string(), size: meta.size as u64, media_type: meta.media_type },
+        bytes,
+    ))
+}
+
+/// Consume the binary frame that follows a `PutBlob`: verify size + content id, persist to disk and
+/// the store. Any binary frame without a matching pending upload is an error.
+fn handle_blob_upload(state: &HubState, conn: &mut ConnState, data: Vec<u8>) -> ServerFrame {
+    let Some(p) = conn.pending.take() else {
+        return ServerFrame::Error {
+            message: "unexpected binary frame (no PutBlob in flight)".into(),
         };
     };
-    handle_authed(state, &authed, frame)
-        .unwrap_or_else(|e| ServerFrame::Error { message: e.to_string() })
+    if data.len() as u64 != p.size {
+        return ServerFrame::Error {
+            message: format!("blob size mismatch: got {} bytes, expected {}", data.len(), p.size),
+        };
+    }
+    if data.len() as u64 > state.max_blob_bytes {
+        return ServerFrame::Error { message: "blob too large".into() };
+    }
+    let id = parler_auth::content_id(&data);
+    if id != p.id {
+        return ServerFrame::Error {
+            message: format!("content id mismatch: bytes hash to {id}, not {}", p.id),
+        };
+    }
+    if let Err(e) = std::fs::write(state.blob_dir.join(&id), &data) {
+        return ServerFrame::Error { message: format!("failed to store blob: {e}") };
+    }
+    if let Err(e) = state.store.put_blob_meta(
+        &id,
+        &p.room,
+        &p.author,
+        p.media_type.as_deref(),
+        data.len() as i64,
+        now_ms(),
+    ) {
+        return ServerFrame::Error { message: e.to_string() };
+    }
+    ServerFrame::BlobStored { id, size: data.len() as u64 }
 }
 
 fn handle_hello(
@@ -370,6 +585,9 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
         }
 
         ClientFrame::Send { target, parts, mentions, reply_to } => {
+            if !state.rate_allows(&me.id, RateKind::Send, now_ms()) {
+                anyhow::bail!("rate limit: too many messages — slow down");
+            }
             let room = resolve_target(store, me, &target)?;
             let mentions = mentions.as_deref().and_then(normalize_mentions);
             let from = EndpointRef { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
@@ -427,6 +645,11 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
         }
 
         ClientFrame::Ping => Ok(ServerFrame::Pong),
+
+        // Blob transfer is intercepted in `dispatch` (it needs the connection / a two-part reply).
+        ClientFrame::PutBlob { .. } | ClientFrame::GetBlob { .. } => {
+            unreachable!("blob ops are handled in dispatch")
+        }
     }
 }
 

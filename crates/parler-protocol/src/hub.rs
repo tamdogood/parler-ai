@@ -291,6 +291,23 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<String>,
     },
+    /// Reserve storage for a content-addressed blob (e.g. a git bundle) bound to the room that
+    /// `target` resolves to. The hub checks membership + the size cap, replies
+    /// [`ServerFrame::BlobReady`], and then expects the bytes as a **single binary frame**; once it
+    /// verifies they hash to `sha256` and match `size` it replies [`ServerFrame::BlobStored`].
+    PutBlob {
+        target: Target,
+        /// The content id the bytes must hash to (lowercase-hex SHA-256).
+        sha256: String,
+        /// The exact byte length of the blob to follow.
+        size: u64,
+        #[serde(default, rename = "mediaType", skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+    },
+    /// Fetch a stored blob by its content id (as carried in a [`BundleRef`]). The hub checks the
+    /// caller is a member of a room the blob was posted to, replies [`ServerFrame::BlobIncoming`],
+    /// then sends the bytes as a single binary frame.
+    GetBlob { id: String },
     Ping,
 }
 
@@ -355,10 +372,80 @@ pub enum ServerFrame {
         entries: Vec<RosterEntry>,
     },
     PresenceOk,
+    /// Storage reserved for a [`ClientFrame::PutBlob`] — send the bytes as one binary frame next.
+    BlobReady {
+        id: String,
+    },
+    /// A blob was received, verified (hash + size), and persisted.
+    BlobStored {
+        id: String,
+        size: u64,
+    },
+    /// A [`ClientFrame::GetBlob`] is authorized — the bytes follow as one binary frame.
+    BlobIncoming {
+        id: String,
+        size: u64,
+        #[serde(default, rename = "mediaType", skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+    },
     Pong,
     Error {
         message: String,
     },
+}
+
+/// The reverse-DNS [`Part`] kind that references a code/artifact bundle handed off through a room.
+pub const BUNDLE_KIND: &str = "com.parler.bundle";
+
+/// A reference to a content-addressed artifact (a git bundle by default) carried inside a room
+/// message as a [`Part::Extension`] of kind [`BUNDLE_KIND`].
+///
+/// The bytes live in the hub's blob store under `blob` (their SHA-256); the message only points at
+/// them, so a code handoff rides the ordinary room / cursor / durability machinery — `send`/`recv`
+/// are unchanged, and a client that doesn't understand the kind still sees a renderable extension
+/// part. Build one with [`BundleRef::to_part`]; recover it from a received part with
+/// [`BundleRef::from_part`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleRef {
+    /// Content id (lowercase-hex SHA-256) of the bytes — the key passed to [`ClientFrame::GetBlob`].
+    pub blob: String,
+    /// The artifact kind: `"git"` (a git bundle), `"patch"`, `"tar"`, …
+    pub vcs: String,
+    /// The bundled tip (e.g. the commit hash at HEAD), when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<String>,
+    /// The base/prerequisite the bundle is thin against (a commit the receiver must already have).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// A one-line human summary (e.g. the tip's commit subject).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Byte length of the blob.
+    pub size: u64,
+    #[serde(default, rename = "mediaType", skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+}
+
+impl BundleRef {
+    /// Encode as the `com.parler.bundle` extension [`Part`].
+    pub fn to_part(&self) -> Part {
+        let fields = match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        Part::Extension { kind: BUNDLE_KIND.to_string(), fields }
+    }
+
+    /// Recover a [`BundleRef`] from a part — `Some` iff it is a well-formed `com.parler.bundle`
+    /// extension.
+    pub fn from_part(part: &Part) -> Option<BundleRef> {
+        match part {
+            Part::Extension { kind, fields } if kind == BUNDLE_KIND => {
+                serde_json::from_value(serde_json::Value::Object(fields.clone())).ok()
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The canonical byte encoding of an [`AgentCard`] for signing/verification.
@@ -533,6 +620,59 @@ mod tests {
         assert_eq!(j["expiresAt"], 123);
         let back: ServerFrame = serde_json::from_value(j).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn blob_frames_round_trip() {
+        let put = ClientFrame::PutBlob {
+            target: Target::Room { room: "dev".into() },
+            sha256: "abc".into(),
+            size: 10,
+            media_type: Some("application/x-git-bundle".into()),
+        };
+        let j = serde_json::to_value(&put).unwrap();
+        assert_eq!(j["op"], "put_blob");
+        assert_eq!(j["target"]["kind"], "room");
+        assert_eq!(j["mediaType"], "application/x-git-bundle");
+        assert_eq!(serde_json::from_value::<ClientFrame>(j).unwrap(), put);
+
+        let get = ClientFrame::GetBlob { id: "abc".into() };
+        let j = serde_json::to_value(&get).unwrap();
+        assert_eq!(j["op"], "get_blob");
+        assert_eq!(serde_json::from_value::<ClientFrame>(j).unwrap(), get);
+
+        let inc = ServerFrame::BlobIncoming { id: "abc".into(), size: 10, media_type: None };
+        let j = serde_json::to_value(&inc).unwrap();
+        assert_eq!(j["type"], "blob_incoming");
+        assert!(j.get("mediaType").is_none());
+        assert_eq!(serde_json::from_value::<ServerFrame>(j).unwrap(), inc);
+    }
+
+    #[test]
+    fn bundle_ref_round_trips_through_a_part() {
+        let b = BundleRef {
+            blob: "abc123".into(),
+            vcs: "git".into(),
+            tip: Some("deadbeef".into()),
+            base: Some("cafe".into()),
+            summary: Some("feat: x".into()),
+            size: 99,
+            media_type: Some("application/x-git-bundle".into()),
+        };
+        let part = b.to_part();
+        match &part {
+            Part::Extension { kind, .. } => assert_eq!(kind, BUNDLE_KIND),
+            _ => panic!("expected an extension part"),
+        }
+        // Survives a JSON wire round-trip as a Part, camelCase `mediaType` intact…
+        let j = serde_json::to_value(&part).unwrap();
+        assert_eq!(j["kind"], BUNDLE_KIND);
+        assert_eq!(j["blob"], "abc123");
+        assert_eq!(j["mediaType"], "application/x-git-bundle");
+        let back: Part = serde_json::from_value(j).unwrap();
+        assert_eq!(BundleRef::from_part(&back), Some(b));
+        // …and a plain part is not a bundle ref.
+        assert_eq!(BundleRef::from_part(&Part::text("hi")), None);
     }
 
     #[test]

@@ -8,10 +8,12 @@ pub mod mcp;
 
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use parler_connector::{Config, MeshAgent};
+use parler_connector::{BundleMeta, Config, MeshAgent};
 use parler_protocol::{
-    AgentSkill, DirectoryEntry, DiscoverScope, Part, RoomKind, StoredMessage, Target, Visibility,
+    AgentSkill, BundleRef, DirectoryEntry, DiscoverScope, Part, RoomKind, StoredMessage, Target,
+    Visibility,
 };
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -54,6 +56,12 @@ enum Cmd {
     Token(TokenArgs),
     /// Send a message (one of --room / --to / --service).
     Send(SendArgs),
+    /// Hand off code: bundle a git ref and push it to a room/peer/service.
+    Push(PushArgs),
+    /// Download a pushed bundle's bytes by its blob id.
+    Fetch(FetchArgs),
+    /// Apply a pushed bundle into the current git repo (imports into refs/parler/*; never merges).
+    Apply(ApplyArgs),
     /// Pull new messages for a room (advances your cursor unless --since/--all).
     Recv(RecvArgs),
     /// Write a fact to the shared memory store.
@@ -144,6 +152,46 @@ struct SendArgs {
     /// The message text.
     #[arg(required = true, trailing_var_arg = true)]
     text: Vec<String>,
+}
+
+#[derive(Args)]
+struct PushArgs {
+    /// Push to a channel room (one-to-many).
+    #[arg(long)]
+    room: Option<String>,
+    /// Push a DM to a peer agent id (one-to-one).
+    #[arg(long)]
+    to: Option<String>,
+    /// Push to a service queue (many-to-one).
+    #[arg(long)]
+    service: Option<String>,
+    /// Only bundle commits after this base ref (a thin patch series, e.g. origin/main).
+    #[arg(long)]
+    base: Option<String>,
+    /// One-line summary (defaults to the tip commit subject).
+    #[arg(long)]
+    summary: Option<String>,
+    /// An optional note posted alongside the bundle.
+    #[arg(long)]
+    note: Option<String>,
+    /// The git ref/tip to bundle (default: HEAD).
+    #[arg(default_value = "HEAD")]
+    gitref: String,
+}
+
+#[derive(Args)]
+struct FetchArgs {
+    /// The blob id (from a `com.parler.bundle` message).
+    blob: String,
+    /// Output file (default: <blob-prefix>.bundle).
+    #[arg(long, short = 'o')]
+    out: Option<String>,
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    /// The blob id (from a `com.parler.bundle` message).
+    blob: String,
 }
 
 #[derive(Args)]
@@ -241,6 +289,9 @@ pub async fn run() -> Result<()> {
         Cmd::Card { id } => cmd_card(id).await,
         Cmd::Token(a) => cmd_token(a).await,
         Cmd::Send(a) => cmd_send(a).await,
+        Cmd::Push(a) => cmd_push(a).await,
+        Cmd::Fetch(a) => cmd_fetch(a).await,
+        Cmd::Apply(a) => cmd_apply(a).await,
         Cmd::Recv(a) => cmd_recv(a).await,
         Cmd::Remember(a) => cmd_remember(a).await,
         Cmd::Recall(a) => cmd_recall(a).await,
@@ -264,7 +315,11 @@ async fn cmd_hub(a: HubArgs) -> Result<()> {
     let store = parler_hub::Store::open(a.db.as_deref().map(std::path::Path::new))?;
     let public_url = a.url.unwrap_or_else(|| format!("parler://{}", a.addr));
     let mode = if a.public { parler_hub::HubMode::Public } else { parler_hub::HubMode::Private };
-    let state = Arc::new(parler_hub::HubState { store, public_url, name: a.name, mode });
+    let mut state = parler_hub::HubState::new(store, public_url, a.name, mode);
+    if let Some(db) = &a.db {
+        state.blob_dir = std::path::PathBuf::from(format!("{db}.blobs"));
+    }
+    let state = Arc::new(state);
     let listener = tokio::net::TcpListener::bind(&a.addr).await?;
     let actual = listener.local_addr()?;
     println!(
@@ -387,18 +442,87 @@ async fn cmd_token(a: TokenArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_send(a: SendArgs) -> Result<()> {
-    let target = match (a.room, a.to, a.service) {
-        (Some(r), None, None) => Target::Room { room: r },
-        (None, Some(t), None) => Target::Dm { agent: t },
-        (None, None, Some(s)) => Target::Service { service: s },
+/// Resolve the `--room`/`--to`/`--service` trio into exactly one [`Target`].
+fn target_from(room: Option<String>, to: Option<String>, service: Option<String>) -> Result<Target> {
+    match (room, to, service) {
+        (Some(r), None, None) => Ok(Target::Room { room: r }),
+        (None, Some(t), None) => Ok(Target::Dm { agent: t }),
+        (None, None, Some(s)) => Ok(Target::Service { service: s }),
         (None, None, None) => bail!("specify a destination: --room, --to, or --service"),
         _ => bail!("specify exactly one of --room, --to, --service"),
-    };
+    }
+}
+
+async fn cmd_send(a: SendArgs) -> Result<()> {
+    let target = target_from(a.room, a.to, a.service)?;
     let text = a.text.join(" ");
     let mut ag = connect().await?;
     let (_id, seq, room) = ag.send_text(target, &text).await?;
     println!("✓ sent to '{room}' (seq {seq})");
+    Ok(())
+}
+
+async fn cmd_push(a: PushArgs) -> Result<()> {
+    let target = target_from(a.room, a.to, a.service)?;
+    // Build the git bundle locally (in the current repo).
+    let (bytes, tip, summary) =
+        build_git_bundle(None, &a.gitref, a.base.as_deref(), a.summary.clone())?;
+    let meta = BundleMeta {
+        vcs: "git".into(),
+        tip: Some(tip.clone()),
+        base: a.base.clone(),
+        summary: (!summary.is_empty()).then(|| summary.clone()),
+        media_type: Some("application/x-git-bundle".into()),
+    };
+    let mut ag = connect().await?;
+    let r = ag.push(target, &bytes, meta, a.note).await?;
+    println!("✓ pushed git bundle to '{}' (seq {}, {} bytes)", r.room, r.seq, bytes.len());
+    println!("  tip:  {}  {summary}", short(&tip));
+    println!("  blob: {}", r.blob_id);
+    println!("  peer: parler apply {}   (or just download: parler fetch {})", r.blob_id, r.blob_id);
+    Ok(())
+}
+
+async fn cmd_fetch(a: FetchArgs) -> Result<()> {
+    let mut ag = connect().await?;
+    let bytes = ag.fetch_blob(&a.blob).await?;
+    let out = a.out.unwrap_or_else(|| format!("{}.bundle", short(&a.blob)));
+    std::fs::write(&out, &bytes)?;
+    println!("✓ wrote {} bytes to {out}", bytes.len());
+    Ok(())
+}
+
+async fn cmd_apply(a: ApplyArgs) -> Result<()> {
+    if git_in(None, &["rev-parse", "--git-dir"]).is_err() {
+        bail!("not inside a git repository — run `parler apply` from the repo you want to import into");
+    }
+    let mut ag = connect().await?;
+    let bytes = ag.fetch_blob(&a.blob).await?;
+    let tmp = std::env::temp_dir().join(format!("parler-apply-{}.bundle", std::process::id()));
+    std::fs::write(&tmp, &bytes)?;
+    let refname = format!("refs/parler/{}", short(&a.blob));
+    let result = (|| -> Result<String> {
+        let tmp_s = path_str(&tmp)?;
+        if let Err(e) = git_in(None, &["bundle", "verify", tmp_s]) {
+            bail!("bundle verify failed (you may be missing the base commit it is thin against): {e}");
+        }
+        // Import the objects (anchored by FETCH_HEAD) without touching the working tree…
+        git_in(None, &["fetch", tmp_s])?;
+        // …then pin the bundle's tip under a stable, namespaced ref.
+        let heads = git_in(None, &["bundle", "list-heads", tmp_s])?;
+        let tip_sha = heads.split_whitespace().next().unwrap_or_default().to_string();
+        if !tip_sha.is_empty() {
+            git_in(None, &["update-ref", &refname, &tip_sha])?;
+        }
+        Ok(heads)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    let heads = result?;
+    println!("✓ imported into {refname} (working tree untouched)");
+    for line in heads.lines() {
+        println!("    {}", line.trim());
+    }
+    println!("  inspect: git log {refname}    merge when ready: git merge {refname}");
     Ok(())
 }
 
@@ -534,10 +658,17 @@ fn render_entry_full(e: &DirectoryEntry) -> String {
     out
 }
 
-/// Render the text of a message's parts (text joined; data/extension parts noted).
+/// Render the text of a message's parts (text joined; a bundle handoff and other extensions noted).
 pub fn render_parts(parts: &[Part]) -> String {
     let mut out = Vec::new();
     for p in parts {
+        if let Some(b) = BundleRef::from_part(p) {
+            let sum = b.summary.unwrap_or_else(|| "(bundle)".into());
+            let tip = b.tip.map(|t| format!(" @{}", short(&t))).unwrap_or_default();
+            // The blob id is shown in full so the `parler apply` command copy-pastes and works.
+            out.push(format!("📦 {sum}{tip} ({} bytes) — parler apply {}", b.size, b.blob));
+            continue;
+        }
         match p {
             Part::Text(t) => out.push(t.clone()),
             Part::Data(d) => out.push(format!("[data] {d}")),
@@ -545,6 +676,63 @@ pub fn render_parts(parts: &[Part]) -> String {
         }
     }
     out.join(" ")
+}
+
+// ---- git helpers (code handoff) ----
+
+/// Run `git` (optionally inside `repo` via `-C`), returning trimmed stdout or an error with stderr.
+fn git_in(repo: Option<&str>, args: &[&str]) -> Result<String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(r) = repo {
+        cmd.arg("-C").arg(r);
+    }
+    cmd.args(args);
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("running git: {e} (is git installed and on PATH?)"))?;
+    if !out.status.success() {
+        bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn path_str(p: &Path) -> Result<&str> {
+    p.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF8 path: {}", p.display()))
+}
+
+/// First 12 chars of a content id (for display / ref names).
+fn short(id: &str) -> &str {
+    &id[..id.len().min(12)]
+}
+
+/// Build a git bundle for `gitref` (thin against `base` if given) in the repo at `repo` (cwd when
+/// `None`). Returns `(bytes, tip_hash, summary)`.
+pub(crate) fn build_git_bundle(
+    repo: Option<&str>,
+    gitref: &str,
+    base: Option<&str>,
+    summary_override: Option<String>,
+) -> Result<(Vec<u8>, String, String)> {
+    let tip = git_in(repo, &["rev-parse", gitref])?;
+    let summary = match summary_override {
+        Some(s) => s,
+        None => git_in(repo, &["log", "-1", "--format=%s", gitref]).unwrap_or_default(),
+    };
+    let range = match base {
+        Some(b) => format!("{b}..{gitref}"),
+        None => gitref.to_string(),
+    };
+    let tmp = std::env::temp_dir().join(format!("parler-push-{}.bundle", std::process::id()));
+    let made = git_in(repo, &["bundle", "create", path_str(&tmp)?, &range]);
+    let bytes = match made {
+        Ok(_) => std::fs::read(&tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow::anyhow!("git bundle create failed: {e}"));
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    Ok((bytes?, tip, summary))
 }
 
 /// One line: `[seq] name (role): text`.

@@ -13,7 +13,7 @@ pub mod agent;
 pub mod client;
 pub mod config;
 
-pub use agent::{Invite, MeshAgent};
+pub use agent::{BundleMeta, Invite, MeshAgent, PushReceipt};
 pub use client::HubClient;
 pub use config::{home_dir, Config};
 
@@ -26,4 +26,19 @@ use parler_protocol::{ClientFrame, ServerFrame};
 #[async_trait]
 pub trait MeshTransport: Send {
     async fn request(&mut self, frame: ClientFrame) -> Result<ServerFrame>;
+
+    /// Upload a content-addressed blob: send the `put` ([`ClientFrame::PutBlob`]) frame, await
+    /// [`ServerFrame::BlobReady`], stream `bytes` as one binary frame, and return the hub's
+    /// [`ServerFrame::BlobStored`]. Transports without a binary side-channel leave this unimplemented.
+    async fn upload_blob(&mut self, put: ClientFrame, bytes: &[u8]) -> Result<ServerFrame> {
+        let _ = (put, bytes);
+        anyhow::bail!("this transport does not support blob upload")
+    }
+
+    /// Download a content-addressed blob: send the `get` ([`ClientFrame::GetBlob`]) frame, await
+    /// [`ServerFrame::BlobIncoming`], and return the binary payload.
+    async fn download_blob(&mut self, get: ClientFrame) -> Result<Vec<u8>> {
+        let _ = get;
+        anyhow::bail!("this transport does not support blob download")
+    }
 }

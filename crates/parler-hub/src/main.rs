@@ -31,6 +31,15 @@ struct Args {
     /// Omit for a private hub, where the full directory is gated behind a directory token.
     #[arg(long, env = "PARLER_HUB_PUBLIC")]
     public: bool,
+
+    /// Directory for handed-off blob bytes (code bundles). Defaults to `<db>.blobs/` next to the
+    /// SQLite file, or a temp dir for an in-memory hub.
+    #[arg(long, env = "PARLER_HUB_BLOB_DIR")]
+    blob_dir: Option<String>,
+
+    /// Largest single blob (git bundle) the hub accepts, in bytes (default 25 MiB).
+    #[arg(long, env = "PARLER_HUB_MAX_BLOB_BYTES")]
+    max_blob_bytes: Option<u64>,
 }
 
 #[tokio::main]
@@ -43,7 +52,16 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(args.db.as_deref().map(std::path::Path::new))?;
     let public_url = args.url.unwrap_or_else(|| format!("parler://{}", args.addr));
     let mode = if args.public { HubMode::Public } else { HubMode::Private };
-    let state = Arc::new(HubState { store, public_url, name: args.name, mode });
+    let mut state = HubState::new(store, public_url, args.name, mode);
+    if let Some(dir) = args.blob_dir {
+        state.blob_dir = std::path::PathBuf::from(dir);
+    } else if let Some(db) = &args.db {
+        state.blob_dir = std::path::PathBuf::from(format!("{db}.blobs"));
+    }
+    if let Some(max) = args.max_blob_bytes {
+        state.max_blob_bytes = max;
+    }
+    let state = Arc::new(state);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     let actual = listener.local_addr()?;

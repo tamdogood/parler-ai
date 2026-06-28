@@ -89,6 +89,24 @@ impl HubClient {
         }
         bail!("hub connection ended")
     }
+
+    /// Receive the next binary frame (a blob payload), surfacing an interleaved error frame as `Err`.
+    async fn recv_binary(&mut self) -> Result<Vec<u8>> {
+        while let Some(msg) = self.ws.next().await {
+            match msg? {
+                WsMessage::Binary(b) => return Ok(b),
+                WsMessage::Text(t) => {
+                    if let Ok(ServerFrame::Error { message }) = serde_json::from_str::<ServerFrame>(&t) {
+                        bail!("{message}");
+                    }
+                    bail!("expected a binary blob, got a text frame");
+                }
+                WsMessage::Close(_) => bail!("hub closed the connection"),
+                _ => continue,
+            }
+        }
+        bail!("hub connection ended")
+    }
 }
 
 #[async_trait]
@@ -100,6 +118,31 @@ impl MeshTransport for HubClient {
             bail!("{message}");
         }
         Ok(reply)
+    }
+
+    async fn upload_blob(&mut self, put: ClientFrame, bytes: &[u8]) -> Result<ServerFrame> {
+        self.send(&put).await?;
+        match self.recv().await? {
+            ServerFrame::BlobReady { .. } => {}
+            ServerFrame::Error { message } => bail!("{message}"),
+            other => bail!("expected blob_ready, got {other:?}"),
+        }
+        self.ws.send(WsMessage::Binary(bytes.to_vec())).await?;
+        match self.recv().await? {
+            stored @ ServerFrame::BlobStored { .. } => Ok(stored),
+            ServerFrame::Error { message } => bail!("{message}"),
+            other => bail!("expected blob_stored, got {other:?}"),
+        }
+    }
+
+    async fn download_blob(&mut self, get: ClientFrame) -> Result<Vec<u8>> {
+        self.send(&get).await?;
+        match self.recv().await? {
+            ServerFrame::BlobIncoming { .. } => {}
+            ServerFrame::Error { message } => bail!("{message}"),
+            other => bail!("expected blob_incoming, got {other:?}"),
+        }
+        self.recv_binary().await
     }
 }
 

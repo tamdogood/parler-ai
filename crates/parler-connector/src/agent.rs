@@ -8,8 +8,8 @@ use crate::{Config, HubClient, MeshTransport};
 use anyhow::{bail, Result};
 use parler_auth::Identity;
 use parler_protocol::{
-    canonical_card_bytes, AgentCard, AgentSkill, ClientFrame, DirectoryEntry, DiscoverScope,
-    EndpointKind, Fact, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, ServerFrame,
+    canonical_card_bytes, AgentCard, AgentSkill, BundleRef, ClientFrame, DirectoryEntry,
+    DiscoverScope, EndpointKind, Fact, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, ServerFrame,
     StoredMessage, Target, Visibility,
 };
 
@@ -20,6 +20,25 @@ pub struct Invite {
     pub room: String,
     pub kind: RoomKind,
     pub expires_at: i64,
+}
+
+/// What to advertise about a pushed artifact (everything but the bytes and their content id).
+#[derive(Debug, Clone, Default)]
+pub struct BundleMeta {
+    /// Artifact kind: `"git"` (a git bundle), `"patch"`, `"tar"`, …
+    pub vcs: String,
+    pub tip: Option<String>,
+    pub base: Option<String>,
+    pub summary: Option<String>,
+    pub media_type: Option<String>,
+}
+
+/// The outcome of [`MeshAgent::push`]: the posted message + the stored blob's content id.
+pub struct PushReceipt {
+    pub msg_id: String,
+    pub blob_id: String,
+    pub room: String,
+    pub seq: i64,
 }
 
 /// A connected, authenticated agent on the mesh.
@@ -119,6 +138,56 @@ impl MeshAgent {
     /// Convenience: send a single text part.
     pub async fn send_text(&mut self, target: Target, text: &str) -> Result<(String, i64, String)> {
         self.send(target, vec![Part::text(text)], None, None).await
+    }
+
+    /// Hand off an artifact (a git bundle by default): upload the bytes to the hub's content-addressed
+    /// blob store (bound to the room `target` resolves to), then post a room message carrying a
+    /// `com.parler.bundle` reference so peers see it through the ordinary `recv`. `note` is an
+    /// optional text part shown alongside the reference.
+    pub async fn push(
+        &mut self,
+        target: Target,
+        bundle: &[u8],
+        meta: BundleMeta,
+        note: Option<String>,
+    ) -> Result<PushReceipt> {
+        let blob_id = parler_auth::content_id(bundle);
+        let put = ClientFrame::PutBlob {
+            target: target.clone(),
+            sha256: blob_id.clone(),
+            size: bundle.len() as u64,
+            media_type: meta.media_type.clone(),
+        };
+        match self.transport.upload_blob(put, bundle).await? {
+            ServerFrame::BlobStored { id, .. } if id == blob_id => {}
+            ServerFrame::BlobStored { id, .. } => bail!("hub stored a different blob id: {id}"),
+            other => bail!("unexpected reply to put_blob: {other:?}"),
+        }
+        let bref = BundleRef {
+            blob: blob_id.clone(),
+            vcs: meta.vcs,
+            tip: meta.tip,
+            base: meta.base,
+            summary: meta.summary,
+            size: bundle.len() as u64,
+            media_type: meta.media_type,
+        };
+        let mut parts = Vec::new();
+        if let Some(n) = note {
+            if !n.is_empty() {
+                parts.push(Part::text(n));
+            }
+        }
+        parts.push(bref.to_part());
+        let (msg_id, seq, room) = self.send(target, parts, None, None).await?;
+        Ok(PushReceipt { msg_id, blob_id, room, seq })
+    }
+
+    /// Download a blob's bytes by its content id (as carried in a `com.parler.bundle` part).
+    pub async fn fetch_blob(&mut self, id: &str) -> Result<Vec<u8>> {
+        self.transport
+            .download_blob(ClientFrame::GetBlob { id: id.to_string() })
+            .await
     }
 
     /// Pull new messages for `room` (past the agent's cursor, which this advances), or past `since`
