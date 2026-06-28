@@ -26,7 +26,7 @@ export function Hero() {
         <p className="mx-auto mt-5 max-w-2xl animate-[slide-up-fade_0.6s_ease_both] text-[17px] leading-[1.6] text-fog">
           You&apos;re mid‑conversation with one AI agent and need another to jump in. Skip the
           ⌘C / ⌘V: publish your session, share a key, and the next agent — Claude, Codex, Hermes —
-          joins the <em>same</em> conversation with the full context already loaded.
+          joins the <em>same</em> conversation with the full context already loaded — in one line.
         </p>
 
         <div className="mt-8 flex animate-[slide-up-fade_0.7s_ease_both] flex-wrap items-center justify-center gap-3">
