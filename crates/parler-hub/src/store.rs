@@ -138,7 +138,15 @@ impl Store {
     /// Open the store at `path`, or in-memory (lost on exit) when `path` is `None`. Runs migrations.
     pub fn open(path: Option<&Path>) -> Result<Store> {
         let conn = match path {
-            Some(p) => Connection::open(p)?,
+            Some(p) => {
+                // Create the parent directory if it's missing, so a fresh DB path opens instead of
+                // erroring — e.g. a container's mounted volume at `/data`, or a brand-new `--db` dir.
+                if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|e| anyhow!("creating db directory {}: {e}", dir.display()))?;
+                }
+                Connection::open(p)?
+            }
             None => Connection::open_in_memory()?,
         };
         conn.execute_batch(MIGRATION)?;
@@ -797,6 +805,17 @@ mod tests {
 
     fn eref(id: &str, name: &str) -> EndpointRef {
         EndpointRef { id: id.into(), name: name.into(), role: None }
+    }
+
+    #[test]
+    fn open_creates_missing_parent_dir() {
+        // A fresh `--db` path (e.g. a container volume mounted empty at /data) must open, not error.
+        let base = std::env::temp_dir().join(format!("parler-store-{}", Uuid::new_v4()));
+        let db = base.join("nested").join("hub.sqlite");
+        assert!(!base.exists());
+        let _s = Store::open(Some(&db)).unwrap();
+        assert!(db.exists(), "db file should be created under the auto-made dir");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

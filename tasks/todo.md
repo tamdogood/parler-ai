@@ -1,3 +1,49 @@
+# Feature: The first public hub — deploy + wss:// (2026-06-27)
+
+**User ask:** create the first server anyone can publish their agents onto, so it's the first live
+example (the website was showing "Can't reach the hub" against `127.0.0.1:7070`). Confirmed host:
+**Fly.io** (+ a portable Caddy recipe).
+
+**Key finding:** the only real code blocker was that `tokio-tungstenite` was declared with **no TLS
+feature**, so `wss://` dials failed at runtime — exactly why the roadmap's TLS box was unchecked. The
+hub already binds `0.0.0.0`, serves a CORS-open REST API, and is fully env-configurable; the rest was
+deploy plumbing + docs.
+
+### Built
+- [x] **TLS client** — `tokio-tungstenite` now `features = ["rustls-tls-webpki-roots"]` (bundled CA
+  roots; reuses the rustls already pulled by async-nats). `client.rs` already normalized
+  `https://→wss://`; now it actually connects. Build green.
+- [x] **Hub landing page** (`GET /`) — was a 404; now a small dark self-documenting page (hub
+  name/mode/counts + the 3-command publish snippet derived from `public_url` + API/repo links, and an
+  optional `PARLER_HUB_WEB` link to the directory site). +2 unit tests (url helper, escaping/snippet).
+- [x] **`deploy/` kit** — `Dockerfile` (glibc builder → distroless/cc, builds `parler-hub`),
+  root `.dockerignore`, `fly.toml` (volume + http_service + `/health` check, always-on),
+  `docker-compose.yml` + `Caddyfile` (auto-TLS self-host = the documented TLS recipe), `README.md`.
+- [x] **Wiring + docs** — `web/.env.example` (prod HTTPS hub + Vercel note, dev fallback kept);
+  README "Deploy a public hub" section + TLS roadmap box ticked; `docs/discovery.md` transport note
+  + "Try it" point at `deploy/`.
+
+### Review — 2026-06-27
+- **Tests:** `cargo test --workspace` green except the *pre-existing* `auth_live` test (needs a
+  vendored `nats-server`, unrelated). `parler-hub` now **13** tests (+`display_hub_url`,
+  +`landing_page…`, +`open_creates_missing_parent_dir`); `connector` e2e (5+6) + `ws_url_normalization`
+  still green.
+- **Live publish smoke (`ws://`):** booted `parler hub --public`, `init`+`register --public` an agent
+  → `/api/directory` returns it `verified:true`, `/api/hub` shows `agents:1/public:1`, `/` renders the
+  publish guide. (`.context/smoke-public-hub.sh`.)
+- **Container run-check:** `docker build` → **39.9 MB** distroless image; `docker run` with **no
+  volume** boots a `public` hub, auto-creates `/data`, and serves `/health` + `/api/hub` + `/`.
+- **Root-cause fix found by the run-check:** `Store::open` didn't create the DB's parent dir, so a
+  fresh `/data` (or any new `--db` dir) errored `unable to open database file`. Fixed in `store.rs`
+  (mirrors `Config::save`'s `create_dir_all`) + a regression test.
+
+### Left to the user (outward-facing; needs their account)
+- `fly deploy --config deploy/fly.toml` under their Fly account, then set
+  `NEXT_PUBLIC_HUB_API=https://<app>.fly.dev` in Vercel. (I prepared everything to a one-command deploy
+  but didn't provision under their account.)
+
+---
+
 # Feature: Agent Discovery — directory + signed cards + Next.js site (2026-06-27)
 
 **User ask:** the best discovery hub — agents register with a uuid + a public/private visibility

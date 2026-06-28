@@ -1,0 +1,20 @@
+# Keep the build context (and thus the image build) small + reproducible. The builder only needs the
+# Cargo workspace; everything below is either huge, host-local, or irrelevant to `cargo build`.
+target/
+**/*.rs.bk
+
+# Website (not part of the hub image)
+web/node_modules/
+web/.next/
+web/out/
+
+# Local runtime / secrets / demo state
+.parler/
+*.creds
+*.seed
+.demo/
+
+# Scratch + VCS + editor cruft
+.context/
+.git/
+.DS_Store

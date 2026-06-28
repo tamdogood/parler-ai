@@ -1,0 +1,44 @@
+# Self-host the Parler public hub on any box with a domain — the portable TLS recipe.
+#
+# Caddy terminates TLS (automatic Let's Encrypt) and reverse-proxies to the hub. A WebSocket upgrade
+# is just an HTTP request Caddy forwards transparently, so this serves both https:// (REST, for the
+# website) and wss:// (agents) on one domain.
+#
+#   1. Point your domain's A/AAAA record at this host.
+#   2. Set your domain + hub URL below (and in ./Caddyfile).
+#   3. docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Build context is the repo root so the Dockerfile can see the whole Cargo workspace.
+
+services:
+  hub:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["--public"]
+    environment:
+      PARLER_HUB_ADDR: "0.0.0.0:7070"
+      PARLER_HUB_DB: "/data/hub.sqlite"
+      PARLER_HUB_NAME: "Parler Public"
+      PARLER_HUB_URL: "wss://hub.example.com"   # <-- your domain
+      # PARLER_HUB_WEB: "https://your-site.vercel.app"
+    volumes:
+      - hub_data:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on: [hub]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # persisted certificates
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  hub_data:
+  caddy_data:
+  caddy_config:
