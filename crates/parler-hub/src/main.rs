@@ -5,8 +5,9 @@
 //! ```
 
 use clap::Parser;
-use parler_hub::{serve, HubMode, HubState, Store};
+use parler_hub::{serve, HubMode, HubState, Retention, Store};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "parler-hub", about = "Parler Hub — the lightweight bus for agent-to-agent messaging")]
@@ -58,6 +59,29 @@ struct Args {
     /// `PARLER_JOIN_SECRET`.
     #[arg(long, env = "PARLER_HUB_JOIN_SECRET")]
     join_secret: Option<String>,
+
+    /// Retention: delete messages older than this many days (always keeping the per-room floor below).
+    /// Omit / `0` keeps all message history. A long-lived public hub should set this so the log can't
+    /// grow without bound.
+    #[arg(long, env = "PARLER_HUB_RETENTION_DAYS")]
+    retention_days: Option<u64>,
+
+    /// Retention floor: always keep at least this many newest messages per room (default 10000).
+    #[arg(long, env = "PARLER_HUB_KEEP_MESSAGES_PER_ROOM")]
+    keep_messages_per_room: Option<i64>,
+
+    /// Retention: keep only this many newest unkeyed facts per (author, room). Omit keeps all.
+    #[arg(long, env = "PARLER_HUB_KEEP_FACTS")]
+    keep_facts: Option<i64>,
+
+    /// Retention: garbage-collect blob bytes neither fetched nor created within this many days. Omit
+    /// keeps blobs until the disk budget fills.
+    #[arg(long, env = "PARLER_HUB_BLOB_TTL_DAYS")]
+    blob_ttl_days: Option<u64>,
+
+    /// How often the background janitor runs, in seconds (default 3600).
+    #[arg(long, env = "PARLER_HUB_JANITOR_INTERVAL_SECS")]
+    janitor_interval_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -89,6 +113,24 @@ async fn main() -> anyhow::Result<()> {
         state.max_connections = max;
     }
     state.join_secret = args.join_secret.filter(|s| !s.is_empty());
+
+    let defaults = Retention::default();
+    let days_to_dur = |d: u64| Duration::from_secs(d * 24 * 3600);
+    state.retention = Retention {
+        message_max_age: args.retention_days.filter(|d| *d > 0).map(days_to_dur),
+        keep_messages_per_room: args
+            .keep_messages_per_room
+            .map(|k| k.max(0))
+            .unwrap_or(defaults.keep_messages_per_room),
+        keep_unkeyed_facts: args.keep_facts.filter(|k| *k >= 0),
+        blob_max_idle: args.blob_ttl_days.filter(|d| *d > 0).map(days_to_dur),
+        interval: args
+            .janitor_interval_secs
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(defaults.interval),
+    };
+
     let state = Arc::new(state);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;

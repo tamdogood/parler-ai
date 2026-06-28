@@ -1,0 +1,25 @@
+# Litestream — continuous streaming backup of the hub's SQLite database to object storage.
+#
+# The hub is a single SQLite file on one volume; that is a single point of failure. Litestream tails
+# the WAL the hub already writes (WAL mode is on by default) and streams it to S3/R2/MinIO, giving the
+# hub point-in-time recovery and survival of a lost volume — with ZERO application changes.
+#
+# OPTIONAL and OFF by default (the base image in deploy/Dockerfile does not bundle Litestream). To
+# enable, see "Continuous backup with Litestream" in deploy/README.md. Supply a bucket + credentials
+# as environment variables — never commit secrets:
+#   REPLICA_URL                    e.g. s3://my-bucket/parler-hub   (R2/MinIO: set endpoint below)
+#   LITESTREAM_ACCESS_KEY_ID       object-store access key
+#   LITESTREAM_SECRET_ACCESS_KEY   object-store secret key
+#
+# Litestream coexists with SQLite's WAL + autocheckpoint (it holds a read lock and keeps a shadow WAL
+# so frames aren't truncated before they're shipped). Keep `synchronous = NORMAL` (the hub's default).
+
+dbs:
+  - path: /data/hub.sqlite
+    replicas:
+      - url: ${REPLICA_URL}
+        # For Cloudflare R2 / MinIO, also set the endpoint (and keep `REPLICA_URL` an s3:// URL):
+        # endpoint: https://<account>.r2.cloudflarestorage.com
+        sync-interval: 10s        # how often new WAL frames are shipped (RPO ≈ this)
+        snapshot-interval: 6h     # full snapshot cadence (bounds restore time)
+        retention: 24h            # how far back point-in-time restore can go — tune to your RPO/cost

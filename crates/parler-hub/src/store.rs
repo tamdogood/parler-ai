@@ -11,14 +11,16 @@ use parler_protocol::{
     AgentCard, DirectoryEntry, DiscoverScope, EndpointRef, Fact, Part, RecallHit, RoomInfo,
     RoomKind, RosterEntry, StoredMessage, Visibility,
 };
-use rusqlite::{named_params, params, Connection, OptionalExtension};
+use rusqlite::{named_params, params, Connection, OpenFlags, OptionalExtension};
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use uuid::Uuid;
 
 const MIGRATION: &str = r#"
+PRAGMA auto_vacuum = INCREMENTAL;
 PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 3000;
 
 CREATE TABLE IF NOT EXISTS agents (
   id         TEXT PRIMARY KEY,
@@ -63,6 +65,9 @@ CREATE TABLE IF NOT EXISTS messages (
   ts          INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room, seq);
+-- Membership keyed by agent: `members` PK is (room, agent), so "every room an agent is in" (rooms_of,
+-- and the recall room-scope subquery) can't use the PK prefix without this index.
+CREATE INDEX IF NOT EXISTS idx_members_agent ON members(agent);
 
 CREATE TABLE IF NOT EXISTS facts (
   id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,16 +152,41 @@ CREATE TABLE IF NOT EXISTS blob_rooms (
 /// the protocol's intent that `offline` is "derived by observers, not self-set while live".
 pub const PRESENCE_STALE_MS: i64 = 300_000;
 
-/// The durable store. Cheaply cloneable (shares one connection behind an `Arc<Mutex<…>>`).
+/// The durable store. Cheaply cloneable (shares the connections behind an `Arc`).
+///
+/// SQLite in WAL mode allows one writer and many concurrent readers, so the store keeps a single
+/// dedicated **writer** connection plus a small pool of **read-only** connections that hot read paths
+/// (`recall`/`discover`/`is_member`/…) fan out across — turning "one serial connection for the whole
+/// hub" into "writes serialized (SQLite is single-writer anyway), reads parallel across cores". The
+/// single writer is also what keeps `append_message`'s `last_insert_rowid()` correct. An in-memory
+/// database can't be shared across connections, so the pool is empty there and reads fall back to the
+/// writer (the historical single-connection behavior, preserved for tests).
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    writer: Mutex<Connection>,
+    readers: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+/// A borrowed connection guard that derefs to [`Connection`], hiding whether it came from the writer
+/// or a pooled reader so call sites stay unchanged (`conn.execute(…)`, `conn.query_row(…)`).
+struct ConnRef<'a>(MutexGuard<'a, Connection>);
+
+impl Deref for ConnRef<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
 }
 
 impl Store {
     /// Open the store at `path`, or in-memory (lost on exit) when `path` is `None`. Runs migrations.
     pub fn open(path: Option<&Path>) -> Result<Store> {
-        let conn = match path {
+        let writer = match path {
             Some(p) => {
                 // Create the parent directory if it's missing, so a fresh DB path opens instead of
                 // erroring — e.g. a container's mounted volume at `/data`, or a brand-new `--db` dir.
@@ -168,16 +198,64 @@ impl Store {
             }
             None => Connection::open_in_memory()?,
         };
-        conn.execute_batch(MIGRATION)?;
+        configure_conn(&writer)?;
+        writer.execute_batch(MIGRATION)?;
+        // Evolve tables created by an older schema without a destructive rebuild.
+        add_column_if_missing(&writer, "blobs", "last_fetched", "INTEGER")?;
+
+        // Read-only pool for a file-backed DB (the writer has already created the -wal/-shm files, so
+        // read-only connections can attach). In-memory has no shared file ⇒ no pool, reads use writer.
+        let mut readers = Vec::new();
+        if let Some(p) = path {
+            let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+            let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            for _ in 0..n {
+                let rc = Connection::open_with_flags(p, flags)?;
+                configure_conn(&rc)?;
+                readers.push(Mutex::new(rc));
+            }
+        }
         Ok(Store {
-            conn: Arc::new(Mutex::new(conn)),
+            inner: Arc::new(Inner { writer: Mutex::new(writer), readers, next: AtomicUsize::new(0) }),
         })
+    }
+
+    /// The writer connection — for every statement that mutates the database (including read-then-write
+    /// ops like `pull`'s cursor advance). Writes are single-writer by design.
+    fn w(&self) -> ConnRef<'_> {
+        ConnRef(self.inner.writer.lock().unwrap())
+    }
+
+    /// A pooled **read-only** connection (round-robin), or the writer when there is no pool (in-memory).
+    /// Use only for pure reads — the pooled connections reject writes, so a misclassified write fails
+    /// loudly against a file-backed DB rather than silently bypassing the single-writer invariant.
+    fn r(&self) -> ConnRef<'_> {
+        if self.inner.readers.is_empty() {
+            ConnRef(self.inner.writer.lock().unwrap())
+        } else {
+            let i = self.inner.next.fetch_add(1, Ordering::Relaxed) % self.inner.readers.len();
+            ConnRef(self.inner.readers[i].lock().unwrap())
+        }
+    }
+
+    /// Run SQLite's (cheap) integrity check. `Ok(())` when the database reports `ok`, otherwise an
+    /// error naming the first problem. Call it on boot / from `/health` so corruption is *detected*
+    /// rather than silently read — the store is corruption-safe by design, this is the smoke alarm.
+    pub fn quick_check(&self) -> Result<()> {
+        // The writer, not a reader: validating the FTS5 inverted index needs write access.
+        let conn = self.w();
+        let res: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
+        if res == "ok" {
+            Ok(())
+        } else {
+            bail!("sqlite integrity check failed: {res}");
+        }
     }
 
     // ---- agents / presence ----
 
     pub fn upsert_agent(&self, id: &str, name: &str, role: Option<&str>, now: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO agents (id, name, role, first_seen, last_seen) VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, role = excluded.role, last_seen = excluded.last_seen",
@@ -187,7 +265,7 @@ impl Store {
     }
 
     pub fn touch_presence(&self, agent: &str, status: &str, activity: Option<&str>, now: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO presence (agent, status, activity, ts) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(agent) DO UPDATE SET status = excluded.status, activity = excluded.activity, ts = excluded.ts",
@@ -199,7 +277,7 @@ impl Store {
     // ---- rooms / membership ----
 
     pub fn ensure_room(&self, name: &str, kind: RoomKind, description: Option<&str>, now: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT OR IGNORE INTO rooms (name, kind, description, created) VALUES (?1, ?2, ?3, ?4)",
             params![name, kind.as_str(), description, now],
@@ -208,7 +286,7 @@ impl Store {
     }
 
     pub fn add_member(&self, room: &str, agent: &str, now: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT OR IGNORE INTO members (room, agent, joined, cursor) VALUES (?1, ?2, ?3, 0)",
             params![room, agent, now],
@@ -217,7 +295,7 @@ impl Store {
     }
 
     pub fn is_member(&self, room: &str, agent: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM members WHERE room = ?1 AND agent = ?2",
             params![room, agent],
@@ -227,7 +305,7 @@ impl Store {
     }
 
     pub fn room_kind(&self, name: &str) -> Result<Option<RoomKind>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let k: Option<String> = conn
             .query_row("SELECT kind FROM rooms WHERE name = ?1", params![name], |r| r.get(0))
             .optional()?;
@@ -236,7 +314,7 @@ impl Store {
 
     /// The one DM room shared by exactly `a` and `b` (i.e. a 2-member `dm` room), if any.
     pub fn find_dm_room(&self, a: &str, b: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let room: Option<String> = conn
             .query_row(
                 "SELECT m1.room FROM members m1
@@ -253,7 +331,7 @@ impl Store {
     }
 
     pub fn rooms_of(&self, agent: &str) -> Result<Vec<RoomInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let mut stmt = conn.prepare(
             "SELECT m.room, r.kind,
                     (SELECT COUNT(*) FROM members WHERE room = m.room),
@@ -277,7 +355,7 @@ impl Store {
     }
 
     pub fn roster(&self, room: &str, now: i64) -> Result<Vec<RosterEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let mut stmt = conn.prepare(
             "SELECT a.id, a.name, a.role, p.status, p.activity, p.ts, a.last_seen
                FROM members mb JOIN agents a ON a.id = mb.agent
@@ -325,7 +403,7 @@ impl Store {
             Some(m) => Some(serde_json::to_string(m)?),
             None => None,
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -354,12 +432,14 @@ impl Store {
         since: Option<i64>,
         limit: Option<u32>,
     ) -> Result<(Vec<StoredMessage>, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let lim = limit.unwrap_or(200).min(1000) as i64;
+        // Read the backlog on a pooled read-only connection (the hot, expensive part); the only write
+        // is the tiny cursor advance below, which goes to the writer.
+        let conn = self.r();
         let cur = match since {
             Some(s) => s,
             None => Self::get_cursor(&conn, room, agent)?,
         };
-        let lim = limit.unwrap_or(200).min(1000) as i64;
         let raws = {
             let mut stmt = conn.prepare(
                 "SELECT seq, id, room, author, author_name, author_role, parts, mentions, reply_to, ts
@@ -383,9 +463,10 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             v
         };
+        drop(conn); // release the read connection before taking the writer
         let new_cursor = raws.last().map(|r| r.seq).unwrap_or(cur);
         if since.is_none() && new_cursor > cur {
-            conn.execute(
+            self.w().execute(
                 "UPDATE members SET cursor = ?1 WHERE room = ?2 AND agent = ?3",
                 params![new_cursor, room, agent],
             )?;
@@ -411,7 +492,7 @@ impl Store {
         created_by: &str,
         now: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO invites (code, room, kind, role, max_uses, uses, expires, created_by, created)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
@@ -422,7 +503,7 @@ impl Store {
 
     /// Redeem `code` for `agent`: validate expiry + remaining uses, increment uses, join the room.
     pub fn redeem_invite(&self, code: &str, agent: &str, now: i64) -> Result<(String, RoomKind)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         let row: Option<(String, String, i64, i64, i64)> = conn
             .query_row(
                 "SELECT room, kind, max_uses, uses, expires FROM invites WHERE code = ?1",
@@ -462,7 +543,7 @@ impl Store {
     ) -> Result<()> {
         let card_json = serde_json::to_string(card)?;
         let (tags, skills) = card_filter_blobs(card);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO directory (agent, visibility, card_json, card_sig, verified, tags, skills, registered, updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
@@ -496,7 +577,7 @@ impl Store {
         let skillp = skill.map(|s| format!("%{}%", s.to_lowercase()));
         let want_status = status.map(|s| s.to_lowercase());
         let lim = limit.unwrap_or(200).min(1000) as usize;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let mut stmt = conn.prepare(
             "SELECT d.card_json, d.visibility, d.card_sig, d.verified,
                     p.status, p.activity, p.ts, a.first_seen, a.last_seen
@@ -536,7 +617,7 @@ impl Store {
     /// Fetch one agent's directory entry by id. A `public` card is always returned; a `private` one
     /// only when `hub_scope` (the caller is an authenticated member / holds a valid directory token).
     pub fn lookup_card(&self, id: &str, hub: &str, hub_scope: bool, now: i64) -> Result<Option<DirectoryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let raw: Option<RawDir> = conn
             .query_row(
                 "SELECT d.card_json, d.visibility, d.card_sig, d.verified,
@@ -558,7 +639,7 @@ impl Store {
     /// The visibility of an agent's directory card, or `None` if it never registered one.
     /// Used to decide whether a peer may open a DM by id: a registered agent is *reachable*.
     pub fn directory_visibility(&self, agent: &str) -> Result<Option<Visibility>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let v: Option<String> = conn
             .query_row(
                 "SELECT visibility FROM directory WHERE agent = ?1",
@@ -571,7 +652,7 @@ impl Store {
 
     /// `(total registered, public)` agent counts — for the `/api/hub` summary.
     pub fn directory_counts(&self) -> Result<(i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM directory", [], |r| r.get(0))?;
         let public: i64 = conn.query_row(
             "SELECT COUNT(*) FROM directory WHERE visibility = 'public'",
@@ -591,7 +672,7 @@ impl Store {
         created_by: &str,
         now: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO directory_tokens (token, scope, expires, created_by, created)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -602,7 +683,7 @@ impl Store {
 
     /// `true` when `token` exists and has not expired.
     pub fn validate_directory_token(&self, token: &str, now: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let exp: Option<i64> = conn
             .query_row(
                 "SELECT expires FROM directory_tokens WHERE token = ?1",
@@ -626,7 +707,7 @@ impl Store {
         size: i64,
         now: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         conn.execute(
             "INSERT INTO blobs (id, media_type, size, created) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO NOTHING",
@@ -642,14 +723,14 @@ impl Store {
 
     /// Total bytes across all stored blobs — used to enforce the hub's disk budget.
     pub fn total_blob_bytes(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let n: i64 = conn.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |r| r.get(0))?;
         Ok(n)
     }
 
     /// A stored blob's metadata (bytes length + media type), or `None` if unknown.
     pub fn blob_meta(&self, id: &str) -> Result<Option<BlobMeta>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let m = conn
             .query_row(
                 "SELECT id, media_type, size, created FROM blobs WHERE id = ?1",
@@ -670,7 +751,7 @@ impl Store {
     /// Whether `agent` may download blob `id` — true iff it is a member of a room the blob was
     /// posted to.
     pub fn blob_readable_by(&self, id: &str, agent: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM blob_rooms br
                JOIN members m ON m.room = br.room
@@ -685,7 +766,7 @@ impl Store {
 
     /// Write a fact. With a `key`, this upserts within (author, room, key) — idempotent updates.
     pub fn remember(&self, author: &str, fact: &Fact, ts: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.w();
         match &fact.key {
             Some(k) => {
                 let updated = conn.execute(
@@ -718,7 +799,7 @@ impl Store {
             return Ok(vec![]);
         }
         let lim = limit.unwrap_or(8).min(50) as i64;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.r();
         let map = |r: &rusqlite::Row| {
             Ok(RecallHit {
                 text: r.get(0)?,
@@ -759,6 +840,130 @@ impl Store {
         };
         Ok(hits)
     }
+
+    // ---- retention / janitor (bound the append-only growth of a long-lived public hub) ----
+
+    /// Delete messages older than `retain_ms`, but always keep at least the newest `keep_per_room`
+    /// messages in each room. Age-based and deliberately simple: an agent offline longer than the
+    /// window may miss expired messages (the bus is at-least-once, not infinite-retention). Cursors
+    /// need no fix-up — `pull` reads `seq > cursor`, so a cursor below a pruned `seq` just resumes at
+    /// the next surviving row. Returns the number of rows removed.
+    pub fn prune_messages(&self, retain_ms: i64, keep_per_room: i64, now: i64) -> Result<usize> {
+        let cutoff = now - retain_ms;
+        let conn = self.w();
+        // The correlated subquery is the `seq` of the (keep_per_room+1)-th newest message in the row's
+        // room; `COALESCE(.., -1)` keeps everything when a room has fewer than that (seq starts at 1).
+        let n = conn.execute(
+            "DELETE FROM messages
+              WHERE ts < ?1
+                AND seq <= COALESCE(
+                      (SELECT seq FROM messages m2 WHERE m2.room = messages.room
+                        ORDER BY seq DESC LIMIT 1 OFFSET ?2), -1)",
+            params![cutoff, keep_per_room],
+        )?;
+        Ok(n)
+    }
+
+    /// Keep only the newest `keep` *unkeyed* facts per `(author, room-or-private)`. Keyed facts are
+    /// already bounded (they upsert) and are never pruned here. The FTS index stays consistent via the
+    /// `facts_ad` delete trigger. Returns the number of rows removed.
+    pub fn prune_facts(&self, keep: i64) -> Result<usize> {
+        let conn = self.w();
+        let n = conn.execute(
+            "DELETE FROM facts
+              WHERE fkey IS NULL
+                AND id <= COALESCE(
+                      (SELECT id FROM facts f2
+                        WHERE f2.fkey IS NULL AND f2.author = facts.author
+                          AND IFNULL(f2.room,'') = IFNULL(facts.room,'')
+                        ORDER BY id DESC LIMIT 1 OFFSET ?1), -1)",
+            params![keep],
+        )?;
+        Ok(n)
+    }
+
+    /// Mark a blob as fetched `now` — the LRU input for [`Store::gc_blobs`].
+    pub fn touch_blob_fetched(&self, id: &str, now: i64) -> Result<()> {
+        let conn = self.w();
+        conn.execute("UPDATE blobs SET last_fetched = ?2 WHERE id = ?1", params![id, now])?;
+        Ok(())
+    }
+
+    /// Garbage-collect blobs neither fetched nor created within `ttl_ms`. Removes the `blobs` +
+    /// `blob_rooms` rows and returns the content ids whose on-disk bytes the caller must unlink (file
+    /// I/O is kept off the DB lock). This is the disk-budget counterpart to message retention — an
+    /// idle bundle eventually expires and becomes unfetchable.
+    pub fn gc_blobs(&self, ttl_ms: i64, now: i64) -> Result<Vec<String>> {
+        let cutoff = now - ttl_ms;
+        let conn = self.w();
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM blobs WHERE COALESCE(last_fetched, created) < ?1")?
+            .query_map(params![cutoff], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        conn.execute(
+            "DELETE FROM blob_rooms WHERE blob IN
+               (SELECT id FROM blobs WHERE COALESCE(last_fetched, created) < ?1)",
+            params![cutoff],
+        )?;
+        conn.execute("DELETE FROM blobs WHERE COALESCE(last_fetched, created) < ?1", params![cutoff])?;
+        Ok(ids)
+    }
+
+    /// Delete expired invites + directory tokens. Always safe (expired rows are dead weight); the one
+    /// retention task the janitor runs unconditionally. Returns the number of rows removed.
+    pub fn sweep_expired(&self, now: i64) -> Result<usize> {
+        let conn = self.w();
+        let a = conn.execute("DELETE FROM invites WHERE expires < ?1", params![now])?;
+        let b = conn.execute("DELETE FROM directory_tokens WHERE expires < ?1", params![now])?;
+        Ok(a + b)
+    }
+
+    /// Reclaim freed pages when the DB is in `auto_vacuum = INCREMENTAL` mode (a no-op otherwise —
+    /// e.g. an older file created before that pragma, which needs a one-time `VACUUM` to convert).
+    pub fn incremental_vacuum(&self) -> Result<()> {
+        let conn = self.w();
+        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+        Ok(())
+    }
+}
+
+/// Idempotently add a column to a table (SQLite has no `ADD COLUMN IF NOT EXISTS`), so an older
+/// on-disk schema can gain a column without a destructive rebuild. `table`/`col`/`decl` are internal
+/// constants, never user input.
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<()> {
+    let present = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<String>>>()?
+        .iter()
+        .any(|c| c == col);
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl};"))?;
+    }
+    Ok(())
+}
+
+/// Per-connection pragmas. These are *not* persisted in the database file, so they must be set on
+/// every connection that is opened (the single writer today; each reader once the pool lands).
+/// `journal_mode = WAL` is a database-level setting and stays in `MIGRATION` (applied once).
+///
+/// `synchronous = NORMAL` is the documented WAL "sweet spot": atomic, never-corrupting commits that
+/// only risk losing the *last* transaction on OS/power loss — in exchange for a large write speedup
+/// over the default `FULL` (which fsyncs on every commit). The cache/mmap/temp_store knobs cut disk
+/// I/O as the database grows; `foreign_keys = ON` enforces referential integrity for future cascades.
+fn configure_conn(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA synchronous  = NORMAL;
+         PRAGMA cache_size   = -65536;
+         PRAGMA temp_store   = MEMORY;
+         PRAGMA mmap_size    = 268435456;
+         PRAGMA foreign_keys = ON;",
+    )?;
+    Ok(())
 }
 
 /// Build a safe FTS5 query: keep alphanumeric terms only, prefix-match each, OR them together.
@@ -915,6 +1120,71 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_pool_reads_see_writes() {
+        // A real file DB exercises the read-only connection pool (an in-memory DB falls back to the
+        // writer). This is the safety net for the writer/reader split: any write mis-routed to a
+        // read-only reader fails here, and every read must observe committed writes through the pool.
+        let dir = std::env::temp_dir().join(format!("parler-pool-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hub.sqlite");
+        {
+            let s = Store::open(Some(&db)).unwrap();
+            // Writes — each must land on the single writer connection.
+            s.upsert_agent("U_A", "alice", Some("planner"), 10).unwrap();
+            s.upsert_agent("U_B", "bob", None, 10).unwrap();
+            s.touch_presence("U_A", "working", Some("things"), 11).unwrap();
+            s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
+            s.add_member("team", "U_A", 1).unwrap();
+            s.add_member("team", "U_B", 1).unwrap();
+            s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 20).unwrap();
+            s.remember("U_A", &Fact { key: None, text: "deploy is blue-green".into(), room: Some("team".into()) }, 21).unwrap();
+            s.register_card(&card("U_A", "alice", &["ops"], &["plan"]), Some("sig"), true, Visibility::Public, 12).unwrap();
+            s.create_invite("CODE", "team", RoomKind::Channel, None, 1, 9_999_999_999_999, "U_A", 1).unwrap();
+            s.mint_directory_token("TOK", "hub", 9_999_999_999_999, "U_A", 1).unwrap();
+            s.put_blob_meta("blob1", "team", "U_A", None, 12, 30).unwrap();
+            s.touch_blob_fetched("blob1", 31).unwrap();
+
+            // Reads — these now run on read-only pool connections and must observe the writes above.
+            assert!(s.is_member("team", "U_A").unwrap());
+            assert_eq!(s.room_kind("team").unwrap(), Some(RoomKind::Channel));
+            assert_eq!(s.roster("team", 20).unwrap().len(), 2);
+            assert_eq!(s.rooms_of("U_A").unwrap().len(), 1);
+            assert_eq!(s.recall("U_A", "deploy", Some("team"), None).unwrap().len(), 1);
+            assert_eq!(s.discover(DiscoverScope::Public, "h", None, None, None, None, None, 20).unwrap().len(), 1);
+            assert!(s.lookup_card("U_A", "h", false, 20).unwrap().is_some());
+            assert_eq!(s.directory_counts().unwrap(), (1, 1));
+            assert_eq!(s.directory_visibility("U_A").unwrap(), Some(Visibility::Public));
+            assert!(s.validate_directory_token("TOK", 100).unwrap());
+            assert_eq!(s.total_blob_bytes().unwrap(), 12);
+            assert!(s.blob_meta("blob1").unwrap().is_some());
+            assert!(s.blob_readable_by("blob1", "U_A").unwrap());
+            assert_eq!(s.find_dm_room("U_A", "U_B").unwrap(), None); // a channel, not a dm
+
+            // `pull` reads on the pool but advances the cursor on the writer.
+            let (msgs, cur) = s.pull("team", "U_B", None, None).unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(cur, 1);
+            let (again, _) = s.pull("team", "U_B", None, None).unwrap();
+            assert!(again.is_empty(), "cursor advanced through the writer");
+
+            // Read-then-write op, then confirm the new membership through the pool.
+            s.upsert_agent("U_C", "carol", None, 2).unwrap();
+            s.redeem_invite("CODE", "U_C", 2).unwrap();
+            assert!(s.is_member("team", "U_C").unwrap());
+
+            s.sweep_expired(1).unwrap();
+            s.quick_check().unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn quick_check_passes_on_fresh_db() {
+        let s = Store::open(None).unwrap();
+        s.quick_check().unwrap();
+    }
+
+    #[test]
     fn append_pull_advances_cursor() {
         let s = Store::open(None).unwrap();
         s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
@@ -993,6 +1263,57 @@ mod tests {
         s.add_member("ops", "U_B", 1).unwrap();
         s.put_blob_meta("deadbeef", "ops", "U_B", None, 42, 3).unwrap();
         assert!(s.blob_readable_by("deadbeef", "U_B").unwrap());
+    }
+
+    #[test]
+    fn prune_messages_keeps_newest_and_respects_age() {
+        let s = Store::open(None).unwrap();
+        s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
+        for i in 0..5 {
+            s.append_message("team", &eref("U_A", "a"), &[Part::text("m")], None, None, 100 + i).unwrap();
+        }
+        // now=10_000, retain 1s ⇒ all five (ts 100..104) are "expired", but keep the newest 2.
+        assert_eq!(s.prune_messages(1_000, 2, 10_000).unwrap(), 3);
+        let (msgs, _) = s.pull("team", "U_A", Some(0), None).unwrap();
+        assert_eq!(msgs.len(), 2);
+        // Idempotent: a second pass removes nothing (only the keep floor remains).
+        assert_eq!(s.prune_messages(1_000, 2, 20_000).unwrap(), 0);
+        // A recent message is never pruned, even with keep=0.
+        s.append_message("team", &eref("U_A", "a"), &[Part::text("fresh")], None, None, 19_900).unwrap();
+        assert_eq!(s.prune_messages(1_000, 0, 20_000).unwrap(), 2); // the two old survivors go
+        let (after, _) = s.pull("team", "U_A", Some(0), None).unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn prune_facts_keeps_newest_unkeyed_and_keeps_keyed() {
+        let s = Store::open(None).unwrap();
+        for i in 0..4 {
+            s.remember("U_A", &Fact { key: None, text: format!("note {i}"), room: None }, 100 + i).unwrap();
+        }
+        s.remember("U_A", &Fact { key: Some("k".into()), text: "kept".into(), room: None }, 200).unwrap();
+        // Keep the newest 1 unkeyed ⇒ remove 3; the keyed fact is untouched.
+        assert_eq!(s.prune_facts(1).unwrap(), 3);
+        assert_eq!(s.recall("U_A", "note", None, None).unwrap().len(), 1);
+        assert_eq!(s.recall("U_A", "kept", None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn gc_blobs_and_sweep_expired() {
+        let s = Store::open(None).unwrap();
+        s.ensure_room("dev", RoomKind::Channel, None, 1).unwrap();
+        s.put_blob_meta("aa", "dev", "U_A", None, 10, 100).unwrap();
+        // created at 100, ttl 1s, now 5_000 ⇒ stale; gc returns the id to unlink and drops the rows.
+        assert_eq!(s.gc_blobs(1_000, 5_000).unwrap(), vec!["aa".to_string()]);
+        assert!(s.blob_meta("aa").unwrap().is_none());
+        assert!(!s.blob_readable_by("aa", "U_A").unwrap());
+        // A fetch keeps a blob alive past the TTL.
+        s.put_blob_meta("bb", "dev", "U_A", None, 10, 100).unwrap();
+        s.touch_blob_fetched("bb", 4_900).unwrap();
+        assert!(s.gc_blobs(1_000, 5_000).unwrap().is_empty());
+
+        s.create_invite("C1", "dev", RoomKind::Channel, None, 1, 5_000, "U_A", 1).unwrap();
+        assert_eq!(s.sweep_expired(10_000).unwrap(), 1); // invite expired at ts 5_000
     }
 
     #[test]

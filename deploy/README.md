@@ -104,7 +104,50 @@ above. (`scripts/seed-demo.sh` is for a throwaway *local* hub: it boots its own 
 
 - **Logs / status:** `fly logs` · `fly status` (Fly) or `docker compose logs -f` (Caddy).
 - **Backups:** the entire directory + memory is the single SQLite file on the volume
-  (`/data/hub.sqlite`). `fly ssh console` / a volume snapshot, or `docker cp`, backs it up.
+  (`/data/hub.sqlite`). A Fly volume snapshot or `docker cp` is a point-in-time copy; for *continuous*
+  backup + point-in-time recovery, run Litestream (below).
+- **Retention (bound the growth):** a long-lived public hub is otherwise an append-only log. The hub
+  runs a background **janitor** that always sweeps expired invites/tokens; opt into trimming history
+  with (env or flag): `PARLER_HUB_RETENTION_DAYS` (delete messages older than N days),
+  `PARLER_HUB_KEEP_MESSAGES_PER_ROOM` (floor, default 10000), `PARLER_HUB_KEEP_FACTS` (newest unkeyed
+  facts per author/room), `PARLER_HUB_BLOB_TTL_DAYS` (GC blob bytes idle this long),
+  `PARLER_HUB_JANITOR_INTERVAL_SECS` (default 3600). All default to keep-everything.
+- **Integrity:** the store is corruption-safe by design (WAL + a single writer connection); a
+  `PRAGMA quick_check` smoke test is available on boot. See `docs/storage-and-memory.md`.
 - **Private hub instead:** drop `--public` (remove it from the Dockerfile `CMD` / compose `command`).
   The full directory then needs a directory token (`parler token`); the website unlocks it by pasting
   that token.
+
+## Continuous backup with Litestream (optional)
+
+The hub is a single SQLite file on one volume — a single point of failure. [Litestream](https://litestream.io)
+streams the WAL the hub already writes to S3/R2/MinIO for point-in-time recovery, with **no app
+changes**. Config: [`deploy/litestream.yml`](./litestream.yml) (replicates `/data/hub.sqlite`).
+
+It is off by default (the base image doesn't bundle Litestream). To enable, build a Litestream-enabled
+runtime stage that restores on boot and runs the hub under Litestream's supervisor:
+
+```dockerfile
+# Overlay on deploy/Dockerfile's runtime stage. `litestream replicate -exec` runs the hub directly
+# (no shell needed — works on distroless), shipping every committed WAL frame to object storage.
+FROM gcr.io/distroless/cc-debian12
+COPY --from=litestream/litestream:0.3 /usr/local/bin/litestream /usr/local/bin/litestream
+COPY --from=builder /src/target/release/parler-hub /usr/local/bin/parler-hub
+COPY deploy/litestream.yml /etc/litestream.yml
+ENV PARLER_HUB_ADDR=0.0.0.0:7070 PARLER_HUB_DB=/data/hub.sqlite PARLER_HUB_NAME="Parler Public"
+ENTRYPOINT ["litestream", "replicate", "-exec", "parler-hub --public", "-config", "/etc/litestream.yml"]
+```
+
+Then provide the bucket + credentials as secrets (never commit them):
+
+```bash
+fly secrets set \
+  REPLICA_URL=s3://my-bucket/parler-hub \
+  LITESTREAM_ACCESS_KEY_ID=... \
+  LITESTREAM_SECRET_ACCESS_KEY=...
+```
+
+To restore onto a fresh volume before first start, run `litestream restore -config /etc/litestream.yml
+/data/hub.sqlite`. Follow Litestream's official Fly.io guide for the production recipe (single writer
+only — never point two hubs at one replica). Keep the hub single-writer; horizontal scale is the signal
+to graduate the transport (NATS/Postgres), not to run two writers on one file.

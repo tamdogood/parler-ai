@@ -1,3 +1,46 @@
+# Task: SQLite design + audit + agent-memory research (2026-06-28)
+
+**User ask:** design/audit the hub's SQLite store so it stays scalable + corruption-safe as the
+public hub grows; ensure messages are recorded correctly and easily retrieved; research the latest
+agent-memory findings; decide whether to build a vector DB; **ensure agents can transmit big code
+changes efficiently**; record everything in a doc.
+
+- [x] Map the store (`parler-hub/src/store.rs`) — schema, indexes, concurrency, durability
+- [x] Audit message recording (seq/cursor atomicity, at-least-once, corruption surface)
+- [x] Audit big-message / code path (blobs on disk, WS-binary, dedup, RAM, GC)
+- [x] Research agent memory (Letta/Mem0/Zep/Graphiti; episodic/semantic/procedural)
+- [x] Research SQLite-at-scale + sqlite-vec hybrid vs dedicated vector DB
+- [x] Write `docs/storage-and-memory.md` (design + audit + research + phased roadmap)
+
+**Verdict:** store is **corruption-safe today**; the single shared connection is the throughput
+ceiling; message/fact/blob growth is **unbounded** (needs retention). Code transfer is architected
+right (content-addressed blobs off the SQLite path) but uploads are fully buffered in RAM and blobs
+never GC. Recommend FTS5 now + **`sqlite-vec` hybrid later with client-supplied embeddings** — do
+**not** stand up a separate vector database. Full write-up: `docs/storage-and-memory.md`.
+
+## Implementation (user: "implement all the phases")
+- [x] **P0 config & integrity** — per-connection pragmas (`synchronous=NORMAL`, cache/mmap/temp_store,
+  `busy_timeout=5s`, `foreign_keys`), `auto_vacuum=INCREMENTAL`, `idx_members_agent`, `quick_check()`
+- [x] **P1 durability & growth** — `prune_messages`/`prune_facts`/`gc_blobs`/`sweep_expired`/
+  `incremental_vacuum` + `blobs.last_fetched`; background **janitor** (spawn_blocking) + CLI/env flags;
+  Litestream opt-in scaffold (`deploy/litestream.yml` + deploy docs)
+- [x] **P2 concurrency unlock** — 1 writer + read-only WAL connection **pool** (`w()`/`r()`); hot reads
+  fan out; `pull` reads on a reader, advances cursor on the writer. *S4 (`rooms.last_seq`) skipped on
+  purpose — taxes the hot send path to speed a cold read; the COUNT is index-backed.*
+- [◑] **P3 big-blob efficiency** — blob GC + LRU landed (P1); chunked/streaming upload (B1) = scoped
+  cross-crate follow-up (current single-frame path works to the 25 MiB cap)
+- [⏳] **P4 semantic memory** — designed; needs the `sqlite-vec` dep + a client embedding source (none
+  exists yet); land as a focused follow-up so the deployed protocol isn't half-changed
+
+**Verification:** 44 tests green — hub **22** (incl. `file_backed_pool_reads_see_writes`, retention,
+`quick_check`, `janitor_pass`), connector e2e **15** (all delivery modes/sessions/reconnect/idle/code
+handoff), CLI/MCP **7**; `cargo clippy -p parler-hub -D warnings` clean; `--release` binary builds.
+The file-backed pool test caught (and I fixed) that `quick_check` must run on the writer because
+FTS5 index validation needs write access — a good example of the read/write split being exercised.
+All additive + backward-compatible; **no `cargo fmt`** (hand-formatted repo). Not committed.
+
+---
+
 # Feature: Code Handoff — git-bundle artifact passing (2026-06-27, BUILT)
 
 **User ask:** investigate [ottogin/agenthub](https://github.com/ottogin/agenthub) and borrow the good
