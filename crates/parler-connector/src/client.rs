@@ -29,6 +29,9 @@ impl HubClient {
         role: Option<&str>,
     ) -> Result<HubClient> {
         let ws_url = to_ws_url(hub_url);
+        if ws_url.starts_with("wss://") {
+            ensure_crypto_provider();
+        }
         let (ws, _resp) = connect_async(&ws_url)
             .await
             .map_err(|e| anyhow!("connecting to {ws_url}: {e}"))?;
@@ -45,6 +48,7 @@ impl HubClient {
             role: role.map(String::from),
             nonce: None,
             sig: None,
+            secret: None,
         })
         .await?;
         let nonce = match self.recv().await? {
@@ -57,12 +61,16 @@ impl HubClient {
         let kp = nkeys::KeyPair::from_seed(&identity.seed).map_err(|e| anyhow!("bad seed: {e}"))?;
         let sig = kp.sign(nonce.as_bytes()).map_err(|e| anyhow!("signing challenge: {e}"))?;
         let sig_b64 = data_encoding::BASE64.encode(&sig);
+        // A private hub may require a shared join secret in addition to key ownership. Presented over
+        // the (TLS-terminated) connection, like a bearer token; absent/empty ⇒ omitted.
+        let secret = std::env::var("PARLER_JOIN_SECRET").ok().filter(|s| !s.is_empty());
         self.send(&ClientFrame::Hello {
             id: identity.id.clone(),
             name: name.to_string(),
             role: role.map(String::from),
             nonce: Some(nonce),
             sig: Some(sig_b64),
+            secret,
         })
         .await?;
         match self.recv().await? {
@@ -144,6 +152,20 @@ impl MeshTransport for HubClient {
         }
         self.recv_binary().await
     }
+}
+
+/// Install the `ring` crypto provider as rustls' process default — once.
+///
+/// tokio-tungstenite builds a rustls `ClientConfig` to dial `wss://`, and rustls 0.23 needs a
+/// process-default [`rustls::crypto::CryptoProvider`]. With only `ring` in the tree it is *not*
+/// auto-installed, so the first TLS dial would otherwise panic. We install it lazily and ignore the
+/// result — an embedding host (or an earlier call) may already have set one.
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static PROVIDER: Once = Once::new();
+    PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Normalize any hub address (`ws://`, `http(s)://`, `parler://`, or bare `host:port`) into the
