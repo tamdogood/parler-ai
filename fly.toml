@@ -15,7 +15,7 @@
 # Change `app` and the `<app>.fly.dev` URL below to your chosen (globally-unique) name.
 
 app = "parler-hub"
-primary_region = "iad"          # pick one near you: `fly platform regions`
+primary_region = "dfw"          # matches the parler_data volume's region
 
 [build]
   dockerfile = "deploy/Dockerfile"   # relative to this file (the repo root)
