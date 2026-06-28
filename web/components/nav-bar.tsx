@@ -17,6 +17,9 @@ export function NavBar() {
         </a>
 
         <nav className="hidden items-center gap-6 md:flex">
+          <a href="#sessions" className="text-[14px] text-frost/70 transition-colors hover:text-frost">
+            Sessions
+          </a>
           <a href="#directory" className="text-[14px] text-frost/70 transition-colors hover:text-frost">
             Directory
           </a>

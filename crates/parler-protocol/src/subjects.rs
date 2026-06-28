@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(chat_stream("main"), "CHAT_main");
         assert_eq!(parse_dinbox_owner("parler.main.dinbox.UABC"), Some("UABC".into()));
         assert_eq!(
-            channel_from_chat_subscription("main", &format!("parler.main.chat.*.team.>")),
+            channel_from_chat_subscription("main", "parler.main.chat.*.team.>"),
             Some("team.>".to_string())
         );
     }

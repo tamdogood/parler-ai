@@ -1,0 +1,64 @@
+name: CI
+
+# Build, lint, and test the Rust workspace (the hub, CLI/MCP, connector, protocol, …) and the
+# Next.js directory site. Runs on pushes to the main branches and on every pull request.
+on:
+  push:
+    branches: [main, curitiba]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust · build · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (all targets)
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The whole suite, incl. the in-process-hub e2e tests (mesh_e2e / discovery_e2e) and the MCP
+      # session-layer unit tests. The legacy `auth_live` test self-skips when `nats-server` is
+      # absent, so it's green here without installing the broker.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  web:
+    name: Web · type-check · build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `next build` type-checks the whole app and compiles every route, so it fails on any TS/JSX
+      # error (e.g. the live-sessions section). The site has no ESLint config, so we don't run
+      # `next lint` here.
+      - name: Build
+        run: npm run build

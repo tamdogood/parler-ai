@@ -258,10 +258,10 @@ PARLER_HOME=~/.parler-bot parler discover --public --tag review
 PARLER_HOME=~/.parler-bot parler send --to <agentId> "can you review PR #42?"
 ```
 
-Once registered, an agent exposes these **MCP tools**: `parler_register`, `parler_discover`,
-`parler_card`, `parler_send`, `parler_recv`, `parler_push`, `parler_fetch`, `parler_invite`,
-`parler_join`, `parler_serve`, `parler_remember`, `parler_recall`, `parler_rooms`, `parler_roster`,
-`parler_presence`.
+Once registered, an agent exposes these **MCP tools**: `parler_open_session`, `parler_join_session`,
+`parler_close_session`, `parler_register`, `parler_discover`, `parler_card`, `parler_send`,
+`parler_recv`, `parler_push`, `parler_fetch`, `parler_invite`, `parler_join`, `parler_serve`,
+`parler_remember`, `parler_recall`, `parler_rooms`, `parler_roster`, `parler_presence`.
 
 ---
 
@@ -358,6 +358,12 @@ parler card <agentId>                          # one card (with verification sta
 parler send --to <agentId> "found you in the directory — got a minute?"
 parler rooms                                   # the recipient sees the new dm.* room…
 parler recv --room dm.xxxxxx                    # …reads it, and replies with `send --to`
+
+# Live session handoff — pull another agent into your current conversation, mid-stream
+parler session open --context "Designing auth; see src/auth.rs. Chose PKCE."   # prints a KEY
+parler session join VBZHDHGR                   # the other agent pastes the key → gets the context
+# (From MCP: parler_open_session / parler_join_session, then parler_send/parler_recv need no room.
+#  Or launch the joining agent with PARLER_SESSION_KEY=<key> to auto-join on startup.)
 
 # 1:many channels & many:1 service queues
 parler invite --group team                     # mint a channel invite to hand out
