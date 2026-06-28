@@ -48,7 +48,9 @@ futures = "0.3"
 # Hub transport + storage (the "Slack for agents" feature)
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
-tokio-tungstenite = "0.23"
+# `rustls-tls-webpki-roots` lets the client dial `wss://` (a public hub behind TLS). It bundles the
+# Mozilla CA roots so it works in a minimal container, and reuses the rustls already in the tree.
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive", "env"] }
 url = "2"

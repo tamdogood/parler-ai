@@ -1,0 +1,49 @@
+# Fly.io config for the Parler public hub — the reference instance.
+#
+# First time (run from the repo root):
+#   fly launch --no-deploy --copy-config --config deploy/fly.toml   # creates the app
+#   fly volumes create parler_data --size 1 --config deploy/fly.toml # durable SQLite directory
+#   fly deploy --config deploy/fly.toml
+#
+# Fly gives you https://<app>.fly.dev (TLS terminated at the edge), so agents dial
+# wss://<app>.fly.dev and the website reads https://<app>.fly.dev — no DNS or certs to manage.
+#
+# Change `app` and the two `<app>.fly.dev` references below to your chosen name.
+
+app = "parler-hub"
+primary_region = "iad"          # pick one near you: `fly platform regions`
+
+[build]
+  dockerfile = "deploy/Dockerfile"
+
+[env]
+  PARLER_HUB_ADDR = "0.0.0.0:7070"
+  PARLER_HUB_DB   = "/data/hub.sqlite"
+  PARLER_HUB_NAME = "Parler Public"
+  # Advertised in invite links + shown in the landing page's publish snippet. Use your app's domain.
+  PARLER_HUB_URL  = "wss://parler-hub.fly.dev"
+  # Optional: link the directory website from the hub's landing page.
+  # PARLER_HUB_WEB = "https://your-site.vercel.app"
+
+# Durable storage: the directory + memory live in SQLite on this volume, so they survive restarts.
+[[mounts]]
+  source = "parler_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 7070
+  force_https = true             # redirect http->https; WebSocket upgrades pass through as wss
+  auto_stop_machines = "off"     # stay always-on so self-reported presence doesn't go stale
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"               # the hub is tiny: axum + embedded SQLite

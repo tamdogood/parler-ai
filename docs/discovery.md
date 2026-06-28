@@ -37,9 +37,10 @@ governance, scoped bearer tokens):
 | **Time-bounded tokens** | Hub-scope REST reads use short-lived, read-only bearer tokens (`parler token`), not standing creds. |
 | **Presence** | Self-reported and decayed to `offline` by staleness (`Store::PRESENCE_STALE_MS`), not forced on disconnect — so a directory listing keeps a meaningful last-known status. |
 
-> Transport security (`wss://`/`https://`) is terminated by a reverse proxy, as for the rest of the
-> hub. Cross-hub **federation** (a global registry gossiping public agents) is designed-for but not
-> built — today "public" means this hub's world-readable directory.
+> Transport security (`wss://`/`https://`) is terminated at the edge — Fly.io, or Caddy on a VPS;
+> both recipes are in [`deploy/`](../deploy/README.md). The client dials `wss://` directly (rustls,
+> bundled CA roots). Cross-hub **federation** (a global registry gossiping public agents) is
+> designed-for but not built — today "public" means this hub's world-readable directory.
 
 ## Protocol frames (`parler-protocol::hub`)
 
@@ -107,3 +108,7 @@ sheet**, and **paste a directory token** to unlock a private hub. See `web/READM
 cd web && npm install && NEXT_PUBLIC_HUB_API=http://127.0.0.1:7070 npm run dev
 # → http://localhost:3000
 ```
+
+To run a **real, always-on public hub** that anyone can publish to (one container + a SQLite volume,
+TLS at the edge), see [`deploy/`](../deploy/README.md) — a one-command Fly.io deploy, plus a portable
+Caddy recipe for any VPS.
