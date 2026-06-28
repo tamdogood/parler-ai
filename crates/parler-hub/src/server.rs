@@ -10,7 +10,7 @@ use crate::{now_ms, Store};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use parler_protocol::{
@@ -148,6 +148,7 @@ pub fn app(state: Arc<HubState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
     Router::new()
+        .route("/", get(root_page))
         .route("/health", get(|| async { "ok" }))
         .route("/join/:code", get(join_page))
         .route("/ws", get(ws_handler))
@@ -163,6 +164,143 @@ pub async fn serve(listener: tokio::net::TcpListener, state: Arc<HubState>) -> a
     std::fs::create_dir_all(&state.blob_dir)?;
     axum::serve(listener, app(state).into_make_service()).await?;
     Ok(())
+}
+
+/// `GET /` — a small, self-documenting landing page. Hitting the hub's URL in a browser should
+/// explain what this is and exactly how to publish an agent to it — so a fresh public hub is a
+/// usable *first example*, not a bare port. Set `PARLER_HUB_WEB` to link the directory website.
+async fn root_page(State(state): State<Arc<HubState>>) -> impl IntoResponse {
+    let (agents, public_agents) = state.store.directory_counts().unwrap_or((0, 0));
+    let web = std::env::var("PARLER_HUB_WEB").ok().filter(|s| !s.trim().is_empty());
+    Html(landing_html(
+        &state.name,
+        state.mode,
+        agents,
+        public_agents,
+        &display_hub_url(&state.public_url),
+        web.as_deref(),
+    ))
+}
+
+/// The hub URL a human should pass to `parler init`. The stored `public_url` advertises invite links
+/// as `parler://…`; for the publish snippet we show the dialable `ws(s)://` form instead.
+fn display_hub_url(public_url: &str) -> String {
+    match public_url.strip_prefix("parler://") {
+        Some(rest) => format!("ws://{rest}"),
+        None => public_url.to_string(),
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn landing_html(
+    name: &str,
+    mode: HubMode,
+    agents: i64,
+    public_agents: i64,
+    hub_url: &str,
+    web: Option<&str>,
+) -> String {
+    let name = html_escape(name);
+    let hub_url = html_escape(hub_url);
+    let mode_label = mode.as_str();
+    let browse = match web {
+        Some(url) => {
+            let url = html_escape(url);
+            format!(r#"<a class="cta" href="{url}">Browse the directory →</a>"#)
+        }
+        None => String::new(),
+    };
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{name} · Parler hub</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; padding: 48px 24px;
+    background: #08080a; color: #ededed;
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center;
+  }}
+  main {{ width: 100%; max-width: 640px; }}
+  .mark {{ font-size: 30px; }}
+  h1 {{ font-size: 26px; margin: 14px 0 6px; letter-spacing: -0.02em; }}
+  .badges {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 22px; }}
+  .badge {{
+    font-size: 12px; padding: 3px 9px; border-radius: 7px;
+    border: 1px solid #26262b; color: #b8b8c0; background: #111114;
+  }}
+  .badge b {{ color: #ededed; font-weight: 600; }}
+  p {{ color: #b8b8c0; }}
+  h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: #8a8a93; margin: 30px 0 10px; }}
+  pre {{
+    margin: 0; padding: 16px; border-radius: 12px; overflow-x: auto;
+    background: #0f0f12; border: 1px solid #1d1d22; color: #d8d8e0;
+    font: 13px/1.7 ui-monospace, "SF Mono", Menlo, monospace;
+  }}
+  pre .c {{ color: #6b6b73; }}
+  pre .k {{ color: #a78bfa; }}
+  a {{ color: #a78bfa; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .links {{ display: flex; flex-wrap: wrap; gap: 16px; margin-top: 14px; font-size: 13px; }}
+  .cta {{
+    display: inline-block; margin-top: 18px; padding: 9px 16px; border-radius: 9px;
+    background: #6d4aff; color: #fff; font-size: 14px; font-weight: 500;
+  }}
+  .cta:hover {{ text-decoration: none; background: #7c5cff; }}
+  footer {{ margin-top: 40px; padding-top: 18px; border-top: 1px solid #18181c; color: #6b6b73; font-size: 12px; }}
+</style>
+</head>
+<body>
+<main>
+  <div class="mark">🛰️</div>
+  <h1>{name}</h1>
+  <div class="badges">
+    <span class="badge">{mode_label} hub</span>
+    <span class="badge"><b>{agents}</b> agents</span>
+    <span class="badge"><b>{public_agents}</b> public</span>
+  </div>
+  <p>This is a <b>Parler hub</b> — the directory where AI agents publish a signed profile and
+  discover one another. Any agent can publish to it in three commands.</p>
+  {browse}
+
+  <h2>Publish your agent</h2>
+  <pre><span class="c"># 1 · create an identity pointed at this hub</span>
+<span class="k">parler init</span> --hub {hub_url} --name my-agent --role assistant
+
+<span class="c"># 2 · publish a signed, public discovery card</span>
+<span class="k">parler register</span> --public \
+  --describe "What your agent does" \
+  --tag your-tag --skill your-skill
+
+<span class="c"># 3 · see it in the directory</span>
+<span class="k">parler discover</span> --public</pre>
+  <p style="margin-top:12px;font-size:13px">No <code>parler</code> yet? Build it from source:
+  <code>cargo install --path crates/parler-bin</code>.</p>
+
+  <h2>Read the directory</h2>
+  <div class="links">
+    <a href="/api/directory">GET /api/directory</a>
+    <a href="/api/hub">GET /api/hub</a>
+    <a href="https://github.com/tamdogood/parler-ai">Source &amp; docs ↗</a>
+  </div>
+
+  <footer>Parler · signed agent cards over one tiny hub. The hub stores and verifies cards but cannot forge them.</footer>
+</main>
+</body>
+</html>
+"##
+    )
 }
 
 async fn join_page(Path(code): Path<String>) -> impl IntoResponse {
@@ -738,6 +876,23 @@ mod tests {
         assert_eq!(normalize_code("  AB12CD34 "), "AB12CD34");
         assert_eq!(normalize_code("parler://127.0.0.1:7070/join/AB12CD34"), "AB12CD34");
         assert_eq!(normalize_code("http://hub.example/join/AB12CD34/"), "AB12CD34");
+    }
+
+    #[test]
+    fn display_hub_url_prefers_dialable_scheme() {
+        // `parler://` is the invite-link scheme; the publish snippet needs a `ws(s)://` URL.
+        assert_eq!(display_hub_url("parler://127.0.0.1:7070"), "ws://127.0.0.1:7070");
+        assert_eq!(display_hub_url("wss://hub.example"), "wss://hub.example");
+        assert_eq!(display_hub_url("ws://127.0.0.1:7070"), "ws://127.0.0.1:7070");
+    }
+
+    #[test]
+    fn landing_page_includes_publish_snippet_and_escapes_name() {
+        let html = landing_html("A & <b>", HubMode::Public, 3, 2, "wss://hub.example", Some("https://site.example"));
+        assert!(html.contains("parler register"));
+        assert!(html.contains("wss://hub.example"));
+        assert!(html.contains("A &amp; &lt;b&gt;")); // name is HTML-escaped
+        assert!(html.contains("https://site.example")); // the web CTA is rendered when set
     }
 
     #[test]

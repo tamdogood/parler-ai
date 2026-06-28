@@ -1,0 +1,6 @@
+# Replace hub.example.com with your domain (its A/AAAA record must point at this host).
+# Caddy fetches and renews a Let's Encrypt certificate automatically, then proxies every request —
+# including WebSocket upgrades (wss://) — to the hub container. Nothing else to configure.
+hub.example.com {
+	reverse_proxy hub:7070
+}
