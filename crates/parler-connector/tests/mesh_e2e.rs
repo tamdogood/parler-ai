@@ -141,15 +141,15 @@ async fn memory_recall_respects_scope() {
     bob.join(&inv.code).await.unwrap();
 
     // A room-scoped fact is recallable by any member.
-    alice.remember("the deploy strategy is blue-green", None, Some(inv.room.clone())).await.unwrap();
-    let hits = bob.recall("deploy", Some(inv.room.clone()), None).await.unwrap();
+    alice.remember("the deploy strategy is blue-green", None, Some(inv.room.clone()), None, None).await.unwrap();
+    let hits = bob.recall("deploy", Some(inv.room.clone()), None, None).await.unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].text.contains("blue-green"));
 
     // A private fact is only recallable by its author.
-    alice.remember("my api token is xyz", Some("token".into()), None).await.unwrap();
-    assert_eq!(bob.recall("token", None, None).await.unwrap().len(), 0);
-    assert_eq!(alice.recall("token", None, None).await.unwrap().len(), 1);
+    alice.remember("my api token is xyz", Some("token".into()), None, None, None).await.unwrap();
+    assert_eq!(bob.recall("token", None, None, None).await.unwrap().len(), 0);
+    assert_eq!(alice.recall("token", None, None, None).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

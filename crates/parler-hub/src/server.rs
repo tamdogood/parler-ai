@@ -1159,23 +1159,29 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             Ok(ServerFrame::Pulled { room, messages, cursor })
         }
 
-        ClientFrame::Remember { fact } => {
+        ClientFrame::Remember { fact, embedding, embedding_model } => {
             if let Some(room) = &fact.room {
                 if !store.is_member(room, &me.id)? {
                     anyhow::bail!("not a member of '{room}'");
                 }
             }
-            store.remember(&me.id, &fact, now_ms())?;
+            store.remember(
+                &me.id,
+                &fact,
+                now_ms(),
+                embedding.as_deref(),
+                embedding_model.as_deref(),
+            )?;
             Ok(ServerFrame::Remembered { ok: true })
         }
 
-        ClientFrame::Recall { query, room, limit } => {
+        ClientFrame::Recall { query, room, limit, embedding } => {
             if let Some(room) = &room {
                 if !store.is_member(room, &me.id)? {
                     anyhow::bail!("not a member of '{room}'");
                 }
             }
-            let hits = store.recall(&me.id, &query, room.as_deref(), limit)?;
+            let hits = store.recall(&me.id, &query, room.as_deref(), limit, embedding.as_deref())?;
             Ok(ServerFrame::Recalled { hits })
         }
 

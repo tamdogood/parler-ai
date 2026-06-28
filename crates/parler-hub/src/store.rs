@@ -12,11 +12,30 @@ use parler_protocol::{
     RoomInfo, RoomKind, RosterEntry, StoredMessage, Visibility,
 };
 use rusqlite::{named_params, params, Connection, OpenFlags, OptionalExtension};
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use uuid::Uuid;
+
+/// Default embedding dimension for the vec_facts table (pinned at creation time).
+pub const VEC_DIMENSION: usize = 768;
+
+/// Register the sqlite-vec extension as an auto-extension (once, before any connection opens).
+fn ensure_vec_extension() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        #[allow(clippy::missing_transmute_annotations)]
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
+const RRF_K: f64 = 60.0;
 
 const MIGRATION: &str = r#"
 PRAGMA auto_vacuum = INCREMENTAL;
@@ -189,6 +208,7 @@ struct Inner {
     writer: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
     next: AtomicUsize,
+    vec_dim: usize,
 }
 
 /// A borrowed connection guard that derefs to [`Connection`], hiding whether it came from the writer
@@ -205,6 +225,8 @@ impl Deref for ConnRef<'_> {
 impl Store {
     /// Open the store at `path`, or in-memory (lost on exit) when `path` is `None`. Runs migrations.
     pub fn open(path: Option<&Path>) -> Result<Store> {
+        ensure_vec_extension();
+
         let writer = match path {
             Some(p) => {
                 // Create the parent directory if it's missing, so a fresh DB path opens instead of
@@ -223,6 +245,11 @@ impl Store {
         add_column_if_missing(&writer, "blobs", "last_fetched", "INTEGER")?;
         add_column_if_missing(&writer, "rooms", "owner", "TEXT")?;
         add_column_if_missing(&writer, "invites", "require_approval", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&writer, "facts", "embedding_model", "TEXT")?;
+
+        // Vector index for semantic recall (sqlite-vec, registered via auto_extension above).
+        let vec_dim = VEC_DIMENSION;
+        create_vec_table(&writer, vec_dim)?;
 
         // Read-only pool for a file-backed DB (the writer has already created the -wal/-shm files, so
         // read-only connections can attach). In-memory has no shared file ⇒ no pool, reads use writer.
@@ -237,8 +264,13 @@ impl Store {
             }
         }
         Ok(Store {
-            inner: Arc::new(Inner { writer: Mutex::new(writer), readers, next: AtomicUsize::new(0) }),
+            inner: Arc::new(Inner { writer: Mutex::new(writer), readers, next: AtomicUsize::new(0), vec_dim }),
         })
+    }
+
+    /// The configured embedding dimension for this store's vec_facts table.
+    pub fn vec_dimension(&self) -> usize {
+        self.inner.vec_dim
     }
 
     /// The writer connection — for every statement that mutates the database (including read-then-write
@@ -913,40 +945,122 @@ impl Store {
     // ---- memory (facts) ----
 
     /// Write a fact. With a `key`, this upserts within (author, room, key) — idempotent updates.
-    pub fn remember(&self, author: &str, fact: &Fact, ts: i64) -> Result<()> {
+    /// When `embedding` is provided, it is stored in the vec_facts table for semantic recall.
+    pub fn remember(
+        &self,
+        author: &str,
+        fact: &Fact,
+        ts: i64,
+        embedding: Option<&[f32]>,
+        embedding_model: Option<&str>,
+    ) -> Result<()> {
+        if let Some(emb) = embedding {
+            if emb.len() != self.inner.vec_dim {
+                bail!(
+                    "embedding dimension mismatch: got {}, expected {}",
+                    emb.len(),
+                    self.inner.vec_dim
+                );
+            }
+        }
         let conn = self.w();
-        match &fact.key {
+        let fact_id: i64 = match &fact.key {
             Some(k) => {
                 let updated = conn.execute(
-                    "UPDATE facts SET text = ?1, ts = ?2
+                    "UPDATE facts SET text = ?1, ts = ?2, embedding_model = ?6
                        WHERE author = ?3 AND IFNULL(room, '') = IFNULL(?4, '') AND fkey = ?5",
-                    params![fact.text, ts, author, fact.room, k],
+                    params![fact.text, ts, author, fact.room, k, embedding_model],
                 )?;
                 if updated == 0 {
                     conn.execute(
-                        "INSERT INTO facts (fkey, room, author, text, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![k, fact.room, author, fact.text, ts],
+                        "INSERT INTO facts (fkey, room, author, text, ts, embedding_model) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![k, fact.room, author, fact.text, ts, embedding_model],
                     )?;
+                    conn.last_insert_rowid()
+                } else {
+                    conn.query_row(
+                        "SELECT id FROM facts WHERE author = ?1 AND IFNULL(room, '') = IFNULL(?2, '') AND fkey = ?3",
+                        params![author, fact.room, k],
+                        |r| r.get(0),
+                    )?
                 }
             }
             None => {
                 conn.execute(
-                    "INSERT INTO facts (fkey, room, author, text, ts) VALUES (NULL, ?1, ?2, ?3, ?4)",
-                    params![fact.room, author, fact.text, ts],
+                    "INSERT INTO facts (fkey, room, author, text, ts, embedding_model) VALUES (NULL, ?1, ?2, ?3, ?4, ?5)",
+                    params![fact.room, author, fact.text, ts, embedding_model],
                 )?;
+                conn.last_insert_rowid()
             }
+        };
+
+        if let Some(emb) = embedding {
+            let emb_bytes = floats_to_bytes(emb);
+            conn.execute("DELETE FROM vec_facts WHERE fact_id = ?1", params![fact_id])?;
+            conn.execute(
+                "INSERT INTO vec_facts (fact_id, embedding) VALUES (?1, ?2)",
+                params![fact_id, emb_bytes],
+            )?;
         }
         Ok(())
     }
 
-    /// Full-text recall. Scoped to `room` when given, else the agent's reachable memory (its own
-    /// private facts plus every room it belongs to). Ordered by relevance (BM25; lower is better).
-    pub fn recall(&self, agent: &str, query: &str, room: Option<&str>, limit: Option<u32>) -> Result<Vec<RecallHit>> {
-        let match_q = build_fts_query(query);
-        if match_q.is_empty() {
-            return Ok(vec![]);
+    /// Recall from the memory store. Pure text runs FTS5/BM25; with an embedding, runs hybrid
+    /// BM25 + vector KNN fused via Reciprocal Rank Fusion. Either query text or embedding (or both)
+    /// must be provided.
+    pub fn recall(
+        &self,
+        agent: &str,
+        query: &str,
+        room: Option<&str>,
+        limit: Option<u32>,
+        embedding: Option<&[f32]>,
+    ) -> Result<Vec<RecallHit>> {
+        if let Some(emb) = embedding {
+            if emb.len() != self.inner.vec_dim {
+                bail!(
+                    "embedding dimension mismatch: got {}, expected {}",
+                    emb.len(),
+                    self.inner.vec_dim
+                );
+            }
         }
         let lim = limit.unwrap_or(8).min(50) as i64;
+        let match_q = build_fts_query(query);
+        let has_text = !match_q.is_empty();
+
+        let fts_hits = if has_text {
+            self.recall_fts(agent, &match_q, room, lim)?
+        } else {
+            vec![]
+        };
+
+        let vec_hits = if let Some(emb) = embedding {
+            self.recall_vec(agent, emb, room, lim)?
+        } else {
+            vec![]
+        };
+
+        if fts_hits.is_empty() && vec_hits.is_empty() {
+            return Ok(vec![]);
+        }
+        if vec_hits.is_empty() {
+            return Ok(fts_hits);
+        }
+        if fts_hits.is_empty() {
+            return Ok(vec_hits);
+        }
+
+        Ok(rrf_fuse(&fts_hits, &vec_hits, lim as usize))
+    }
+
+    fn recall_fts(
+        &self,
+        agent: &str,
+        match_q: &str,
+        room: Option<&str>,
+        lim: i64,
+    ) -> Result<Vec<RecallHit>> {
         let conn = self.r();
         let map = |r: &rusqlite::Row| {
             Ok(RecallHit {
@@ -989,6 +1103,71 @@ impl Store {
         Ok(hits)
     }
 
+    fn recall_vec(
+        &self,
+        agent: &str,
+        embedding: &[f32],
+        room: Option<&str>,
+        lim: i64,
+    ) -> Result<Vec<RecallHit>> {
+        let conn = self.r();
+        let emb_bytes = floats_to_bytes(embedding);
+        // Over-fetch from vec0 (no scope filter in the KNN query), then filter.
+        let fetch_k = (lim * 5).min(200);
+        let mut stmt = conn.prepare(
+            "SELECT vf.fact_id, vf.distance,
+                    f.text, f.fkey, f.room, f.author, f.ts
+               FROM vec_facts vf
+               JOIN facts f ON f.id = vf.fact_id
+              WHERE vf.embedding MATCH ?1 AND vf.k = ?2",
+        )?;
+        let candidates = {
+            let v = stmt
+                .query_map(params![emb_bytes, fetch_k], |r| {
+                    Ok((
+                        r.get::<_, f64>(1)?, // distance
+                        RecallHit {
+                            text: r.get(2)?,
+                            key: r.get(3)?,
+                            room: r.get(4)?,
+                            author: r.get(5)?,
+                            ts: r.get(6)?,
+                            score: r.get(1)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        };
+
+        // Filter by scope (same rules as FTS: room-scoped or agent's reachable memory).
+        let agent_rooms: Option<Vec<String>> = if room.is_none() {
+            let mut stmt2 = conn.prepare("SELECT room FROM members WHERE agent = ?1")?;
+            let v = stmt2
+                .query_map(params![agent], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Some(v)
+        } else {
+            None
+        };
+
+        let filtered: Vec<RecallHit> = candidates
+            .into_iter()
+            .filter_map(|(_dist, hit)| {
+                let in_scope = match room {
+                    Some(r) => hit.room.as_deref() == Some(r),
+                    None => match &hit.room {
+                        None => hit.author == agent,
+                        Some(r) => agent_rooms.as_ref().is_some_and(|rooms| rooms.contains(r)),
+                    },
+                };
+                if in_scope { Some(hit) } else { None }
+            })
+            .take(lim as usize)
+            .collect();
+        Ok(filtered)
+    }
+
     // ---- retention / janitor (bound the append-only growth of a long-lived public hub) ----
 
     /// Delete messages older than `retain_ms`, but always keep at least the newest `keep_per_room`
@@ -1014,7 +1193,8 @@ impl Store {
 
     /// Keep only the newest `keep` *unkeyed* facts per `(author, room-or-private)`. Keyed facts are
     /// already bounded (they upsert) and are never pruned here. The FTS index stays consistent via the
-    /// `facts_ad` delete trigger. Returns the number of rows removed.
+    /// `facts_ad` delete trigger; vec_facts orphans are cleaned up afterwards. Returns the number of
+    /// rows removed.
     pub fn prune_facts(&self, keep: i64) -> Result<usize> {
         let conn = self.w();
         let n = conn.execute(
@@ -1027,6 +1207,12 @@ impl Store {
                         ORDER BY id DESC LIMIT 1 OFFSET ?1), -1)",
             params![keep],
         )?;
+        if n > 0 {
+            conn.execute(
+                "DELETE FROM vec_facts WHERE fact_id NOT IN (SELECT id FROM facts)",
+                [],
+            )?;
+        }
         Ok(n)
     }
 
@@ -1134,6 +1320,58 @@ fn configure_conn(conn: &Connection) -> Result<()> {
          PRAGMA foreign_keys = ON;",
     )?;
     Ok(())
+}
+
+/// Create the vec0 virtual table for vector embeddings (idempotent).
+fn create_vec_table(conn: &Connection, dim: usize) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
+           fact_id INTEGER PRIMARY KEY,
+           embedding float[{dim}]
+         );"
+    ))?;
+    Ok(())
+}
+
+/// Encode a float slice as little-endian bytes for sqlite-vec.
+fn floats_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Reciprocal Rank Fusion: combine two ranked result lists into one.
+fn rrf_fuse(fts: &[RecallHit], vec: &[RecallHit], limit: usize) -> Vec<RecallHit> {
+    let mut scores: HashMap<String, (f64, RecallHit)> = HashMap::new();
+    for (rank, hit) in fts.iter().enumerate() {
+        let key = hit_key(hit);
+        let rrf = 1.0 / (RRF_K + rank as f64 + 1.0);
+        scores.entry(key).or_insert_with(|| (0.0, hit.clone())).0 += rrf;
+    }
+    for (rank, hit) in vec.iter().enumerate() {
+        let key = hit_key(hit);
+        let rrf = 1.0 / (RRF_K + rank as f64 + 1.0);
+        let entry = scores.entry(key).or_insert_with(|| (0.0, hit.clone()));
+        entry.0 += rrf;
+    }
+    let mut results: Vec<(f64, RecallHit)> = scores.into_values().collect();
+    results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    results
+        .into_iter()
+        .map(|(s, mut h)| {
+            h.score = s;
+            h
+        })
+        .collect()
+}
+
+fn hit_key(hit: &RecallHit) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        hit.author,
+        hit.ts,
+        hit.room.as_deref().unwrap_or(""),
+        &hit.text[..hit.text.len().min(128)]
+    )
 }
 
 /// Build a safe FTS5 query: keep alphanumeric terms only, prefix-match each, OR them together.
@@ -1317,7 +1555,7 @@ mod tests {
             s.add_member("team", "U_A", 1).unwrap();
             s.add_member("team", "U_B", 1).unwrap();
             s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 20).unwrap();
-            s.remember("U_A", &Fact { key: None, text: "deploy is blue-green".into(), room: Some("team".into()) }, 21).unwrap();
+            s.remember("U_A", &Fact { key: None, text: "deploy is blue-green".into(), room: Some("team".into()) }, 21, None, None).unwrap();
             s.register_card(&card("U_A", "alice", &["ops"], &["plan"]), Some("sig"), true, Visibility::Public, 12).unwrap();
             s.create_invite("CODE", "team", RoomKind::Channel, None, 1, 9_999_999_999_999, "U_A", false, 1).unwrap();
             s.mint_directory_token("TOK", "hub", 9_999_999_999_999, "U_A", 1).unwrap();
@@ -1329,7 +1567,7 @@ mod tests {
             assert_eq!(s.room_kind("team").unwrap(), Some(RoomKind::Channel));
             assert_eq!(s.roster("team", 20).unwrap().len(), 2);
             assert_eq!(s.rooms_of("U_A").unwrap().len(), 1);
-            assert_eq!(s.recall("U_A", "deploy", Some("team"), None).unwrap().len(), 1);
+            assert_eq!(s.recall("U_A", "deploy", Some("team"), None, None).unwrap().len(), 1);
             assert_eq!(s.discover(DiscoverScope::Public, "h", None, None, None, None, None, 20).unwrap().len(), 1);
             assert!(s.lookup_card("U_A", "h", false, 20).unwrap().is_some());
             assert_eq!(s.directory_counts().unwrap(), (1, 1));
@@ -1391,16 +1629,16 @@ mod tests {
     #[test]
     fn remember_recall_and_key_upsert() {
         let s = Store::open(None).unwrap();
-        s.remember("U_A", &Fact { key: None, text: "deploy plan is blue-green".into(), room: None }, 1).unwrap();
-        s.remember("U_A", &Fact { key: Some("db".into()), text: "uses postgres".into(), room: None }, 1).unwrap();
-        s.remember("U_A", &Fact { key: Some("db".into()), text: "uses postgres 16".into(), room: None }, 2).unwrap();
+        s.remember("U_A", &Fact { key: None, text: "deploy plan is blue-green".into(), room: None }, 1, None, None).unwrap();
+        s.remember("U_A", &Fact { key: Some("db".into()), text: "uses postgres".into(), room: None }, 1, None, None).unwrap();
+        s.remember("U_A", &Fact { key: Some("db".into()), text: "uses postgres 16".into(), room: None }, 2, None, None).unwrap();
 
-        let hits = s.recall("U_A", "deploy", None, None).unwrap();
+        let hits = s.recall("U_A", "deploy", None, None, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].text.contains("blue-green"));
 
         // The keyed fact upserted (still one row), with the new text.
-        let db = s.recall("U_A", "postgres", None, None).unwrap();
+        let db = s.recall("U_A", "postgres", None, None, None).unwrap();
         assert_eq!(db.len(), 1);
         assert!(db[0].text.contains("16"));
     }
@@ -1516,13 +1754,13 @@ mod tests {
     fn prune_facts_keeps_newest_unkeyed_and_keeps_keyed() {
         let s = Store::open(None).unwrap();
         for i in 0..4 {
-            s.remember("U_A", &Fact { key: None, text: format!("note {i}"), room: None }, 100 + i).unwrap();
+            s.remember("U_A", &Fact { key: None, text: format!("note {i}"), room: None }, 100 + i, None, None).unwrap();
         }
-        s.remember("U_A", &Fact { key: Some("k".into()), text: "kept".into(), room: None }, 200).unwrap();
+        s.remember("U_A", &Fact { key: Some("k".into()), text: "kept".into(), room: None }, 200, None, None).unwrap();
         // Keep the newest 1 unkeyed ⇒ remove 3; the keyed fact is untouched.
         assert_eq!(s.prune_facts(1).unwrap(), 3);
-        assert_eq!(s.recall("U_A", "note", None, None).unwrap().len(), 1);
-        assert_eq!(s.recall("U_A", "kept", None, None).unwrap().len(), 1);
+        assert_eq!(s.recall("U_A", "note", None, None, None).unwrap().len(), 1);
+        assert_eq!(s.recall("U_A", "kept", None, None, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -1646,5 +1884,136 @@ mod tests {
         assert!(s.validate_directory_token("TKN", 1_000).unwrap());
         assert!(!s.validate_directory_token("TKN", 1_001).unwrap()); // expired
         assert!(!s.validate_directory_token("NOPE", 1).unwrap()); // unknown
+    }
+
+    // ---- vector / semantic recall ----
+
+    fn make_embedding(dim: usize, seed: f32) -> Vec<f32> {
+        (0..dim).map(|i| (seed + i as f32 * 0.01).sin()).collect()
+    }
+
+    #[test]
+    fn vector_recall_returns_nearest_facts() {
+        let s = Store::open(None).unwrap();
+        let dim = s.vec_dimension();
+        let emb_a = make_embedding(dim, 1.0);
+        let emb_b = make_embedding(dim, 2.0);
+        let emb_c = make_embedding(dim, 1.01); // very close to emb_a
+
+        s.remember("U_A", &Fact { key: None, text: "alpha fact".into(), room: None }, 1, Some(&emb_a), Some("test-model")).unwrap();
+        s.remember("U_A", &Fact { key: None, text: "beta fact".into(), room: None }, 2, Some(&emb_b), None).unwrap();
+        s.remember("U_A", &Fact { key: None, text: "gamma fact".into(), room: None }, 3, Some(&emb_c), None).unwrap();
+
+        // Vector-only recall (empty text query) with a vector close to emb_a.
+        let query_emb = make_embedding(dim, 1.005);
+        let hits = s.recall("U_A", "", None, None, Some(&query_emb)).unwrap();
+        assert!(!hits.is_empty());
+        // The closest should be alpha or gamma (both near seed 1.0), not beta (seed 2.0).
+        assert!(hits[0].text.contains("alpha") || hits[0].text.contains("gamma"));
+    }
+
+    #[test]
+    fn hybrid_recall_fuses_fts_and_vector() {
+        let s = Store::open(None).unwrap();
+        let dim = s.vec_dimension();
+        let emb_a = make_embedding(dim, 1.0);
+        let emb_b = make_embedding(dim, 5.0);
+
+        // "deploy" is a keyword hit; emb_b is far from query vector.
+        s.remember("U_A", &Fact { key: None, text: "deploy strategy is blue-green".into(), room: None }, 1, Some(&emb_b), None).unwrap();
+        // "scaling plan" won't match "deploy" keyword; emb_a is close to query vector.
+        s.remember("U_A", &Fact { key: None, text: "scaling plan for the cluster".into(), room: None }, 2, Some(&emb_a), None).unwrap();
+
+        let query_emb = make_embedding(dim, 1.001);
+        let hits = s.recall("U_A", "deploy", None, None, Some(&query_emb)).unwrap();
+        // Both should appear: one from FTS (deploy), one from vector (scaling).
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn embedding_dimension_mismatch_errors() {
+        let s = Store::open(None).unwrap();
+        let wrong_dim = vec![0.1_f32; 100]; // not 768
+        let result = s.remember("U_A", &Fact { key: None, text: "x".into(), room: None }, 1, Some(&wrong_dim), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dimension mismatch"));
+
+        let result = s.recall("U_A", "x", None, None, Some(&wrong_dim));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn keyed_upsert_replaces_embedding() {
+        let s = Store::open(None).unwrap();
+        let dim = s.vec_dimension();
+        let emb_old = make_embedding(dim, 1.0);
+        let emb_new = make_embedding(dim, 5.0);
+
+        s.remember("U_A", &Fact { key: Some("k".into()), text: "v1".into(), room: None }, 1, Some(&emb_old), None).unwrap();
+        // Upsert with new embedding.
+        s.remember("U_A", &Fact { key: Some("k".into()), text: "v2".into(), room: None }, 2, Some(&emb_new), None).unwrap();
+
+        // Query with a vector close to the NEW embedding — should find the updated fact.
+        let q = make_embedding(dim, 5.001);
+        let hits = s.recall("U_A", "", None, None, Some(&q)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.contains("v2"));
+    }
+
+    #[test]
+    fn vector_recall_respects_room_scope() {
+        let s = Store::open(None).unwrap();
+        let dim = s.vec_dimension();
+        let emb = make_embedding(dim, 1.0);
+
+        s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
+        s.add_member("team", "U_A", 1).unwrap();
+        s.ensure_room("secret", RoomKind::Channel, None, 1).unwrap();
+
+        // Fact in "team" (U_A is a member).
+        s.remember("U_A", &Fact { key: None, text: "visible".into(), room: Some("team".into()) }, 1, Some(&emb), None).unwrap();
+        // Fact in "secret" (U_A is NOT a member).
+        s.remember("U_B", &Fact { key: None, text: "hidden".into(), room: Some("secret".into()) }, 2, Some(&emb), None).unwrap();
+
+        let q = make_embedding(dim, 1.001);
+        // Unscoped recall for U_A should only see "team" facts + private facts.
+        let hits = s.recall("U_A", "", None, None, Some(&q)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.contains("visible"));
+
+        // Room-scoped recall in "team".
+        let hits = s.recall("U_A", "", Some("team"), None, Some(&q)).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn prune_facts_also_cleans_vec_facts() {
+        let s = Store::open(None).unwrap();
+        let dim = s.vec_dimension();
+        let emb = make_embedding(dim, 1.0);
+
+        for i in 0..4 {
+            s.remember("U_A", &Fact { key: None, text: format!("note {i}"), room: None }, 100 + i, Some(&emb), None).unwrap();
+        }
+        // Keep the newest 1 unkeyed ⇒ remove 3 (and their vec entries).
+        assert_eq!(s.prune_facts(1).unwrap(), 3);
+
+        let q = make_embedding(dim, 1.001);
+        let hits = s.recall("U_A", "", None, None, Some(&q)).unwrap();
+        assert_eq!(hits.len(), 1, "vec_facts should be pruned in sync with facts");
+    }
+
+    #[test]
+    fn recall_without_embedding_is_pure_bm25() {
+        let s = Store::open(None).unwrap();
+        let dim = s.vec_dimension();
+        let emb = make_embedding(dim, 1.0);
+        s.remember("U_A", &Fact { key: None, text: "deploy strategy".into(), room: None }, 1, Some(&emb), None).unwrap();
+
+        // No embedding in recall → pure FTS, same behavior as before.
+        let hits = s.recall("U_A", "deploy", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.contains("deploy"));
     }
 }
