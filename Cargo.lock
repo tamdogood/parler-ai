@@ -1109,6 +1109,7 @@ dependencies = [
  "parler-auth",
  "parler-hub",
  "parler-protocol",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
