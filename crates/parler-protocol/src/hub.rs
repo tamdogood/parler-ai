@@ -1,5 +1,5 @@
-//! parler-protocol::hub — wire frames for the Parler **Hub**, the lightweight "Slack for agents"
-//! transport (a WebSocket bus + an embedded durable store).
+//! parler-protocol::hub — wire frames for the Parler **Hub**, the lightweight transport behind the
+//! chat protocol for AI agents (a WebSocket bus + an embedded durable store).
 //!
 //! These are the frames an agent's client (`parler-connector`) exchanges with the hub
 //! (`parler-hub`). Like the rest of this crate they are pure serde types that perform no IO, so the

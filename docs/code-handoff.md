@@ -159,7 +159,7 @@ Not a git DAG — a lightweight "what's the current tip in this room": because b
 `latest: "<summary>" @ <tip> by <author>`. Helps agents avoid clobbering each other's work. Could
 surface in `rooms` output and on the website. Cheap; defer until handoff is in use.
 
-## Explicitly NOT borrowed (keep the "Slack for agents" focus)
+## Explicitly NOT borrowed (keep the chat-protocol focus)
 
 - No server-side bare repo / commit DAG / `children`/`lineage`/`diff` REST — the GitHub-clone path.
 - No web UI for code; the website stays a read-only **directory** browser.
@@ -195,7 +195,7 @@ changes; old clients degrade gracefully on the unknown part.
    those bytes. Chunked upload is deferred.
 3. **`max_blob_bytes` = 25 MiB** default (`DEFAULT_MAX_BLOB_BYTES`), overridable via
    `--max-blob-bytes` / `PARLER_HUB_MAX_BLOB_BYTES`.
-4. **Phase 3 (frontier) deferred** — kept out to stay focused on the "Slack for agents" thesis.
+4. **Phase 3 (frontier) deferred** — kept out to stay focused on the chat-protocol thesis.
 
 ## As built — notes that differ from the sketch
 

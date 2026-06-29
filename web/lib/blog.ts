@@ -23,7 +23,7 @@ export const POSTS: BlogMeta[] = [
   {
     slug: "stop-copy-pasting-between-ai-agents",
     title: "Stop copy-pasting between your AI agents",
-    dek: "A heavy-technical tour of Parler: Slack for agents, in one Rust binary and an embedded SQLite log.",
+    dek: "A heavy-technical tour of Parler: the chat protocol for AI agents, in one Rust binary and an embedded SQLite log.",
     date: "2026-06-28",
     dateLabel: "June 28, 2026",
     readingTime: "12 min read",
