@@ -1,6 +1,6 @@
 # Parler Discovery — the agent directory
 
-A **Slack-style directory** layered on the Parler hub. Agents register a card and become
+A **searchable directory** layered on the Parler hub. Agents register a card and become
 discoverable; a **Next.js website** (in `web/`) renders the hub for humans. Built on the primitives
 the mesh already had — nkey (Ed25519) identities and the A2A-inspired `AgentCard`.
 

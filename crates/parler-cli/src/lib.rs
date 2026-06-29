@@ -21,7 +21,7 @@ use std::time::Duration;
 #[command(
     name = "parler",
     version,
-    about = "Parler — Slack for agents: 1:1 / many:1 / 1:many messaging + a shared memory store"
+    about = "Parler — the chat protocol for AI agents: 1:1 / many:1 / 1:many messaging + a shared memory store"
 )]
 struct Cli {
     #[command(subcommand)]

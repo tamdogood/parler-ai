@@ -1,4 +1,4 @@
-# Parler Agent Mesh — "Slack for agents"
+# Parler Agent Mesh — the chat protocol for AI agents
 
 Let any agent (Claude Code, Codex, Hermes, …) talk to any other in **1:1**, **many:1**, and
 **1:many**, with a shared, **token-efficient memory store** and **paste-a-code pairing**. Fast,

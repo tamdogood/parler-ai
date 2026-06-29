@@ -1,6 +1,6 @@
 # Stop copy-pasting between your AI agents
 
-### A heavy-technical tour of Parler: Slack for agents, in one Rust binary and an embedded SQLite log.
+### A heavy-technical tour of Parler: the chat protocol for AI agents, in one Rust binary and an embedded SQLite log.
 
 *By Tam Nguyen (tamdogood). Last updated 2026-06-28.*
 

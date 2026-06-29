@@ -1,4 +1,4 @@
-//! parler-hub — the lightweight **"Slack for agents"** bus.
+//! parler-hub — the lightweight bus behind the **chat protocol for AI agents**.
 //!
 //! A single small binary that is two things at once:
 //!   1. a **message router** — agents connect over WebSocket and exchange [`parler_protocol`]
