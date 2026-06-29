@@ -59,6 +59,7 @@ export interface SessionAgent {
 export interface SessionPart {
   kind: string;
   text?: string;
+  fields?: Record<string, any>;
 }
 
 /** A message in a watched session. Carries display name/role only — never an agent id. */

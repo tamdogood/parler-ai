@@ -90,6 +90,15 @@ enum Cmd {
     Whoami,
     /// Run the MCP server (stdio) exposing the parler_* tools to an MCP host.
     Mcp,
+    /// Check configuration, database, connections, and dependencies.
+    Doctor,
+    /// Handle a Claude Code / editor lifecycle hook.
+    Hook {
+        /// The hook type (session-start, pre-tool-use, post-tool-use, post-tool-use-failure, session-end).
+        kind: String,
+    },
+    /// Consolidate the active session backlog into key semantic facts.
+    Consolidate,
 }
 
 #[derive(Args)]
@@ -274,7 +283,7 @@ struct ApplyArgs {
 #[derive(Args)]
 struct RecvArgs {
     #[arg(long)]
-    room: String,
+    room: Option<String>,
     /// Pull messages with seq greater than this (does not advance your cursor).
     #[arg(long)]
     since: Option<i64>,
@@ -382,11 +391,34 @@ pub async fn run() -> Result<()> {
         Cmd::Presence { status, activity } => cmd_presence(status, activity).await,
         Cmd::Whoami => cmd_whoami(),
         Cmd::Mcp => mcp::serve_stdio().await,
+        Cmd::Doctor => cmd_doctor().await,
+        Cmd::Hook { kind } => cmd_hook(kind).await,
+        Cmd::Consolidate => cmd_consolidate().await,
     }
 }
 
 async fn connect() -> Result<MeshAgent> {
-    let cfg = Config::load()?;
+    let mut cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            let fallback_path = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| parler_connector::home_dir())
+                .join(".parler-codex")
+                .join("config.json");
+            if fallback_path.exists() {
+                std::env::set_var("PARLER_HOME", fallback_path.parent().unwrap());
+                Config::load().map_err(|_| e)?
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    if let Ok(hub) = std::env::var("PARLER_HUB") {
+        if !hub.is_empty() {
+            cfg.hub_url = hub;
+        }
+    }
     MeshAgent::connect(&cfg).await
 }
 
@@ -495,6 +527,7 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
                 let seed = format!("📋 session context (from {}):\n{ctx}", ag.name);
                 ag.send_text(Target::Room { room: inv.room.clone() }, &seed).await?;
             }
+            save_active_session(&inv.room)?;
             println!("✓ session open — room '{}'", inv.room);
             println!();
             println!("    KEY:  {}", inv.code);
@@ -524,6 +557,7 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
             };
             // since=None advances the fresh cursor to the live edge after backfilling the context.
             let (msgs, _cursor) = ag.pull(&room, None, None).await?;
+            save_active_session(&room)?;
             println!("✓ joined session — room '{room}'");
             if msgs.is_empty() {
                 println!("(no prior context yet)");
@@ -629,7 +663,13 @@ fn target_from(room: Option<String>, to: Option<String>, service: Option<String>
         (Some(r), None, None) => Ok(Target::Room { room: r }),
         (None, Some(t), None) => Ok(Target::Dm { agent: t }),
         (None, None, Some(s)) => Ok(Target::Service { service: s }),
-        (None, None, None) => bail!("specify a destination: --room, --to, or --service"),
+        (None, None, None) => {
+            if let Some(active_room) = load_active_session() {
+                Ok(Target::Room { room: active_room })
+            } else {
+                bail!("specify a destination: --room, --to, or --service (or open/join a session first)")
+            }
+        }
         _ => bail!("specify exactly one of --room, --to, --service"),
     }
 }
@@ -708,13 +748,16 @@ async fn cmd_apply(a: ApplyArgs) -> Result<()> {
 }
 
 async fn cmd_recv(a: RecvArgs) -> Result<()> {
+    let room = a.room
+        .or_else(load_active_session)
+        .ok_or_else(|| anyhow::anyhow!("specify --room, or open/join a session first"))?;
     let since = if a.all { Some(0) } else { a.since };
     let mut ag = connect().await?;
 
     // First, the backlog past the cursor (or `since`).
-    let (msgs, cursor) = ag.pull(&a.room, since, a.limit).await?;
+    let (msgs, cursor) = ag.pull(&room, since, a.limit).await?;
     if msgs.is_empty() {
-        println!("(no new messages in '{}')", a.room);
+        println!("(no new messages in '{}')", room);
     } else {
         for m in &msgs {
             println!("{}", render_message(m));
@@ -732,7 +775,7 @@ async fn cmd_recv(a: RecvArgs) -> Result<()> {
     let pushing = ag.subscribe().await.unwrap_or(false);
     eprintln!(
         "👁  watching '{}' — {} (Ctrl-C to stop)",
-        a.room,
+        room,
         if pushing { "live push" } else { "polling every 2s" }
     );
     loop {
@@ -742,7 +785,7 @@ async fn cmd_recv(a: RecvArgs) -> Result<()> {
         } else {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let (new, cur) = ag.pull(&a.room, None, a.limit).await?;
+        let (new, cur) = ag.pull(&room, None, a.limit).await?;
         if !new.is_empty() {
             for m in &new {
                 println!("{}", render_message(m));
@@ -955,4 +998,361 @@ pub fn render_message(m: &StoredMessage) -> String {
         .map(|r| format!("{} ({r})", m.from.name))
         .unwrap_or_else(|| m.from.name.clone());
     format!("[{}] {}: {}", m.seq, who, render_parts(&m.parts))
+}
+
+pub fn save_active_session(room: &str) -> Result<()> {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| parler_connector::home_dir());
+    let path = home.join(".parler").join("active_session");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, room)?;
+    Ok(())
+}
+
+pub fn load_active_session() -> Option<String> {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| parler_connector::home_dir());
+    let path = home.join(".parler").join("active_session");
+    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+}
+
+pub fn clear_active_session() -> Result<()> {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| parler_connector::home_dir());
+    let path = home.join(".parler").join("active_session");
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+async fn cmd_doctor() -> Result<()> {
+    println!("🩺 Running Parler System Diagnostics...");
+    let mut clean = true;
+
+    // 1. Config & Keypair Check
+    print!("  • Checking local configuration... ");
+    let home = parler_connector::home_dir();
+    let cfg_path = home.join("config.json");
+    if !Config::exists() {
+        println!("❌ CONFIG NOT FOUND");
+        println!("     No Parler identity exists at {}.", cfg_path.display());
+        println!("     Run `parler init` or start MCP server to bootstrap.");
+        clean = false;
+    } else {
+        match Config::load() {
+            Ok(cfg) => {
+                println!("✅ LOADED");
+                println!("     Hub URL:      {}", cfg.hub_url);
+                println!("     Agent Name:   {}", cfg.name);
+                println!("     Agent Role:   {}", cfg.role.as_deref().unwrap_or("none"));
+                println!("     Agent ID:     {}", cfg.identity.id);
+                
+                print!("  • Verifying Ed25519 identity keypair... ");
+                let keypair_ok = (|| -> Result<()> {
+                    let kp = nkeys::KeyPair::from_seed(&cfg.identity.seed)?;
+                    if kp.public_key() != cfg.identity.id {
+                        bail!("identity mismatch: seed public key != config id");
+                    }
+                    let test_sig = kp.sign(b"parler_doctor_probe")?;
+                    if !parler_auth::verify(&cfg.identity.id, b"parler_doctor_probe", &data_encoding::BASE64.encode(&test_sig)) {
+                        bail!("keypair verification failed");
+                    }
+                    Ok(())
+                })();
+                match keypair_ok {
+                    Ok(_) => println!("✅ INTEGRITY OK"),
+                    Err(e) => {
+                        println!("❌ CORRUPTED ({e})");
+                        clean = false;
+                    }
+                }
+
+                // 2. Hub connectivity
+                print!("  • Testing connectivity to hub... ");
+                match MeshAgent::connect(&cfg).await {
+                    Ok(_) => println!("✅ CONNECTED & AUTHENTICATED"),
+                    Err(e) => {
+                        println!("❌ FAILED");
+                        println!("     Could not connect to {}: {}", cfg.hub_url, e);
+                        clean = false;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("❌ PARSE ERROR ({e})");
+                clean = false;
+            }
+        }
+    }
+
+    // 3. Database & sqlite-vec status (local in-memory test for client)
+    print!("  • Checking sqlite-vec extension... ");
+    match parler_hub::Store::open(None) {
+        Ok(_) => println!("✅ AVAILABLE"),
+        Err(e) => {
+            println!("❌ UNAVAILABLE ({e})");
+            clean = false;
+        }
+    }
+
+    // 4. Git binary
+    print!("  • Checking git workspace... ");
+    match git_in(None, &["--version"]) {
+        Ok(v) => {
+            println!("✅ AVAILABLE ({})", v.trim());
+            match git_in(None, &["rev-parse", "--show-toplevel"]) {
+                Ok(path) => println!("     Git Repo Root: {}", path),
+                Err(_) => println!("     ⚠️ Current directory is not inside a git repository."),
+            }
+        }
+        Err(e) => {
+            println!("❌ NOT FOUND ({e})");
+            clean = false;
+        }
+    }
+
+    println!();
+    if clean {
+        println!("✨ All diagnostics passed! Your Parler mesh agent is healthy.");
+    } else {
+        println!("⚠️ Diagnostics failed. Review the errors above to fix your installation.");
+    }
+
+    Ok(())
+}
+
+async fn cmd_hook(kind: String) -> Result<()> {
+    // 1. Check if there is an active session
+    let Some(room) = load_active_session() else {
+        // Exit silently if no active session
+        return Ok(());
+    };
+
+    // 2. Read stdin for JSON payload from Claude Code
+    let mut stdin_buffer = String::new();
+    let mut stdin = tokio::io::stdin();
+    use tokio::io::AsyncReadExt;
+    let _ = stdin.read_to_string(&mut stdin_buffer).await;
+    
+    let data: serde_json::Value = serde_json::from_str(&stdin_buffer).unwrap_or(serde_json::Value::Null);
+
+    let mut ag = connect().await?;
+
+    let parts = match kind.as_str() {
+        "session-start" | "SessionStart" => {
+            let cwd = data.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+            vec![Part::Text(format!("🚀 Session started by agent {} in directory {cwd}", ag.name))]
+        }
+        "session-end" | "SessionEnd" => {
+            vec![Part::Text("👋 Session ended.".to_string())]
+        }
+        "user-prompt-submit" | "UserPromptSubmit" | "prompt-submit" | "PromptSubmit" => {
+            let mut prompt = data.get("prompt")
+                .or_else(|| data.get("text"))
+                .or_else(|| data.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if prompt.is_empty() {
+                return Ok(());
+            }
+            if prompt.len() > 1000 {
+                prompt = format!("{}\n[...truncated]", &prompt[..1000]);
+            }
+            vec![Part::Text(format!("💬 Prompt: {prompt}"))]
+        }
+        "post-tool-use" | "PostToolUse" | "post-tool-use-failure" | "PostToolUseFailure" => {
+            let tool_name = data.get("tool_name").or_else(|| data.get("toolName")).and_then(|v| v.as_str()).unwrap_or("unknown");
+            let tool_input = data.get("tool_input").or_else(|| data.get("toolArgs")).cloned().unwrap_or(serde_json::json!({}));
+            
+            // Extract output and truncate if too long
+            let tool_result = data.get("tool_response")
+                .or_else(|| data.get("tool_output"))
+                .or_else(|| data.get("toolResult"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+                
+            let mut output_str = if tool_result.is_string() {
+                tool_result.as_str().unwrap().to_string()
+            } else if tool_result.is_object() {
+                tool_result.get("text_result_for_llm")
+                    .or_else(|| tool_result.get("textResultForLlm"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| tool_result.to_string())
+            } else {
+                tool_result.to_string()
+            };
+            
+            if output_str.len() > 2000 {
+                output_str = format!("{}\n[...truncated]", &output_str[..2000]);
+            }
+            
+            let status = if kind.contains("failure") { "failure" } else { "success" };
+            
+            let mut fields = serde_json::Map::new();
+            fields.insert("type".to_string(), serde_json::json!("tool"));
+            fields.insert("tool_name".to_string(), serde_json::json!(tool_name));
+            fields.insert("tool_input".to_string(), tool_input);
+            fields.insert("tool_output".to_string(), serde_json::json!(output_str));
+            fields.insert("status".to_string(), serde_json::json!(status));
+            
+            vec![Part::Extension {
+                kind: "com.parler.observation".to_string(),
+                fields,
+            }]
+        }
+        _ => return Ok(()),
+    };
+
+    if !parts.is_empty() {
+        let _ = ag.send(Target::Room { room }, parts, None, None).await;
+    }
+
+    Ok(())
+}
+
+async fn cmd_consolidate() -> Result<()> {
+    let Some(room) = load_active_session() else {
+        bail!("No active session found. Open or join a session first.");
+    };
+
+    println!("🧠 Consolidating active session backlog for room '{room}'...");
+    let mut ag = connect().await?;
+
+    // 1. Pull the backlog
+    let (msgs, _) = ag.pull(&room, Some(0), None).await?;
+    if msgs.is_empty() {
+        println!("(No messages in backlog to consolidate)");
+        return Ok(());
+    }
+    let backlog = msgs.iter().map(render_message).collect::<Vec<_>>().join("\n");
+
+    // 2. Determine LLM provider & API key
+    let gemini_key = std::env::var("GEMINI_API_KEY").ok();
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let openai_key = std::env::var("OPENAI_API_KEY").ok();
+
+    let prompt = format!(
+        "Analyze the following conversation backlog from a collaborative session. \
+         Extract 1 to 5 key decisions, architectural choices, modified file paths, or lessons learned. \
+         Format the output strictly as a JSON array of strings, where each string is a concise fact. \
+         Only return the JSON array, no markdown wrappers (like ```json), no extra explanation.\n\n\
+         Backlog:\n{}",
+        backlog
+    );
+
+    let mut facts: Vec<String> = Vec::new();
+
+    if let Some(key) = gemini_key {
+        println!("  • Requesting consolidation from Gemini...");
+        let payload = serde_json::json!({
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }]
+        });
+        let payload_str = serde_json::to_string(&payload)?;
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
+            key
+        );
+        let output = run_curl_post(&url, &payload_str)?;
+        if let Ok(res_val) = serde_json::from_str::<serde_json::Value>(&output) {
+            if let Some(text) = res_val.pointer("/candidates/0/content/parts/0/text").and_then(|v| v.as_str()) {
+                let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+                if let Ok(parsed_facts) = serde_json::from_str::<Vec<String>>(cleaned) {
+                    facts = parsed_facts;
+                }
+            }
+        }
+    } else if let Some(key) = anthropic_key {
+        println!("  • Requesting consolidation from Anthropic...");
+        let payload = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        let payload_str = serde_json::to_string(&payload)?;
+        let output = run_curl_post_headers(
+            "https://api.anthropic.com/v1/messages",
+            &payload_str,
+            &[
+                ("x-api-key", &key),
+                ("anthropic-version", "2023-06-01"),
+                ("content-type", "application/json"),
+            ],
+        )?;
+        if let Ok(res_val) = serde_json::from_str::<serde_json::Value>(&output) {
+            if let Some(text) = res_val.pointer("/content/0/text").and_then(|v| v.as_str()) {
+                let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+                if let Ok(parsed_facts) = serde_json::from_str::<Vec<String>>(cleaned) {
+                    facts = parsed_facts;
+                }
+            }
+        }
+    } else if let Some(key) = openai_key {
+        println!("  • Requesting consolidation from OpenAI...");
+        let payload = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        let payload_str = serde_json::to_string(&payload)?;
+        let output = run_curl_post_headers(
+            "https://api.openai.com/v1/chat/completions",
+            &payload_str,
+            &[
+                ("authorization", &format!("Bearer {key}")),
+                ("content-type", "application/json"),
+            ],
+        )?;
+        if let Ok(res_val) = serde_json::from_str::<serde_json::Value>(&output) {
+            if let Some(text) = res_val.pointer("/choices/0/message/content").and_then(|v| v.as_str()) {
+                let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+                if let Ok(parsed_facts) = serde_json::from_str::<Vec<String>>(cleaned) {
+                    facts = parsed_facts;
+                }
+            }
+        }
+    } else {
+        println!("⚠️ No LLM API key (GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY) found.");
+        println!("  Consolidation is agent-driven inside the MCP server via the 'parler_consolidate_session' prompt.");
+        return Ok(());
+    }
+
+    if facts.is_empty() {
+        println!("❌ Failed to distill facts from LLM response.");
+        return Ok(());
+    }
+
+    println!("✓ Distilled {} facts from session history:", facts.len());
+    for f in &facts {
+        println!("  • {f}");
+        ag.remember(f, None, Some(room.clone()), None, None).await?;
+    }
+    println!("✓ Saved as room-scoped facts.");
+
+    Ok(())
+}
+
+fn run_curl_post(url: &str, json_payload: &str) -> Result<String> {
+    run_curl_post_headers(url, json_payload, &[("content-type", "application/json")])
+}
+
+fn run_curl_post_headers(url: &str, json_payload: &str, headers: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.arg("-s").arg("-X").arg("POST").arg(url);
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    cmd.arg("-d").arg(json_payload);
+    let out = cmd.output().map_err(|e| anyhow::anyhow!("running curl: {e}"))?;
+    if !out.status.success() {
+        bail!("curl request failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }

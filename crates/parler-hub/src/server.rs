@@ -737,7 +737,13 @@ fn viewer_message(m: &StoredMessage) -> serde_json::Value {
         .map(|p| match p {
             Part::Text(t) => serde_json::json!({ "kind": "text", "text": t }),
             Part::Data(_) => serde_json::json!({ "kind": "data" }),
-            Part::Extension { kind, .. } => serde_json::json!({ "kind": kind }),
+            Part::Extension { kind, fields } => {
+                if kind == "com.parler.observation" {
+                    serde_json::json!({ "kind": kind, "fields": fields })
+                } else {
+                    serde_json::json!({ "kind": kind })
+                }
+            }
         })
         .collect();
     serde_json::json!({

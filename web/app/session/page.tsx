@@ -11,6 +11,13 @@ import {
   ServerCrash,
   ShieldCheck,
   Users,
+  Play,
+  Pause,
+  RotateCcw,
+  ChevronRight,
+  ChevronLeft,
+  AlertCircle,
+  Terminal,
 } from "lucide-react";
 import type { SessionAgent, SessionMessage, SessionPart, SessionView } from "@/lib/types";
 import { fetchSession, HUB_API, HubError } from "@/lib/api";
@@ -43,11 +50,15 @@ function SessionViewer() {
   const [unauthorized, setUnauthorized] = useState(false);
   const cursor = useRef(0);
 
-  // A deliberately-crafted /session#k=<token> link prefills the box (the hash never reaches a server).
+  // A deliberately-crafted /session#k=<token> link prefills the box and automatically connects.
   useEffect(() => {
     const h = typeof window !== "undefined" ? window.location.hash : "";
     const m = h.match(/[#&]k=([^&]+)/);
-    if (m) setDraft(decodeURIComponent(m[1]));
+    if (m) {
+      const decoded = decodeURIComponent(m[1]);
+      setDraft(decoded);
+      setToken(decoded);
+    }
   }, []);
 
   const reset = useCallback(() => {
@@ -57,6 +68,9 @@ function SessionViewer() {
     setError(null);
     setUnauthorized(false);
     cursor.current = 0;
+    if (typeof window !== "undefined") {
+      window.location.hash = "";
+    }
   }, []);
 
   const load = useCallback(async () => {
@@ -96,6 +110,9 @@ function SessionViewer() {
     setUnauthorized(false);
     setError(null);
     setToken(t);
+    if (typeof window !== "undefined") {
+      window.location.hash = `k=${encodeURIComponent(t)}`;
+    }
   };
 
   const connected = !!view && !unauthorized;
@@ -178,9 +195,70 @@ function ConnectedView({
   onDisconnect: () => void;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
+  const listContainerRef = useRef<HTMLDivElement>(null);
+  
+  // Replay timeline states
+  const [viewMode, setViewMode] = useState<"chat" | "timeline">("chat");
+  const [replayIndex, setReplayIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+
+  // Deduplicate adjacent duplicate boundary messages (🚀 Session started / 👋 Session ended)
+  const list = useMemo(() => {
+    const result: SessionMessage[] = [];
+    let lastText = "";
+    for (const m of messages) {
+      const text = m.parts.map((p) => p.text || "").join(" ");
+      const isBoundary = text.startsWith("🚀 Session started") || text === "👋 Session ended.";
+      if (isBoundary && text === lastText) {
+        continue;
+      }
+      result.push(m);
+      if (isBoundary) {
+        lastText = text;
+      } else {
+        lastText = ""; // Reset boundary tracking on normal messages
+      }
+    }
+    return result;
+  }, [messages]);
+
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length]);
+    if (viewMode === "chat") {
+      endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [list.length, viewMode]);
+
+  // Replay timer
+  useEffect(() => {
+    if (!isPlaying || viewMode !== "timeline" || list.length === 0) return;
+    const interval = setInterval(() => {
+      setReplayIndex((prev) => {
+        if (prev >= list.length - 1) {
+          setIsPlaying(false);
+          return prev;
+        }
+        return prev + 1;
+      });
+    }, 1500 / speed);
+    return () => clearInterval(interval);
+  }, [isPlaying, speed, viewMode, list.length]);
+
+  // Auto-scroll the active step item in the left list container during replay
+  useEffect(() => {
+    if (viewMode !== "timeline") return;
+    const container = listContainerRef.current;
+    if (!container) return;
+    const activeItem = container.querySelector(`[data-index="${replayIndex}"]`);
+    if (activeItem) {
+      activeItem.scrollIntoView({
+        behavior: "smooth",
+        block: "nearest",
+      });
+    }
+  }, [replayIndex, viewMode]);
+
+  const activeMessage = list[replayIndex] || null;
 
   return (
     <div className="mt-8">
@@ -216,7 +294,34 @@ function ConnectedView({
         </div>
       )}
 
-      {/* Conversation. */}
+      {/* Mode Switcher */}
+      <div className="flex border-x border-graphite-rail bg-black/10 px-5 py-2 border-b border-graphite-rail">
+        <button
+          onClick={() => setViewMode("chat")}
+          className={cn(
+            "px-4 py-1.5 text-[13px] font-medium transition-colors border-b-2 -mb-[9px] focus:outline-none",
+            viewMode === "chat" ? "text-electric-blue border-electric-blue" : "text-steel border-transparent hover:text-frost"
+          )}
+        >
+          💬 Chat View
+        </button>
+        <button
+          onClick={() => {
+            setViewMode("timeline");
+            if (list.length > 0) {
+              setReplayIndex(list.length - 1);
+            }
+          }}
+          className={cn(
+            "px-4 py-1.5 text-[13px] font-medium transition-colors border-b-2 -mb-[9px] ml-2 focus:outline-none",
+            viewMode === "timeline" ? "text-electric-blue border-electric-blue" : "text-steel border-transparent hover:text-frost"
+          )}
+        >
+          ⏱️ Timeline Replay
+        </button>
+      </div>
+
+      {/* Conversation / Replay Panel. */}
       <div className="rounded-b-[16px] border border-t-0 border-graphite-rail bg-void-black px-5 py-5">
         {error && (
           <p className="mb-4 flex items-center gap-2 text-[12px] text-complained-yellow">
@@ -224,15 +329,197 @@ function ConnectedView({
             Lost contact with the hub — retrying. ({error})
           </p>
         )}
-        {messages.length === 0 ? (
-          <p className="py-10 text-center text-[14px] text-steel">No messages in this session yet.</p>
+
+        {viewMode === "chat" ? (
+          list.length === 0 ? (
+            <p className="py-10 text-center text-[14px] text-steel">No messages in this session yet.</p>
+          ) : (
+            <div className="flex flex-col gap-5">
+              {list.map((m) => (
+                <MessageRow key={m.seq} message={m} />
+              ))}
+              <div ref={endRef} />
+            </div>
+          )
         ) : (
-          <div className="flex flex-col gap-5">
-            {messages.map((m) => (
-              <MessageRow key={m.seq} message={m} />
-            ))}
-            <div ref={endRef} />
-          </div>
+          /* Timeline Replay View */
+          list.length === 0 ? (
+            <p className="py-10 text-center text-[14px] text-steel">No messages to replay.</p>
+          ) : (
+            <div className="flex flex-col gap-4">
+              {/* Controls bar */}
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-[12px] border border-graphite-rail/60 bg-black/30 p-3">
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    disabled={replayIndex === 0}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setReplayIndex(0);
+                    }}
+                  >
+                    <RotateCcw className="size-3.5" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    disabled={replayIndex === 0}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setReplayIndex((prev) => Math.max(0, prev - 1));
+                    }}
+                  >
+                    <ChevronLeft className="size-4" />
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    className="h-8 px-3"
+                    onClick={() => setIsPlaying(!isPlaying)}
+                  >
+                    {isPlaying ? <Pause className="size-3.5 mr-1" /> : <Play className="size-3.5 mr-1" />}
+                    {isPlaying ? "Pause" : "Play"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    disabled={replayIndex >= list.length - 1}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setReplayIndex((prev) => Math.min(list.length - 1, prev + 1));
+                    }}
+                  >
+                    <ChevronRight className="size-4" />
+                  </Button>
+                </div>
+
+                {/* Scrubber slider */}
+                <div className="flex flex-1 items-center gap-3 px-2 min-w-[150px]">
+                  <span className="font-mono text-[11px] text-steel">
+                    Step {replayIndex + 1}/{list.length}
+                  </span>
+                  <input
+                    type="range"
+                    min="0"
+                    max={list.length - 1}
+                    value={replayIndex}
+                    onChange={(e) => {
+                      setIsPlaying(false);
+                      setReplayIndex(parseInt(e.target.value, 10));
+                    }}
+                    className="h-1 flex-1 cursor-pointer appearance-none rounded-lg bg-graphite-rail accent-electric-blue"
+                  />
+                </div>
+
+                {/* Speed buttons */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-steel">Speed:</span>
+                  {[1, 2, 5].map((sp) => (
+                    <button
+                      key={sp}
+                      onClick={() => setSpeed(sp)}
+                      className={cn(
+                        "rounded-[6px] border px-2 py-0.5 font-mono text-[11px] font-medium transition-colors",
+                        speed === sp
+                          ? "border-electric-blue/40 bg-electric-blue/10 text-frost"
+                          : "border-graphite-rail bg-transparent text-steel hover:text-frost"
+                      )}
+                    >
+                      {sp}x
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Grid content */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-2">
+                {/* Left pane: steps list */}
+                <div ref={listContainerRef} className="max-h-[500px] overflow-y-auto rounded-[12px] border border-graphite-rail bg-black/20 p-2 flex flex-col gap-1">
+                  {list.map((m, idx) => {
+                    const isObs = m.parts.some((p) => p.kind === "com.parler.observation");
+                    const toolPart = m.parts.find((p) => p.kind === "com.parler.observation");
+                    const toolName = toolPart?.fields?.tool_name;
+                    const status = toolPart?.fields?.status;
+                    const isFailed = status === "failure";
+
+                    return (
+                      <button
+                        key={m.seq}
+                        data-index={idx}
+                        onClick={() => {
+                          setIsPlaying(false);
+                          setReplayIndex(idx);
+                        }}
+                        className={cn(
+                          "w-full rounded-[8px] p-2 text-left transition-colors flex items-start gap-2 focus:outline-none border border-transparent",
+                          idx === replayIndex
+                            ? "bg-electric-blue/10 border-electric-blue/30 text-frost"
+                            : "text-steel hover:bg-white/5 hover:text-frost"
+                        )}
+                      >
+                        <span className="font-mono text-[10px] bg-graphite-rail/60 rounded px-1 text-steel shrink-0 mt-0.5">
+                          {idx + 1}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-1">
+                            <span className="font-medium text-[12px] truncate text-frost">{m.from.name}</span>
+                            <span className="font-mono text-[9px] text-steel shrink-0">{fmtTime(m.ts)}</span>
+                          </div>
+                          <p className="text-[11px] truncate mt-0.5">
+                            {isObs ? (
+                              <span className={cn(
+                                "inline-flex items-center gap-1",
+                                isFailed ? "text-bounced-red" : "text-electric-blue"
+                              )}>
+                                {isFailed ? <AlertCircle className="size-3" /> : <Terminal className="size-3" />}
+                                <code>{toolName}</code>
+                              </span>
+                            ) : (
+                              m.parts.map((p) => p.text).join(" ")
+                            )}
+                          </p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Right pane: step details */}
+                <div className="md:col-span-2 min-h-[300px] max-h-[500px] overflow-y-auto rounded-[12px] border border-graphite-rail bg-black/40 p-4">
+                  {activeMessage ? (
+                    <div>
+                      <div className="flex items-center justify-between border-b border-graphite-rail pb-3">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-[15px] text-frost">{activeMessage.from.name}</span>
+                            {activeMessage.from.role && (
+                              <span className="rounded bg-graphite-rail/50 px-1.5 py-0.5 text-[11px] text-steel">
+                                {activeMessage.from.role}
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-1 font-mono text-[11px] text-steel">Sequence: {activeMessage.seq}</p>
+                        </div>
+                        <span className="font-mono text-[11px] text-steel">{new Date(activeMessage.ts).toLocaleString()}</span>
+                      </div>
+
+                      <div className="mt-4 leading-relaxed text-[14px]">
+                        {activeMessage.parts.map((p, i) => (
+                          <PartView key={i} part={p} />
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-center text-steel py-20 text-[13px]">Select a step to view details.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )
         )}
       </div>
 

@@ -123,7 +123,11 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {}
+            },
             "serverInfo": { "name": "parler", "version": env!("CARGO_PKG_VERSION") }
         })),
         "tools/list" => Ok(json!({ "tools": tool_specs() })),
@@ -144,6 +148,127 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
             match result {
                 Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false })),
                 Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("error: {e}") }], "isError": true })),
+            }
+        }
+        "resources/list" => Ok(json!({
+            "resources": [
+                {
+                    "uri": "parler://active-session/backlog",
+                    "name": "Active Session Backlog",
+                    "description": "Chronological history of the active session's conversation (all messages in the room).",
+                    "mimeType": "text/plain"
+                },
+                {
+                    "uri": "parler://roster",
+                    "name": "Session Roster",
+                    "description": "The list of agents currently in the active session room.",
+                    "mimeType": "application/json"
+                }
+            ]
+        })),
+        "resources/read" => {
+            let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| (-32602, "missing 'uri'".to_string()))?;
+            match uri {
+                "parler://active-session/backlog" => {
+                    let room = state.active_session.clone().ok_or_else(|| (-32602, "no active session room".to_string()))?;
+                    let (msgs, _) = state.agent.pull(&room, Some(0), None).await.map_err(|e| (-32000, format!("failed to pull messages: {e}")))?;
+                    let text = msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                    Ok(json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "text/plain",
+                            "text": text
+                        }]
+                    }))
+                }
+                "parler://roster" => {
+                    let room = state.active_session.clone().ok_or_else(|| (-32602, "no active session room".to_string()))?;
+                    let entries = state.agent.roster(&room).await.map_err(|e| (-32000, format!("failed to fetch roster: {e}")))?;
+                    Ok(json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": serde_json::to_string(&entries).unwrap_or_default()
+                        }]
+                    }))
+                }
+                other => Err((-32602, format!("unknown resource URI: {other}")))
+            }
+        }
+        "prompts/list" => Ok(json!({
+            "prompts": [
+                {
+                    "name": "parler_session_handoff",
+                    "description": "Instructs an agent on how to consume the active session backlog and resume work.",
+                    "arguments": []
+                },
+                {
+                    "name": "parler_consolidate_session",
+                    "description": "Instructs the agent on how to consolidate the active session backlog into key facts.",
+                    "arguments": []
+                }
+            ]
+        })),
+        "prompts/get" => {
+            let name = params.get("name").and_then(Value::as_str).ok_or_else(|| (-32602, "missing 'name'".to_string()))?;
+            match name {
+                "parler_session_handoff" => {
+                    let room = state.active_session.clone().unwrap_or_else(|| "none".to_string());
+                    let mut backlog = String::new();
+                    let mut roster_str = String::new();
+                    if let Some(ref r) = state.active_session {
+                        if let Ok((msgs, _)) = state.agent.pull(r, Some(0), None).await {
+                            backlog = msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                        }
+                        if let Ok(entries) = state.agent.roster(r).await {
+                            roster_str = entries.iter().map(|e| format!("- {} {} [{}]", e.name, e.id, e.status)).collect::<Vec<_>>().join("\n");
+                        }
+                    }
+                    let text = format!(
+                        "You are joining a Parler collaborative session.\n\
+                         Active Room: {room}\n\n\
+                         Roster:\n{roster_str}\n\n\
+                         Here is the chronological backlog of the conversation:\n\
+                         {backlog}\n\n\
+                         Please review the backlog to catch up on the task, key decisions, relevant file paths, and current status. Then, continue coordinating with other agents or address the task at hand."
+                    );
+                    Ok(json!({
+                        "description": "Handoff instructions for the active session",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": text
+                            }
+                        }]
+                    }))
+                }
+                "parler_consolidate_session" => {
+                    let room = state.active_session.clone().unwrap_or_else(|| "none".to_string());
+                    let mut backlog = String::new();
+                    if let Some(ref r) = state.active_session {
+                        if let Ok((msgs, _)) = state.agent.pull(r, Some(0), None).await {
+                            backlog = msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                        }
+                    }
+                    let text = format!(
+                        "Analyze the following conversation backlog from a collaborative session (Room: {room}).\n\
+                         Extract 1 to 5 key decisions, architectural choices, modified file paths, or lessons learned.\n\
+                         Write them down as room-scoped facts using the `parler_remember` tool with the room name '{room}'.\n\n\
+                         Backlog:\n{backlog}"
+                    );
+                    Ok(json!({
+                        "description": "Consolidate the session backlog into facts",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": text
+                            }
+                        }]
+                    }))
+                }
+                other => Err((-32602, format!("unknown prompt: {other}")))
             }
         }
         "ping" => Ok(json!({})),
@@ -504,6 +629,7 @@ async fn open_session(
         state.agent.send_text(Target::Room { room: room.clone() }, &seed).await?;
     }
     state.active_session = Some(room.clone());
+    let _ = crate::save_active_session(&room);
     let _ = state.agent.presence("working", topic.or_else(|| Some("shared session".into()))).await;
     let gate = if require_approval {
         "When another agent redeems this key it will ask to join, and YOU must approve it before it \
@@ -563,6 +689,7 @@ async fn join_session(state: &mut McpState, key: &str) -> Result<String> {
     // genuinely new messages rather than re-delivering this backlog.
     let (msgs, _cursor) = state.agent.pull(&room, None, None).await?;
     state.active_session = Some(room.clone());
+    let _ = crate::save_active_session(&room);
     let _ = state
         .agent
         .send_text(Target::Room { room: room.clone() }, &format!("{} joined the session", state.agent.name))
@@ -616,6 +743,7 @@ async fn close_session(state: &mut McpState) -> Result<String> {
     let Some(room) = state.active_session.take() else {
         return Ok("no active session to close".into());
     };
+    let _ = crate::clear_active_session();
     let _ = state
         .agent
         .send_text(Target::Room { room: room.clone() }, &format!("{} left the session", state.agent.name))

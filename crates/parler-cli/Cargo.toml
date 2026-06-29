@@ -9,6 +9,9 @@ description = "Parler CLI — the `parler` subcommands (hub/init/invite/join/sen
 parler-connector = { workspace = true }
 parler-hub = { workspace = true }
 parler-protocol = { workspace = true }
+parler-auth = { workspace = true }
+nkeys = { workspace = true }
+data-encoding = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
