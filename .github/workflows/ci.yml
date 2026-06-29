@@ -36,7 +36,9 @@ jobs:
       - name: actionlint (lint the workflows)
         uses: reviewdog/action-actionlint@v1
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           reporter: local # no checks/PR-write permissions needed; fails the step on findings
+          filter_mode: nofilter
           fail_level: error
 
   rust:
