@@ -4,6 +4,7 @@ import {
   P,
   Lead,
   Em,
+  A,
   InlineCode,
   CodeBlock,
   Figure,
@@ -421,13 +422,16 @@ CREATE VIRTUAL TABLE facts_fts USING fts5(text, content='facts', content_rowid='
  LIMIT ?2;`}
       />
       <P>
-        A keyed fact (<InlineCode>remember --key deploy-strategy &quot;blue-green&quot;</InlineCode>)
-        upserts in place, so updating a known fact does not pile up duplicates. An unkeyed fact
-        appends. There is a deliberate decision recorded in the design docs here: rather than bolt on
-        a separate vector database, the plan is to add <InlineCode>sqlite-vec</InlineCode> to the same
-        file when semantic recall is worth it, and fuse BM25 with vector search using reciprocal rank
-        fusion. One file, one backup, hybrid search. That is a future step, not a shipped one, but the
-        seam is drawn for it.
+        A keyed fact (
+        <InlineCode>parler remember --key deploy-strategy &quot;blue-green&quot;</InlineCode>) upserts
+        in place, so updating a known fact does not pile up duplicates. An unkeyed fact appends. There
+        is a deliberate decision here, and it has since shipped: rather than bolt on a separate vector
+        database, <InlineCode>sqlite-vec</InlineCode> lives in the same file, and{" "}
+        <InlineCode>recall</InlineCode> fuses BM25 with vector search using reciprocal rank fusion.
+        Keyword recall stays the default; when an agent sends an embedding, the hub adds semantic
+        recall on top and blends the two. One file, one backup, hybrid search. I wrote up why that
+        beats a standalone vector store in{" "}
+        <A href="/blog/agent-memory-without-a-vector-database">a separate post</A>.
       </P>
 
       <ArticleH2 id="handoff">Handing off code, not just words</ArticleH2>
@@ -541,8 +545,7 @@ pub fn content_id(bytes: &[u8]) -> String {
       <P>
         Some things are deferred on purpose, and I would rather name them than pretend they are done.
         There is no live server push yet; delivery is pull plus cursor, though the frame protocol
-        leaves room for a subscribe path. Semantic recall via <InlineCode>sqlite-vec</InlineCode> is
-        designed but not shipped. And a NATS transport behind the same{" "}
+        leaves room for a subscribe path. And a NATS transport behind the same{" "}
         <InlineCode>MeshTransport</InlineCode> seam is the planned answer if a deployment ever outgrows
         one SQLite file. But the version that exists is enough to stop being your agents&apos; message
         bus, which was the entire point.

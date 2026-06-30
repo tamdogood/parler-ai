@@ -5,10 +5,12 @@ import { NavBar } from "@/components/nav-bar";
 import { Footer } from "@/components/footer";
 import { POSTS, getPost } from "@/lib/blog";
 import { InsideParler } from "@/components/blog/inside-parler";
+import { AgentMemory } from "@/components/blog/agent-memory-without-a-vector-database";
 import { SITE_URL, SITE_NAME } from "@/lib/seo";
 
 /** slug → fully-rendered article body. Add a line here when you add a post. */
 const BODIES: Record<string, React.ReactNode> = {
+  "agent-memory-without-a-vector-database": <AgentMemory />,
   "stop-copy-pasting-between-ai-agents": <InsideParler />,
 };
 
