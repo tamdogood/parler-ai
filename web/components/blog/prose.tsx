@@ -58,6 +58,20 @@ export function InlineCode({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** An inline link in the body copy. External hrefs open in a new tab; internal ones cross-link posts. */
+export function A({ href, children }: { href: string; children: React.ReactNode }) {
+  const external = /^https?:/.test(href);
+  return (
+    <a
+      href={href}
+      {...(external ? { target: "_blank", rel: "noreferrer" } : {})}
+      className="text-electric-blue underline decoration-graphite-rail underline-offset-2 transition-colors hover:decoration-electric-blue"
+    >
+      {children}
+    </a>
+  );
+}
+
 export function Divider() {
   return <hr className="mt-16 border-0 border-t border-graphite-rail" />;
 }

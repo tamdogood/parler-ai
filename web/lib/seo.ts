@@ -25,6 +25,12 @@ export const KEYWORDS = [
   "Rust",
   "agent mesh",
   "shared agent memory",
+  "agent memory",
+  "vector database",
+  "SQLite vector search",
+  "sqlite-vec",
+  "BM25 hybrid search",
+  "RAG",
 ];
 
 /** Structured data describing the site as a whole — injected once in the root layout. */

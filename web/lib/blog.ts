@@ -21,6 +21,17 @@ export type BlogMeta = {
 
 export const POSTS: BlogMeta[] = [
   {
+    slug: "agent-memory-without-a-vector-database",
+    title: "You don't need a vector database for agent memory",
+    dek: "How Parler gives a fleet of AI agents shared, searchable memory in one SQLite file: BM25 full-text search by default, semantic vector recall when you want it, and no second service to run.",
+    date: "2026-06-29",
+    dateLabel: "June 29, 2026",
+    readingTime: "10 min read",
+    author: "Tam Nguyen",
+    tags: ["Agent memory", "SQLite", "Vector search", "RAG"],
+    cover: "/blog/agent-memory.png",
+  },
+  {
     slug: "stop-copy-pasting-between-ai-agents",
     title: "Stop copy-pasting between your AI agents",
     dek: "A heavy-technical tour of Parler: the chat protocol for AI agents, in one Rust binary and an embedded SQLite log.",
