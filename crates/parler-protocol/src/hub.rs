@@ -517,6 +517,10 @@ fn is_false(b: &bool) -> bool {
 /// The reverse-DNS [`Part`] kind that references a code/artifact bundle handed off through a room.
 pub const BUNDLE_KIND: &str = "com.parler.bundle";
 
+/// The reverse-DNS [`Part`] kind that carries a structured turn handoff — an explicit "you're up
+/// next" between agents sharing a room. See [`HandoffRef`].
+pub const HANDOFF_KIND: &str = "com.parler.handoff";
+
 /// A reference to a content-addressed artifact (a git bundle by default) carried inside a room
 /// message as a [`Part::Extension`] of kind [`BUNDLE_KIND`].
 ///
@@ -564,6 +568,165 @@ impl BundleRef {
                 serde_json::from_value(serde_json::Value::Object(fields.clone())).ok()
             }
             _ => None,
+        }
+    }
+}
+
+/// The reverse-DNS [`Part`] kind that carries an author's detached signature over a message.
+///
+/// Like [`BUNDLE_KIND`], a signature rides *inside* the message's `parts` as a [`Part::Extension`],
+/// so authenticating a message needs **no new wire frame and no hub/store change** — the hub already
+/// persists and returns arbitrary parts verbatim. A client that doesn't understand the kind still
+/// sees a renderable extension part; one that does verifies it against the author's id (its public
+/// key) and learns whether the (possibly untrusted) hub forged or altered the authored content.
+pub const MESSAGE_SIG_KIND: &str = "com.parler.sig";
+
+/// Signed-payload schema version embedded in [`canonical_message_bytes`] and the sig part.
+pub const MESSAGE_SIG_V: u64 = 1;
+
+/// `true` iff `p` is a [`MESSAGE_SIG_KIND`] extension part (the detached message signature).
+pub fn is_message_sig_part(p: &Part) -> bool {
+    matches!(p, Part::Extension { kind, .. } if kind == MESSAGE_SIG_KIND)
+}
+
+/// An author's detached signature over a message, carried as a [`MESSAGE_SIG_KIND`] extension part.
+///
+/// The signature covers [`canonical_message_bytes`] of the message's *content* — the author id, the
+/// routing `target` the author chose, the non-signature `parts`, the optional `replyTo`, and the
+/// author-stamped `ts`/`uid`. It deliberately does **not** cover hub-assigned routing metadata
+/// (`seq`, the resolved room name, the hub's own `ts`): those are the relay's to set, and binding the
+/// delivered room (anti-misrouting) and ordering (anti-reorder) ride the per-room hash chain layered
+/// on top of this. `mentions` are excluded because the hub normalizes them in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSig {
+    /// Base64 nkey/Ed25519 signature over [`canonical_message_bytes`].
+    pub sig: String,
+    /// Author-stamped send time (epoch-ms) — part of the signed payload (not the hub's `ts`).
+    pub ts: i64,
+    /// Author-chosen unique id for this message — part of the signed payload, and the idempotency key.
+    pub uid: String,
+    /// The routing target the author addressed (its intent), covered by the signature.
+    pub target: Target,
+}
+
+impl MessageSig {
+    /// Encode as the `com.parler.sig` extension [`Part`].
+    pub fn to_part(&self) -> Part {
+        let mut fields = serde_json::Map::new();
+        fields.insert("sig".into(), serde_json::Value::String(self.sig.clone()));
+        fields.insert("alg".into(), serde_json::Value::String("ed25519".into()));
+        fields.insert("v".into(), serde_json::json!(MESSAGE_SIG_V));
+        fields.insert("ts".into(), serde_json::json!(self.ts));
+        fields.insert("uid".into(), serde_json::Value::String(self.uid.clone()));
+        fields.insert(
+            "target".into(),
+            serde_json::to_value(&self.target).unwrap_or(serde_json::Value::Null),
+        );
+        Part::Extension { kind: MESSAGE_SIG_KIND.to_string(), fields }
+    }
+
+    /// Recover the [`MessageSig`] from a message's parts — `Some` iff exactly one well-formed
+    /// `com.parler.sig` part is present.
+    pub fn from_parts(parts: &[Part]) -> Option<MessageSig> {
+        parts.iter().find_map(|p| match p {
+            Part::Extension { kind, fields } if kind == MESSAGE_SIG_KIND => Some(MessageSig {
+                sig: fields.get("sig")?.as_str()?.to_string(),
+                ts: fields.get("ts")?.as_i64()?,
+                uid: fields.get("uid")?.as_str()?.to_string(),
+                target: serde_json::from_value(fields.get("target")?.clone()).ok()?,
+            }),
+            _ => None,
+        })
+    }
+}
+
+/// The canonical bytes an author signs (and a verifier reconstructs) for a message.
+///
+/// Deterministic, whitespace-free, recursively key-sorted JSON (the same JCS-style form as
+/// [`canonical_card_bytes`]) over `{v, from, target, parts, replyTo?, ts, uid}`. Any
+/// [`MESSAGE_SIG_KIND`] part is filtered out first, so passing the full `parts` (signature included)
+/// reproduces the exact bytes the author signed — a verifier and the signer can't disagree on framing.
+pub fn canonical_message_bytes(
+    from_id: &str,
+    target: &Target,
+    parts: &[Part],
+    reply_to: Option<&str>,
+    ts: i64,
+    uid: &str,
+) -> Vec<u8> {
+    let signable: Vec<&Part> = parts.iter().filter(|p| !is_message_sig_part(p)).collect();
+    let mut obj = serde_json::Map::new();
+    obj.insert("v".into(), serde_json::json!(MESSAGE_SIG_V));
+    obj.insert("from".into(), serde_json::Value::String(from_id.to_string()));
+    obj.insert("target".into(), serde_json::to_value(target).unwrap_or(serde_json::Value::Null));
+    obj.insert("parts".into(), serde_json::to_value(&signable).unwrap_or(serde_json::Value::Null));
+    if let Some(rt) = reply_to {
+        obj.insert("replyTo".into(), serde_json::Value::String(rt.to_string()));
+    }
+    obj.insert("ts".into(), serde_json::json!(ts));
+    obj.insert("uid".into(), serde_json::Value::String(uid.to_string()));
+    serde_json::to_vec(&canonicalize(&serde_json::Value::Object(obj))).unwrap_or_default()
+}
+
+/// A structured turn handoff carried inside a room message as a [`Part::Extension`] of kind
+/// [`HANDOFF_KIND`] — the explicit "you're up next" signal between agents sharing a room.
+///
+/// Parler delivers it like any other part (room / cursor / push / durability all unchanged), but the
+/// typed shape lets a worker loop or MCP host *recognise* a handoff addressed to it and continue
+/// without a human re-prompting. Pair it with `recv --watch` / `parler_recv wait_secs` for the
+/// wakeup. A client that doesn't understand the kind still sees a renderable extension part.
+///
+/// Build one with [`HandoffRef::to_part`]; recover it with [`HandoffRef::from_part`]; ask whether it
+/// is meant for a given agent with [`HandoffRef::is_for`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffRef {
+    /// What the next agent should do — the actual instruction to act on.
+    pub next: String,
+    /// A recap of what was just completed / the current state, so the next agent has context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// The addressee: a target agent **name or role**. Absent means "any agent in the room".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Optional content id of an attached code bundle (a [`BundleRef::blob`]) handed off alongside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+}
+
+impl HandoffRef {
+    /// Encode as the `com.parler.handoff` extension [`Part`].
+    pub fn to_part(&self) -> Part {
+        let fields = match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        Part::Extension { kind: HANDOFF_KIND.to_string(), fields }
+    }
+
+    /// Recover a [`HandoffRef`] from a part — `Some` iff it is a well-formed `com.parler.handoff`
+    /// extension.
+    pub fn from_part(part: &Part) -> Option<HandoffRef> {
+        match part {
+            Part::Extension { kind, fields } if kind == HANDOFF_KIND => {
+                serde_json::from_value(serde_json::Value::Object(fields.clone())).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this handoff is for the agent with the given `name` / optional `role`.
+    ///
+    /// An unaddressed handoff (`to` absent) is for everyone. An addressed one matches
+    /// case-insensitively against either the name or the role, so `--for webdev` reaches an agent
+    /// named `webdev` *or* one whose role is `webdev`.
+    pub fn is_for(&self, name: &str, role: Option<&str>) -> bool {
+        match &self.to {
+            None => true,
+            Some(addr) => {
+                let addr = addr.trim();
+                addr.eq_ignore_ascii_case(name)
+                    || role.is_some_and(|r| addr.eq_ignore_ascii_case(r))
+            }
         }
     }
 }
@@ -872,6 +1035,86 @@ mod tests {
         assert_eq!(BundleRef::from_part(&back), Some(b));
         // …and a plain part is not a bundle ref.
         assert_eq!(BundleRef::from_part(&Part::text("hi")), None);
+    }
+
+    #[test]
+    fn message_sig_part_round_trips_and_ignores_non_sig_parts() {
+        let ms = MessageSig {
+            sig: "BASE64SIG".into(),
+            ts: 1710000000000,
+            uid: "018f-uid".into(),
+            target: Target::Room { room: "team".into() },
+        };
+        let part = ms.to_part();
+        assert!(is_message_sig_part(&part));
+        // Survives a JSON wire round-trip as a Part…
+        let j = serde_json::to_value(&part).unwrap();
+        assert_eq!(j["kind"], MESSAGE_SIG_KIND);
+        assert_eq!(j["alg"], "ed25519");
+        assert_eq!(j["target"]["kind"], "room");
+        let back: Part = serde_json::from_value(j).unwrap();
+        // …recovered from a parts list that also holds ordinary parts.
+        let parts = vec![Part::text("hi"), back];
+        assert_eq!(MessageSig::from_parts(&parts), Some(ms));
+        // A list with no sig part yields None.
+        assert_eq!(MessageSig::from_parts(&[Part::text("hi")]), None);
+    }
+
+    #[test]
+    fn canonical_message_bytes_is_stable_and_sig_part_independent() {
+        let target = Target::Dm { agent: "UBOB".into() };
+        let parts = vec![Part::text("ship it")];
+        let a = canonical_message_bytes("UALICE", &target, &parts, Some("m0"), 42, "uid1");
+        // Recomputing with the sig part appended must yield identical bytes (it's filtered out), so a
+        // verifier that passes the full received `parts` reconstructs exactly what the author signed.
+        let ms = MessageSig { sig: "x".into(), ts: 42, uid: "uid1".into(), target: target.clone() };
+        let mut with_sig = parts.clone();
+        with_sig.push(ms.to_part());
+        let b = canonical_message_bytes("UALICE", &target, &with_sig, Some("m0"), 42, "uid1");
+        assert_eq!(a, b, "the sig part must not feed back into the signed bytes");
+        // Any covered field changing the payload changes the bytes.
+        let c = canonical_message_bytes("UALICE", &target, &[Part::text("ship them")], Some("m0"), 42, "uid1");
+        assert_ne!(a, c);
+        let d = canonical_message_bytes("UMALLORY", &target, &parts, Some("m0"), 42, "uid1");
+        assert_ne!(a, d, "the author id is part of the signed payload");
+    }
+
+    #[test]
+    fn handoff_ref_round_trips_and_addresses() {
+        let h = HandoffRef {
+            next: "build the page structure".into(),
+            summary: Some("design direction is locked".into()),
+            to: Some("webdev".into()),
+            bundle: Some("blobsha".into()),
+        };
+        let part = h.to_part();
+        match &part {
+            Part::Extension { kind, .. } => assert_eq!(kind, HANDOFF_KIND),
+            _ => panic!("expected an extension part"),
+        }
+        // Survives a JSON wire round-trip as a Part.
+        let j = serde_json::to_value(&part).unwrap();
+        assert_eq!(j["kind"], HANDOFF_KIND);
+        assert_eq!(j["next"], "build the page structure");
+        let back: Part = serde_json::from_value(j).unwrap();
+        assert_eq!(HandoffRef::from_part(&back), Some(h.clone()));
+        // …and a plain part is not a handoff ref.
+        assert_eq!(HandoffRef::from_part(&Part::text("hi")), None);
+
+        // Addressing: matches the agent's name or role, case-insensitively.
+        assert!(h.is_for("webdev", None));
+        assert!(h.is_for("bob", Some("WebDev")));
+        assert!(!h.is_for("designer", Some("planner")));
+        // An unaddressed handoff is for everyone.
+        let any = HandoffRef { to: None, ..h };
+        assert!(any.is_for("anyone", None));
+
+        // Optional fields stay absent on the wire when None.
+        let minimal = HandoffRef { next: "go".into(), summary: None, to: None, bundle: None };
+        let j = serde_json::to_value(minimal.to_part()).unwrap();
+        assert!(j.get("summary").is_none());
+        assert!(j.get("to").is_none());
+        assert!(j.get("bundle").is_none());
     }
 
     #[test]
