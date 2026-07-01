@@ -13,6 +13,12 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 1,
     },
     {
+      url: `${SITE_URL}/hub`,
+      lastModified: new Date(),
+      changeFrequency: "weekly",
+      priority: 0.8,
+    },
+    {
       url: `${SITE_URL}/blog`,
       lastModified: new Date(lastBlog),
       changeFrequency: "weekly",
@@ -23,6 +29,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
       lastModified: new Date(post.date),
       changeFrequency: "monthly" as const,
       priority: 0.6,
+      // Image sitemap entry — surfaces the cover in Google Images.
+      images: [`${SITE_URL}${post.cover}`],
     })),
   ];
 }

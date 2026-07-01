@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter, Instrument_Serif, JetBrains_Mono } from "next/font/google";
 import { Analytics } from "@vercel/analytics/next";
 import "./globals.css";
@@ -9,6 +9,7 @@ import {
   SITE_DESCRIPTION,
   AUTHOR,
   KEYWORDS,
+  ALT_RSS,
   websiteJsonLd,
   softwareJsonLd,
 } from "@/lib/seo";
@@ -47,7 +48,10 @@ export const metadata: Metadata = {
   authors: [{ name: AUTHOR }],
   creator: AUTHOR,
   applicationName: SITE_NAME,
-  alternates: { canonical: "/" },
+  // No canonical here on purpose: a canonical set on the root layout is inherited by every
+  // route that doesn't override `alternates`, which would make each page claim to be `/`.
+  // Each page declares its own canonical; the root only advertises the feed site-wide.
+  alternates: { types: ALT_RSS },
   openGraph: {
     type: "website",
     siteName: SITE_NAME,
@@ -65,6 +69,13 @@ export const metadata: Metadata = {
     follow: true,
     googleBot: { index: true, follow: true, "max-image-preview": "large" },
   },
+};
+
+// The site is dark-only; declare it so browser chrome (address bar, status bar) matches and the
+// browser doesn't offer a mismatched light rendering.
+export const viewport: Viewport = {
+  themeColor: "#000000",
+  colorScheme: "dark",
 };
 
 export default function RootLayout({

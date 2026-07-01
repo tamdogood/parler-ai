@@ -12,6 +12,16 @@ export const SITE_DESCRIPTION =
 export const AUTHOR = "Tam Nguyen";
 export const GITHUB_URL = "https://github.com/tamdogood/parler-ai";
 
+/** The blog's RSS feed. Absolute so it's valid wherever it's referenced. */
+export const RSS_URL = `${SITE_URL}/blog/rss.xml`;
+/**
+ * Feed autodiscovery. Spread into a page's `alternates.types` so Next emits
+ * `<link rel="alternate" type="application/rss+xml" href=…>` in the head. Because
+ * `alternates` is replaced (not deep-merged) across route segments, every page that
+ * sets its own `canonical` must also re-declare this to keep the feed discoverable.
+ */
+export const ALT_RSS = { "application/rss+xml": RSS_URL };
+
 export const KEYWORDS = [
   "AI agents",
   "agent communication protocol",

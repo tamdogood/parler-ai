@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import {
   Fingerprint,
   KeyRound,
@@ -19,6 +20,12 @@ import { SessionsFeature } from "@/components/sessions-feature";
 import { Reveal } from "@/components/reveal";
 import { Faq } from "@/components/faq";
 import { Footer } from "@/components/footer";
+import { ALT_RSS } from "@/lib/seo";
+
+// The home canonical lives here (not on the root layout) so it doesn't leak to every route.
+export const metadata: Metadata = {
+  alternates: { canonical: "/", types: ALT_RSS },
+};
 
 export default function Home() {
   return (
