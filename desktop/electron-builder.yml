@@ -36,6 +36,14 @@ mac:
   extendInfo:
     LSApplicationCategoryType: public.app-category.developer-tools
 
+# Publish to GitHub Releases when the release-desktop workflow runs with `--publish always`.
+# `owner`/`repo` are pinned so forks still target the canonical namespace unless overridden.
+publish:
+  provider: github
+  owner: tamdogood
+  repo: parler-ai
+  releaseType: release
+
 dmg:
   title: "${productName} ${version}"
   # Standard drag-to-Applications layout.

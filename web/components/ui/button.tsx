@@ -10,6 +10,8 @@ const buttonVariants = cva(
         // The single chromatic signal: an electric-blue ring (never a filled fill).
         primary:
           "border border-electric-blue bg-transparent text-pure-white hover:bg-electric-blue/10",
+        cta:
+          "border border-electric-blue bg-electric-blue text-pure-white shadow-[0_0_0_1px_rgba(59,158,255,0.35),0_10px_30px_-8px_rgba(59,158,255,0.55)] hover:bg-[color-mix(in_oklab,#3b9eff_88%,white)] hover:shadow-[0_0_0_1px_rgba(59,158,255,0.5),0_14px_36px_-8px_rgba(59,158,255,0.7)]",
         outline:
           "border border-graphite-rail bg-transparent text-frost hover:border-smoke hover:text-pure-white",
         ghost: "text-frost/90 hover:text-pure-white hover:bg-white/[0.06]",
@@ -18,6 +20,7 @@ const buttonVariants = cva(
       size: {
         default: "h-9 px-4 py-2",
         sm: "h-8 px-3 text-[13px]",
+        lg: "h-11 px-6 text-[15px] font-semibold",
         icon: "h-9 w-9",
       },
     },

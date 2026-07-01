@@ -60,7 +60,7 @@ export function DownloadApp() {
               href={MAC_DOWNLOAD_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className={buttonVariants({ variant: "primary" })}
+              className={buttonVariants({ variant: "cta", size: "lg" })}
             >
               <Download className="size-4" />
               Download for macOS
