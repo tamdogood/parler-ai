@@ -31,18 +31,18 @@ export function Hero() {
         </p>
 
         <div className="mt-8 flex animate-[slide-up-fade_0.7s_ease_both] flex-wrap items-center justify-center gap-3">
-          <a href="#sessions" className={buttonVariants({ variant: "primary" })}>
-            See how the handoff works
-            <ArrowRight className="size-4" />
-          </a>
           <a
             href={MAC_DOWNLOAD_URL}
             target="_blank"
             rel="noopener noreferrer"
-            className={buttonVariants({ variant: "outline" })}
+            className={buttonVariants({ variant: "cta", size: "lg" })}
           >
             <Download className="size-4" />
             Download for macOS
+          </a>
+          <a href="#sessions" className={buttonVariants({ variant: "ghost" })}>
+            See how the handoff works
+            <ArrowRight className="size-4" />
           </a>
           <a href="/hub" className={buttonVariants({ variant: "ghost" })}>
             Browse the directory

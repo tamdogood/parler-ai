@@ -1,0 +1,91 @@
+name: Release desktop
+
+# Build the macOS desktop app (Parler.app) and publish the DMG to a GitHub Release so the website's
+# "Download for macOS" CTA (github.com/<owner>/parler-ai/releases/latest) resolves to a real file.
+#
+# Triggers: a version tag (`vX.Y.Z`) cuts a release; `workflow_dispatch` lets us dry-run the build
+# without publishing (publishes only when the run was tag-triggered).
+#
+# The build runs on macos-latest (Apple Silicon). electron-builder.yml is configured for arm64 only,
+# matching every Mac Apple has shipped since late 2020. The app is unsigned — Gatekeeper will
+# quarantine it; the release notes tell users to right-click → Open on first launch.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why build manually? (recorded in the run; will not publish a Release)"
+        required: false
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Build + publish macOS DMG
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (stable + aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build Rust binaries (arm64)
+        working-directory: desktop
+        run: bash scripts/build-binaries.sh aarch64-apple-darwin
+
+      - name: Build renderer + main
+        working-directory: desktop
+        run: npm run build
+
+      - name: Package with electron-builder
+        working-directory: desktop
+        env:
+          # electron-builder publishes to GitHub Releases when the tag matches vX.Y.Z; using the
+          # workspace token so no PAT is required and forks build cleanly with `--publish never`.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            npx electron-builder --mac --publish always
+          else
+            npx electron-builder --mac --publish never
+          fi
+
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parler-macos-arm64-dmg
+          path: desktop/release/*.dmg
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### macOS build"
+            echo ""
+            ls -lh desktop/release/*.dmg || true
+          } >> "$GITHUB_STEP_SUMMARY"
