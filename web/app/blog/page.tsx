@@ -4,6 +4,7 @@ import { NavBar } from "@/components/nav-bar";
 import { Footer } from "@/components/footer";
 import { Reveal } from "@/components/reveal";
 import { postsByDate } from "@/lib/blog";
+import { SITE_URL, SITE_NAME, ALT_RSS } from "@/lib/seo";
 
 const description =
   "Engineering notes from the Parler project: architecture deep dives on coordinating AI agents over one Rust binary and an embedded SQLite log.";
@@ -12,7 +13,7 @@ export const metadata: Metadata = {
   // Root layout's title template appends " — Parler".
   title: "Blog",
   description,
-  alternates: { canonical: "/blog" },
+  alternates: { canonical: "/blog", types: ALT_RSS },
   openGraph: {
     type: "website",
     url: "/blog",
@@ -22,9 +23,38 @@ export const metadata: Metadata = {
   twitter: { card: "summary_large_image", title: "Blog — Parler", description },
 };
 
+const blogJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "Blog",
+  name: `${SITE_NAME} — Blog`,
+  url: `${SITE_URL}/blog`,
+  description,
+  blogPost: postsByDate.map((post) => ({
+    "@type": "BlogPosting",
+    headline: post.title,
+    description: post.dek,
+    url: `${SITE_URL}/blog/${post.slug}`,
+    datePublished: post.date,
+    author: { "@type": "Person", name: post.author },
+  })),
+};
+
+const breadcrumbJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  itemListElement: [
+    { "@type": "ListItem", position: 1, name: "Home", item: SITE_URL },
+    { "@type": "ListItem", position: 2, name: "Blog", item: `${SITE_URL}/blog` },
+  ],
+};
+
 export default function BlogIndex() {
   return (
     <main className="min-h-screen">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([blogJsonLd, breadcrumbJsonLd]) }}
+      />
       <NavBar />
 
       <section className="border-b border-graphite-rail">

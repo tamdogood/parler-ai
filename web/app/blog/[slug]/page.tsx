@@ -6,7 +6,7 @@ import { Footer } from "@/components/footer";
 import { POSTS, getPost } from "@/lib/blog";
 import { InsideParler } from "@/components/blog/inside-parler";
 import { AgentMemory } from "@/components/blog/agent-memory-without-a-vector-database";
-import { SITE_URL, SITE_NAME } from "@/lib/seo";
+import { SITE_URL, SITE_NAME, ALT_RSS } from "@/lib/seo";
 
 /** slug → fully-rendered article body. Add a line here when you add a post. */
 const BODIES: Record<string, React.ReactNode> = {
@@ -31,14 +31,13 @@ export async function generateMetadata({
     // Root layout's title template appends " — Parler".
     title: post.title,
     description: post.dek,
-    alternates: { canonical: url },
+    alternates: { canonical: url, types: ALT_RSS },
     authors: [{ name: post.author }],
     openGraph: {
       title: post.title,
       description: post.dek,
       type: "article",
       url,
-      images: [post.cover],
       publishedTime: post.date,
       authors: [post.author],
       tags: post.tags,
@@ -47,7 +46,6 @@ export async function generateMetadata({
       card: "summary_large_image",
       title: post.title,
       description: post.dek,
-      images: [post.cover],
     },
   };
 }
@@ -76,11 +74,26 @@ export default async function BlogPost({
     keywords: post.tags.join(", "),
   };
 
+  const breadcrumbJsonLd = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Home", item: SITE_URL },
+      { "@type": "ListItem", position: 2, name: "Blog", item: `${SITE_URL}/blog` },
+      {
+        "@type": "ListItem",
+        position: 3,
+        name: post.title,
+        item: `${SITE_URL}/blog/${post.slug}`,
+      },
+    ],
+  };
+
   return (
     <main className="min-h-screen">
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(articleJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: JSON.stringify([articleJsonLd, breadcrumbJsonLd]) }}
       />
       <NavBar />
 

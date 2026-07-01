@@ -191,3 +191,81 @@ private=`command:[]`, public=`command:[--public]`.
 - Caveat: Docker daemon was down locally so the *image build* itself runs in CI; the Dockerfile delta
   is only the `CMD`/`ENV` lines (build otherwise identical to the proven Fly build) and the binary's
   mode selection is directly proven. `CI_SKIP_WEB=1 make ci` green.
+
+---
+
+# Task: SEO pass — apply the `astro-seo` skill's principles to the Next.js site — 2026-06-30
+
+**User ask:** install `fusengine/agents astro-seo` via skillfish, then "apply this skill to improve SEO
+for my website with your best effort." The skill is Astro-specific; the site is Next 15 App Router, so
+we apply its *principles* (canonical correctness, RSS, sitemap, BreadcrumbList, feed autodiscovery,
+XSS-safe JSON-LD). Existing SEO (PR #55/#56) is already strong (FAQPage/BlogPosting/OG+Twitter/sitemap/
+robots), so this is a targeted improvement pass.
+
+## Real bug found
+- `/hub` (a `"use client"` page with no metadata) inherited the root layout's `alternates:{canonical:"/"}`
+  → the standalone Hub self-reported as a duplicate of `/` and reused the home title/description.
+
+## Plan
+- [x] `lib/seo.ts` — `RSS_URL` + `ALT_RSS` feed-autodiscovery constant.
+- [x] `app/layout.tsx` — drop root `canonical:"/"` (footgun: every un-overriding route inherited it);
+      set site-wide `alternates.types` (RSS).
+- [x] `app/page.tsx` — own `metadata` w/ `canonical:"/"` + RSS type.
+- [x] `app/hub/layout.tsx` — NEW server layout: hub title/description/canonical `/hub`/OG/Twitter.
+- [x] `app/sitemap.ts` — add `/hub`.
+- [x] `app/blog/rss.xml/route.ts` — NEW static RSS 2.0 feed (XML-escaped, categories, atom:self).
+- [x] `app/blog/page.tsx` — RSS alternate + `Blog` + `BreadcrumbList` JSON-LD.
+- [x] `app/blog/[slug]/page.tsx` — RSS alternate + `BreadcrumbList` JSON-LD.
+- [x] `components/footer.tsx` — RSS link.
+
+## Verify
+- [x] `npm run build` green (15 routes prerender; `/blog/rss.xml` + `/hub` both static).
+- [x] Per-route canonicals correct: `/`→`/`, `/hub`→`/hub` (was `/` — the bug), `/blog`→`/blog`,
+      post→own URL. `/hub` `<title>`/`og:title` now hub-specific, distinct from home.
+- [x] `/blog/rss.xml` well-formed (`xmllint --noout` ✓): escaped titles/deks, categories,
+      `atom:self`, RFC-822 dates. RSS `<link rel=alternate>` on home + blog pages; footer link.
+- [x] `BreadcrumbList` JSON-LD on blog post + index; `Blog` collection JSON-LD on index.
+- [x] Sitemap now lists `/hub`. `/session` still `noindex`; robots.txt unchanged.
+- [x] Web CI gate = `scripts/ci/web.sh` (`npm ci` + `next build`); no `next lint` (no ESLint config).
+
+## Review
+**Done & verified.** Applied the `astro-seo` skill's *principles* to the Next.js site (skill is
+Astro-only, so no Astro code — the checklist transferred: canonical correctness, RSS, sitemap,
+BreadcrumbList, feed autodiscovery, XSS-safe JSON-LD via `dangerouslySetInnerHTML`+`JSON.stringify`).
+
+- **Fixed a real canonical bug:** `/hub` (client page, no metadata) inherited the root layout's
+  `canonical:"/"` and the home title/description — it self-reported as a duplicate of the homepage.
+  Moved the home canonical off the root onto `app/page.tsx`, and gave `/hub` its own server
+  `layout.tsx` (title/description/canonical/OG). Root now only advertises the feed site-wide, so no
+  route inherits a wrong canonical.
+- **Added an RSS 2.0 feed** (`/blog/rss.xml`, `force-static`) with autodiscovery `<link>`s + footer
+  link. **Added BreadcrumbList** (posts + index) and a **Blog** collection schema. **Added `/hub`**
+  to the sitemap.
+- **Minimal blast radius:** `web/` only, no protocol/crate change; existing SEO (FAQPage, BlogPosting,
+  OG/Twitter images, keywords) untouched.
+
+New: `app/hub/layout.tsx`, `app/blog/rss.xml/route.ts`. Edited: `lib/seo.ts`, `app/layout.tsx`,
+`app/page.tsx`, `app/sitemap.ts`, `app/blog/page.tsx`, `app/blog/[slug]/page.tsx`, `components/footer.tsx`.
+
+Still off-page / out of code scope (same as the 2026-06-29 SEO task): submit sitemap to Google Search
+Console + Bing, earn inbound links, a real domain vs `*.fly.dev`, more posts. Nice-to-have not done:
+`Organization` logo node (no dedicated square-raster logo asset yet).
+
+### Further pass ("anything else?") — DONE & verified
+Recon showed the blog covers are a poor social-card source (aspect 1.14–2.36:1, none = OG's 1.91:1;
+raw PNGs up to 3200px / ~400 KB via plain `<img>`), and there was no theme-color/manifest at all.
+- **Per-post branded OG + Twitter cards** — `app/blog/[slug]/opengraph-image.tsx` (+ `twitter-image.tsx`
+  re-export), 1200×630, title + dek on the root card's aesthetic, next/og default font. Both
+  **prerender static** (`generateStaticParams`) so crawlers get a cached image. Dropped the manual
+  `images:[post.cover]` from the post's `generateMetadata` so the branded card is the social image;
+  the cover stays as the in-page hero + `BlogPosting` `image`. **Visually verified** the rendered PNG.
+- **theme-color + web manifest** — `viewport` export (`themeColor:#000`, `colorScheme:dark`) →
+  `<meta name=theme-color>`; `app/manifest.ts` → `/manifest.webmanifest` (Next auto-links it).
+- **Image sitemap** — blog entries now carry `<image:loc>` (cover) for Google Images.
+`next build` green (18 routes prerender). Verified in output: post `og:image`/`twitter:image` → the
+branded `/blog/<slug>/opengraph-image` card; `theme-color` + `rel=manifest` present; manifest valid;
+sitemap `<image:loc>` present.
+
+Offered, not done (need a judgment call / visual QA): convert covers to `next/image` (Core Web Vitals —
+they're 92–388 KB raw PNGs; touches rendering so wants visual QA); `Organization`/`publisher.logo`
+(needs a light-bg square logo asset); AI-crawler policy in robots (a product decision).

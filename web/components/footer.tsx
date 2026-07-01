@@ -20,6 +20,9 @@ export function Footer() {
           <a href="/blog" className="text-fog transition-colors hover:text-frost">
             Blog
           </a>
+          <a href="/blog/rss.xml" className="text-fog transition-colors hover:text-frost">
+            RSS
+          </a>
           <a href="/#faq" className="text-fog transition-colors hover:text-frost">
             FAQ
           </a>
