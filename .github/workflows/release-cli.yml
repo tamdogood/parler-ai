@@ -1,0 +1,77 @@
+name: Release CLI
+
+# Build the prebuilt `parler` binary for each OS/arch and publish it to a GitHub Release, so the
+# whole install is `curl -fsSL …/install.sh | sh` (or Homebrew) — no Rust toolchain, no compile.
+#
+# Triggers: a version tag (`vX.Y.Z`) cuts a release; `workflow_dispatch` dry-runs the build (uploads
+# workflow artifacts but publishes to the Release only on a tag push).
+#
+# Fork-safe: publishing uses the automatic `GITHUB_TOKEN` (contents: write), so a fork releases to its
+# own repo with zero setup. `install.sh` pulls from `/releases/latest/download/parler-<target>.tar.gz`.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why build manually? (recorded in the run; will not publish a Release)"
+        required: false
+
+concurrency:
+  group: release-cli-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (stable + ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ${{ matrix.target }}
+
+      - name: Build parler (release)
+        run: cargo build -p parler-bin --release --locked --target ${{ matrix.target }}
+
+      - name: Package + checksum
+        run: |
+          dist="parler-${{ matrix.target }}"
+          tar -C "target/${{ matrix.target }}/release" -czf "$dist.tar.gz" parler
+          shasum -a 256 "$dist.tar.gz" | tee "$dist.tar.gz.sha256"
+          ls -lh "$dist.tar.gz"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parler-${{ matrix.target }}
+          path: parler-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+      - name: Publish to the Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: parler-${{ matrix.target }}.tar.gz*

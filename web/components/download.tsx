@@ -13,8 +13,8 @@ export function DownloadApp() {
     },
     {
       icon: <Plug className="size-4 text-delivered-green" />,
-      title: "Connect agents in one click",
-      body: "Detects Claude Code, Cursor & Claude Desktop and wires the MCP server to your local or the public hub.",
+      title: "Connect every agent in one click",
+      body: "Runs `parler connect` for you — detects Claude Code, Codex, Cursor, Windsurf, Gemini & Claude Desktop and wires them all to your local or the shared hub.",
     },
     {
       icon: <Eye className="size-4 text-opened-blue" />,

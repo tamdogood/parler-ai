@@ -4,6 +4,7 @@
 //! local identity, connect to the hub, do one op, print. `parler hub` runs the bus in-process and
 //! `parler mcp` exposes the same ops as MCP tools (see [`mcp`]).
 
+pub mod connect;
 pub mod mcp;
 
 use anyhow::{bail, Result};
@@ -32,7 +33,9 @@ struct Cli {
 enum Cmd {
     /// Run the hub (the message bus + memory store).
     Hub(HubArgs),
-    /// Create this agent's identity and point it at a hub.
+    /// Wire every AI agent on this machine to Parler in one step (Claude Code, Codex, Cursor, …).
+    Connect(ConnectArgs),
+    /// Create this agent's identity and point it at a hub (advanced; `connect`/`mcp` do this for you).
     Init(InitArgs),
     /// Mint an invite code/link to hand to another agent (default: a 1:1 DM).
     Invite(InviteArgs),
@@ -128,6 +131,45 @@ struct HubArgs {
     /// resume from its durable cursor). `0` disables the timeout. Default: 1800 (30 min).
     #[arg(long, env = "PARLER_HUB_IDLE_TIMEOUT_SECS", default_value_t = 1800)]
     idle_timeout_secs: u64,
+    /// Convenience for a persistent hub on THIS machine: if `--db` is unset, store it at
+    /// `~/.parler/hub.sqlite`. The default `--addr` already binds loopback, so nothing leaves the box
+    /// and no join secret is needed. Pairs with `parler connect --local`.
+    #[arg(long)]
+    local: bool,
+}
+
+#[derive(Args)]
+struct ConnectArgs {
+    /// Specific agents to wire (e.g. `codex`, `cursor`, `hermes`). Omit to auto-detect and wire every
+    /// agent found on this machine.
+    hosts: Vec<String>,
+    /// Keep everything on THIS machine: point agents at a local hub (nothing leaves the box).
+    #[arg(long, conflicts_with_all = ["team", "hub"])]
+    local: bool,
+    /// Like `--local`, but reachable by teammates on your network; generates a join secret.
+    #[arg(long, conflicts_with_all = ["local", "hub"])]
+    team: bool,
+    /// Advanced: dial this explicit hub URL instead of the shared/local one.
+    #[arg(long)]
+    hub: Option<String>,
+    /// Port for the `--local` / `--team` hub (default 7070).
+    #[arg(long, default_value_t = 7070)]
+    port: u16,
+    /// Display-name base for this machine's agents (default: the agent id, e.g. `codex`).
+    #[arg(long)]
+    name: Option<String>,
+    /// Join secret required by a secret-gated hub (pair with `--hub`). `--team` mints one for you.
+    #[arg(long)]
+    join_secret: Option<String>,
+    /// Don't write anything — just print the config snippet to paste yourself.
+    #[arg(long)]
+    print: bool,
+    /// List detected agents and their current Parler status; write nothing.
+    #[arg(long)]
+    list: bool,
+    /// Emit machine-readable JSON (used by the Parler desktop app).
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -397,6 +439,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Hub(a) => cmd_hub(a).await,
+        Cmd::Connect(a) => cmd_connect(a),
         Cmd::Init(a) => cmd_init(a),
         Cmd::Invite(a) => cmd_invite(a).await,
         Cmd::Join { code } => cmd_join(code).await,
@@ -454,11 +497,18 @@ async fn cmd_hub(a: HubArgs) -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .try_init();
-    let store = parler_hub::Store::open(a.db.as_deref().map(std::path::Path::new))?;
+    // `--local` makes a bare `parler hub` persistent: default the db under ~/.parler so a loopback
+    // hub survives restarts (agents resume from their durable cursors) without extra flags.
+    let db = if a.local && a.db.is_none() {
+        Some(parler_connector::home_dir().join("hub.sqlite").to_string_lossy().into_owned())
+    } else {
+        a.db.clone()
+    };
+    let store = parler_hub::Store::open(db.as_deref().map(std::path::Path::new))?;
     let public_url = a.url.unwrap_or_else(|| format!("parler://{}", a.addr));
     let mode = if a.public { parler_hub::HubMode::Public } else { parler_hub::HubMode::Private };
     let mut state = parler_hub::HubState::new(store, public_url, a.name, mode);
-    if let Some(db) = &a.db {
+    if let Some(db) = &db {
         state.blob_dir = std::path::PathBuf::from(format!("{db}.blobs"));
     }
     state.join_secret = a.join_secret.filter(|s| !s.is_empty());
@@ -471,9 +521,30 @@ async fn cmd_hub(a: HubArgs) -> Result<()> {
         "parler-hub up · ws://{actual}/ws · {} hub '{}' · db: {}",
         state.mode.as_str(),
         state.name,
-        a.db.as_deref().unwrap_or(":memory:")
+        db.as_deref().unwrap_or(":memory:")
     );
     parler_hub::serve(listener, state).await
+}
+
+fn cmd_connect(a: ConnectArgs) -> Result<()> {
+    let hub = if let Some(u) = a.hub {
+        connect::Hub::Explicit(u)
+    } else if a.team {
+        connect::Hub::Team { port: a.port }
+    } else if a.local {
+        connect::Hub::Local { port: a.port }
+    } else {
+        connect::Hub::Shared
+    };
+    connect::run(connect::Options {
+        hosts: a.hosts,
+        hub,
+        name: a.name,
+        join_secret: a.join_secret,
+        print: a.print,
+        list: a.list,
+        json: a.json,
+    })
 }
 
 fn cmd_init(a: InitArgs) -> Result<()> {

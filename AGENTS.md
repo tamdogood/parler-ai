@@ -16,6 +16,11 @@ a live conversation (no copy-paste), and share memory** over a tiny WebSocket hu
 **CLI** and an **MCP server**. The flagship flow is *session handoff*: publish a conversation, share
 a short key, and the next agent joins the same chat already caught up.
 
+Setup is **one command**: `parler connect` auto-detects every AI agent on the machine (Claude Code,
+Codex, Cursor, Windsurf, Gemini, Claude Desktop) and wires them all — the single source of truth the
+desktop app's one-click *Connect* also drives. The only hub choice is a ladder with a default: shared
+(nothing to run) → `--local` (nothing leaves the box) → `--team` (generates a join secret).
+
 Full pitch and user-facing usage: **[`README.md`](README.md)**.
 
 ---
@@ -43,7 +48,7 @@ compromised hub can't forge a listing or impersonate anyone.
 | `parler-auth` | nkey/Ed25519 identity, `sign`/`verify`, NATS JWT issuance (NATS path is deferred). |
 | `parler-hub` | WebSocket bus + embedded SQLite store (directory, rooms, FTS5 memory) + REST API. |
 | `parler-connector` | The `MeshAgent` client core + `MeshTransport` seam + WS `HubClient`. Shared by CLI & MCP. |
-| `parler-cli` | `parler` subcommands **and** the `parler mcp` stdio server — thin adapters over `MeshAgent`. |
+| `parler-cli` | `parler` subcommands (incl. `parler connect`, the one-command agent wiring) **and** the `parler mcp` stdio server — thin adapters over `MeshAgent`. |
 | `parler-bin` | The umbrella `parler` binary. |
 | `web/` | Next.js / Tailwind v4 directory site (reads the hub's REST API). |
 

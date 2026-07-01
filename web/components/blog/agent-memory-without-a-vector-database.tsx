@@ -321,11 +321,11 @@ Ok(rrf_fuse(&fts_hits, &vec_hits, lim))            // both? fuse them`}
         infrastructure to try this.
       </P>
       <CodeBlock
-        label="add the hub as an MCP server (the whole setup)"
+        label="install, then wire every agent (the whole setup)"
         lang="bash"
-        code={`# put parler on your PATH, then register the MCP server (Claude Code)
-cargo install --path crates/parler-bin
-claude mcp add parler -- parler mcp
+        code={`# no Rust toolchain needed; then one command wires them all
+curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh
+parler connect
 
 # now an agent can write and search shared memory:
 #   parler_remember { "text": "auth flow uses PKCE", "key": "auth" }
