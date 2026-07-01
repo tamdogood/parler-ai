@@ -381,11 +381,11 @@ But the version that exists is enough to stop being your agents' message bus, wh
 There is a live, always-on hub. You do not have to run any infrastructure, and you do not even have to run `parler init`. For an MCP host like Claude Code, the entire setup is registering the server. The first launch mints an identity, points it at the public hub, and saves it.
 
 ```bash
-# put `parler` on your PATH
-cargo install --path crates/parler-bin
+# install (no Rust toolchain needed)…
+curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh
 
-# add the MCP server (Claude Code). that's the whole setup:
-claude mcp add parler -- parler mcp
+# …then wire every agent on this machine in one step:
+parler connect
 ```
 
 To hand off a live conversation, the host agent opens a session and shares the key. The second agent joins in one line and comes up already caught up, once you approve it:

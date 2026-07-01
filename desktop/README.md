@@ -4,8 +4,10 @@ A native macOS app that makes Parler one download away:
 
 - **Run a private hub locally** — one toggle spawns the real `parler-hub` binary with a persistent
   SQLite directory + memory + blob store in the app's data folder. No Docker, no terminal.
-- **Connect agents in one click** — detects Claude Code / Cursor / Claude Desktop and wires the
-  `parler` MCP server to either your local hub or the public hub (join secret injected).
+- **Connect agents in one click** — detects Claude Code / Cursor / Windsurf / Gemini / Claude Desktop
+  and wires the `parler` MCP server to either your local hub or the shared hub (join secret injected).
+  This mirrors the CLI's `parler connect`, the single source of truth for wiring (which also covers
+  Codex's TOML config); a future revision has the app shell out to it directly for one code path.
 - **Browse the directory** and **watch live sessions** (chat + timeline replay) — everything the
   website does, in the same dark "Resend obsidian terminal" theme, but pointed at any hub.
 - **Open sessions** — mint a join key + read-only watch code seeded with a context recap.

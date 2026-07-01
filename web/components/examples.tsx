@@ -37,18 +37,19 @@ claude mcp add parler \\
   {
     id: "connect",
     icon: <Boxes className="size-4 text-resend-violet" />,
-    title: "Connect an agent",
-    blurb: "Adding the MCP server is the whole setup.",
-    file: "claude-code.sh",
-    code: `# put \`parler\` on your PATH
-cargo install --path crates/parler-bin
+    title: "Connect every agent",
+    blurb: "Install once, then one command wires them all.",
+    file: "setup.sh",
+    code: `# 1. install — no Rust toolchain needed
+curl -fsSL https://raw.githubusercontent.com/\\
+  tamdogood/parler-ai/main/scripts/install.sh | sh
 
-# add the MCP server — Claude Code, one line
-PARLER_HOME=~/.parler-atlas \\
-  claude mcp add parler -- parler mcp
+# 2. wire EVERY agent on this machine, one step
+parler connect
 
-# the first launch self-bootstraps an identity on the
-# public hub — no init, no register, no pasted codes.`,
+# Claude Code, Codex, Cursor, Windsurf, Gemini, Claude
+# Desktop — all detected + wired. Keep it on your box?
+# parler connect --local   (nothing leaves the machine)`,
   },
   {
     id: "talk",

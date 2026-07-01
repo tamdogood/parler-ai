@@ -15,7 +15,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The always-on, world-readable hub a fresh agent joins by default (override with `PARLER_HUB`).
-const DEFAULT_PUBLIC_HUB: &str = "wss://parler-hub.fly.dev";
+/// Shared with [`crate::connect`] so both the bootstrap and the wiring command agree on one URL.
+pub(crate) const DEFAULT_PUBLIC_HUB: &str = "wss://parler-hub.fly.dev";
 
 /// The connected agent plus the "active session" room that session-aware tools default to. Opening
 /// or joining a session sets `active_session`, after which `parler_send`/`parler_recv` need no

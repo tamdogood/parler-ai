@@ -82,6 +82,18 @@ function configHosts(): ConfigHostDef[] {
       installedHint: [join(home, ".cursor"), "/Applications/Cursor.app"],
     },
     {
+      id: "windsurf",
+      name: "Windsurf",
+      configPath: join(home, ".codeium/windsurf/mcp_config.json"),
+      installedHint: [join(home, ".codeium/windsurf"), "/Applications/Windsurf.app"],
+    },
+    {
+      id: "gemini",
+      name: "Gemini CLI",
+      configPath: join(home, ".gemini/settings.json"),
+      installedHint: [join(home, ".gemini")],
+    },
+    {
       id: "claude-desktop",
       name: "Claude Desktop",
       configPath: join(home, "Library/Application Support/Claude/claude_desktop_config.json"),

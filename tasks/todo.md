@@ -1,3 +1,67 @@
+# Task: One good way to set up Parler — kill the fragmentation — 2026-07-01
+
+**User:** "too technical & hard to set up even for an SE; too cumbersome for little reward. I don't
+know when to set up for Claude vs Hermes vs Codex — everything's fragmented. I just need ONE good way
+to set it up for all agents. Public vs private hub is also too technical and I'm lost." → implement
+all the recommendations, veteran security/network/Rust standard.
+
+**Root causes (grounded in the code):** (1) "zero setup" actually needs the Rust toolchain
+(`cargo install --path`); no prebuilt binary. (2) 5 hosts, 5 config locations, only Claude has a
+one-liner; Codex/Gemini/Hermes have no automated path anywhere. (3) The only auto-wiring logic lives
+in the Electron app (`desktop/src/main/mcp.ts`) and knows just Claude/Cursor/Claude-Desktop — the CLI
+has no `connect`. (4) "public vs private hub" forces an infra decision (hubs, join secrets, wss)
+before you've said hello.
+
+## 1. `parler connect` — the one command (single source of truth)
+- [ ] `crates/parler-cli/src/connect.rs`: host registry + JSON/TOML/claude-cli writers, tests.
+- [ ] Auto-detect & wire Claude Code, Codex, Cursor, Windsurf, Gemini, Claude Desktop; per-host
+      identity home (`~/.parler/agents/<id>`) assigned automatically (kills PARLER_HOME juggling).
+- [ ] Hub *ladder*, not a fork: default **shared**; `--local` (loopback, nothing leaves); `--team`
+      (generates a join secret, prints teammate line). Reuse `parler_hub::random_secret()`.
+- [ ] Unknown host (`parler connect hermes`) + `--print` → portable paste-snippet. `--json` (desktop),
+      `--list`. Idempotent writes that never clobber other MCP servers.
+- [ ] Honest one-line confidentiality note; `parler hub --local` sugar for a clean instruction.
+
+## 2. A real install (no Rust toolchain)
+- [ ] `scripts/install.sh` (curl | sh) + `.github/workflows/release-cli.yml` (macOS arm64/x64 + Linux)
+      + `packaging/homebrew/parler.rb`.
+
+## 3. Reframe docs — README Quickstart → install + `parler connect` + hub ladder; delete Options A/B/C.
+
+## 4. Desktop = same code path — `mcp.ts` delegates to bundled `parler connect --json` (Codex/Gemini free).
+
+## Gate: `CI_SKIP_WEB=1 make ci` green (build·clippy -D warnings·test·doc·deny). Never `cargo fmt`.
+
+## Review — DONE & VERIFIED (2026-07-01) ✅
+
+Collapsed setup from "install Rust → hand-edit per-agent configs → choose public/private hub" to
+**install once → `parler connect`**, and reframed the hub model as a ladder with a default.
+
+- **`parler connect`** (`crates/parler-cli/src/connect.rs`, +8 unit tests) — one command auto-detects
+  and wires Claude Code, Codex, Cursor, Windsurf, Gemini, Claude Desktop; unknown host (`connect
+  hermes`) / `--print` → portable snippet; `--list`, `--json` (desktop). **Idempotent, never clobbers
+  other MCP servers** (JSON merge + format-preserving `toml_edit` for Codex), `0600` on every file we
+  author, absolute exe path baked in, per-host identity home (`~/.parler/agents/<id>`). Hub ladder:
+  default **shared** → `--local` (loopback, nothing leaves; `parler hub --local` sugar added) →
+  `--team` (mints + prints a join secret via `parler_hub::random_secret`, detects LAN IP). Added
+  `--join-secret`/`--hub` (fills a real gap: a secret-gated hub had no client-side secret flag).
+- **Real install** — `scripts/install.sh` (checksum-verified `curl|sh`, no Rust), `release-cli.yml`
+  (macOS arm64/x64 + Linux x64, uploads to the Release), `packaging/homebrew/parler.rb`.
+- **Docs + website** — README Quickstart → two-line install + `parler connect` + the ladder table
+  (deleted Options A/B/C); reframed Connect + env-var sections; security caveat leads with one plain
+  sentence; AGENTS.md + docs/agent-mesh.md; website examples/download/faq + both blog components/mirrors.
+- **Desktop** — extended detection+wiring to Windsurf + Gemini (safe data addition to the existing
+  JSON path); README notes `parler connect` is the shared brain. *Full CLI-delegation + Codex-in-GUI
+  left as a follow-up (needs GUI smoke test + a connect `remove`/enriched `--list`).*
+
+**Verified:** `CI_SKIP_WEB=1 make ci` → "all gates passed" (build·clippy -D warnings·test·doc·
+cargo-deny incl. new `toml_edit`); 8/8 connect tests; live binary smoke — `--list`, `--print`, real
+Codex TOML write (twice: idempotent, `# comment` + `model` + `[mcp_servers.other]` preserved, clean
+`[mcp_servers.parler]`, `0600`), `--local`/`--team` messaging (secret + LAN teammate line); `cd web &&
+npm run build` green. **Not GUI-tested:** the desktop app (Electron; change is a typed data addition).
+
+---
+
 # Task: Parler Desktop — SIMPLIFY for 10/10 UX (declutter) — 2026-06-30
 
 **User:** too many features/buttons; clunky & cluttered. Simplify as much as possible, still intuitive.

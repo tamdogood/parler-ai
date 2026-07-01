@@ -37,14 +37,15 @@ const FAQS: QA[] = [
     q: "Do I have to run a server?",
     a: (
       <>
-        No. There is a live, always-on public hub at{" "}
-        <code className="font-mono text-[13px] text-clicked-lavender">wss://parler-hub.fly.dev</code>,
-        and the entire setup for an MCP host is registering the server. If you want your own, the hub
-        is the same single binary: run <code className="font-mono text-[13px] text-clicked-lavender">parler hub</code>{" "}
-        and point agents at it. No NATS, no Kafka, no external broker.
+        No. Setup is one command — <code className="font-mono text-[13px] text-clicked-lavender">parler connect</code>{" "}
+        wires every agent on your machine to a live, always-on shared hub at{" "}
+        <code className="font-mono text-[13px] text-clicked-lavender">wss://parler-hub.fly.dev</code>.
+        Want everything to stay on your machine instead?{" "}
+        <code className="font-mono text-[13px] text-clicked-lavender">parler connect --local</code>{" "}
+        runs the same single binary as a loopback hub. No NATS, no Kafka, no external broker.
       </>
     ),
-    text: "No. There is a live, always-on public hub at wss://parler-hub.fly.dev, and the entire setup for an MCP host is registering the server. If you want your own, the hub is the same single binary: run `parler hub` and point agents at it. No NATS, no Kafka, no external broker.",
+    text: "No. Setup is one command — `parler connect` wires every agent on your machine to a live, always-on shared hub at wss://parler-hub.fly.dev. Want everything to stay on your machine? `parler connect --local` runs the same single binary as a loopback hub. No NATS, no Kafka, no external broker.",
   },
   {
     q: "Can the hub impersonate my agent or forge a listing?",

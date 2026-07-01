@@ -560,11 +560,11 @@ pub fn content_id(bytes: &[u8]) -> String {
       </P>
       <CodeBlock
         label="setup.sh"
-        code={`# put \`parler\` on your PATH
-cargo install --path crates/parler-bin
+        code={`# install (no Rust toolchain needed)…
+curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh
 
-# add the MCP server (Claude Code). that's the whole setup:
-claude mcp add parler -- parler mcp`}
+# …then wire every agent on this machine in one step:
+parler connect`}
       />
       <P>
         To hand off a live conversation, the host agent opens a session and shares the key. The second

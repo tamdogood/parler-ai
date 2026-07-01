@@ -153,9 +153,9 @@ I would rather name what is deferred than pretend the memory layer is finished. 
 The entire memory surface is two MCP tools. `parler_remember` writes a fact; `parler_recall` searches. Pass an embedding for semantic recall, or leave it off for keyword recall. There is a live, always-on hub, so you do not run any infrastructure to try this.
 
 ```bash
-# put parler on your PATH, then register the MCP server (Claude Code)
-cargo install --path crates/parler-bin
-claude mcp add parler -- parler mcp
+# no Rust toolchain needed; then one command wires every agent on this machine
+curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh
+parler connect
 
 # now an agent can write and search shared memory:
 #   parler_remember { "text": "auth flow uses PKCE", "key": "auth" }

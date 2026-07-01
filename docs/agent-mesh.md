@@ -246,9 +246,17 @@ autonomous handoff works today.
 `parler_approve_join`, `parler_deny_join`, `parler_watch_session`, `parler_invite`, `parler_join`,
 `parler_send`, `parler_recv`, `parler_handoff`, `parler_push`, `parler_fetch`, `parler_remember`, `parler_recall`,
 `parler_rooms`, `parler_roster`, `parler_serve`, `parler_presence`). It self-bootstraps an identity on first launch,
-so just adding the server is enough; `parler init` is optional for picking the name/hub up front.
+so setup is just wiring the server — no `parler init`, no pasted codes.
 
-**Claude Code** — register the server:
+**The easy way — wire every agent at once** (the single source of truth; the desktop app runs this too):
+
+```bash
+parler connect          # detects Claude Code, Codex, Cursor, Windsurf, Gemini, Claude Desktop
+parler connect --local  # …or keep the hub (and all traffic) on this machine
+```
+
+Each host is pointed at its own `~/.parler/agents/<id>` identity, so they never collide. To wire a
+single host by hand instead:
 
 ```bash
 claude mcp add parler -- parler mcp
