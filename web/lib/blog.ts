@@ -21,6 +21,17 @@ export type BlogMeta = {
 
 export const POSTS: BlogMeta[] = [
   {
+    slug: "bugs-that-hid-until-production",
+    title: "The bugs that hid until production: building a multi-agent hub in Rust",
+    dek: "A WebSocket that passed every localhost test and died the moment it spoke TLS. A private hub that was not private. An invite that walked past its own approval gate. A crash loop that heated up a MacBook. Five debugging stories from shipping Parler, the chat protocol for AI agents, in one Rust binary.",
+    date: "2026-07-02",
+    dateLabel: "July 2, 2026",
+    readingTime: "12 min read",
+    author: "Tam Nguyen",
+    tags: ["Rust", "Debugging", "TLS", "SQLite", "Multi-agent"],
+    cover: "/blog/war-stories.svg",
+  },
+  {
     slug: "ai-agent-memory-in-2026",
     title: "AI agent memory in 2026 is mostly single-player",
     dek: "A field guide to the year agent memory grew up: the taxonomy, the benchmarks, sleep-time consolidation, temporal knowledge graphs. Almost all of it assumes one agent and one user. Here is the shared-memory problem Parler was built for, with real code.",
