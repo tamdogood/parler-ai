@@ -35,7 +35,10 @@ export function SettingsScreen({
       </div>
 
       <Group title="Local hub">
-        <Row title="Start on launch" subtitle="Boot your private hub automatically when Parler opens.">
+        <Row title="Start Parler at login" subtitle="Launch in the background at login so the hub is up before your agents dial in.">
+          <Switch on={settings.startAtLogin} onChange={(v) => onUpdate({ startAtLogin: v })} />
+        </Row>
+        <Row title="Start hub on launch" subtitle="Boot your private hub automatically when Parler opens.">
           <Switch on={settings.autoStartHub} onChange={(v) => onUpdate({ autoStartHub: v })} />
         </Row>
         <Row title={settings.hubName} subtitle={`Port ${settings.hubPort} · ${settings.hubPublic ? "public" : "private"}`}>

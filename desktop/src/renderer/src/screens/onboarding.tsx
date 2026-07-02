@@ -3,8 +3,10 @@ import { ArrowRight, Check, Loader2, Terminal, ShieldCheck, Sparkles, AlertTrian
 import type { ConnectAllResult, HubStatus, McpHost } from "@shared/types";
 import { parler } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
+import { useHubUrl } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 import { CodeBlock } from "@/components/copyable";
+import { DialInList } from "@/components/dial-in";
 
 /** First-run setup: a welcome, then connect the first agent to the auto-started local hub. */
 export function Onboarding({
@@ -74,6 +76,7 @@ function ConnectFirst({ status, onFinish }: { status: HubStatus | null; onFinish
   const [snippet, setSnippet] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ConnectAllResult | null>(null);
+  const localUrl = useHubUrl("local", status);
 
   useEffect(() => {
     parler.agents.detectHosts().then((hs) => setInstalled(hs.filter((h) => h.installed)));
@@ -122,6 +125,12 @@ function ConnectFirst({ status, onFinish }: { status: HubStatus | null; onFinish
               <Check className="size-5 shrink-0" /> Connected {result?.connected} agent{(result?.connected ?? 0) > 1 ? "s" : ""}.
             </div>
             <p className="mt-1.5 text-[12.5px] text-delivered-green/90">Restart them to load Parler — then they appear under Agents.</p>
+            {localUrl && result && (
+              <DialInList
+                base={localUrl}
+                hosts={result.results.filter((r) => r.status === "wired").map((r) => ({ id: r.id, name: r.name }))}
+              />
+            )}
           </div>
         ) : hasAgents ? (
           <div className="rounded-[14px] border border-graphite-rail bg-void-black p-4">

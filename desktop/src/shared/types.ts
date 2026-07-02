@@ -16,6 +16,8 @@ export interface Settings {
   hubPort: number;
   /** Which hub the Connect flow targets by default. */
   connectTarget: HubTarget;
+  /** Launch Parler at login (kept hidden in the tray) so the hub is up before agents dial in. */
+  startAtLogin: boolean;
   /** Whether the first-run onboarding has been completed. */
   onboarded: boolean;
 }

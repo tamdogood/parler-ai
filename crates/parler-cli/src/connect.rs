@@ -77,6 +77,23 @@ pub struct Options {
     pub remove: bool,
     /// Emit machine-readable JSON (used by the desktop app).
     pub json: bool,
+    /// Whether a hub was chosen explicitly (`--shared`/`--local`/`--team`/`--hub`). When false — a
+    /// bare `parler connect` — a host that is already wired **keeps its current hub and join
+    /// secret** instead of being silently moved to the default, so a CLI re-run can't undo the hub
+    /// the desktop app (or an earlier `--local`/`--team` run) chose.
+    pub hub_pinned: bool,
+}
+
+/// One successfully wired agent, as [`run`] reports it back — everything `--verify` needs to watch
+/// the agent actually dial its hub.
+#[derive(Debug, Clone)]
+pub struct WiredAgent {
+    /// The display name written as `PARLER_NAME` (what the directory will show).
+    pub name: String,
+    /// The hub URL written as `PARLER_HUB`.
+    pub hub: String,
+    /// The join secret written alongside, when the hub is gated.
+    pub secret: Option<String>,
 }
 
 /// How a given MCP host stores its server config — the knowledge that used to be scattered across
@@ -153,6 +170,20 @@ fn registry() -> Vec<HostDef> {
     ]
 }
 
+/// How a host picks the new config up — per-host truth so "restart them" is never vague. Claude
+/// Code notably needs **no** restart: user-scope MCP servers load on the next session.
+fn restart_hint(id: &str) -> &'static str {
+    match id {
+        "claude-code" => "picks it up in your next session — no restart needed",
+        "codex" => "takes effect on the next `codex` run",
+        "gemini" => "takes effect on the next `gemini` run",
+        "cursor" => "restart Cursor (or toggle the parler server under Settings → MCP)",
+        "windsurf" => "restart Windsurf to load it",
+        "claude-desktop" => "quit and reopen Claude Desktop",
+        _ => "restart it to load Parler",
+    }
+}
+
 /// Map a user-typed host token to a known id, tolerating the obvious aliases.
 fn canonical_id(token: &str) -> Option<&'static str> {
     match token.trim().to_ascii_lowercase().replace([' ', '_'], "-").as_str() {
@@ -201,9 +232,10 @@ fn is_configured(def: &HostDef) -> bool {
     }
 }
 
-/// The `PARLER_HUB` a host is currently wired to (so `--list --json` can tell the desktop app whether
-/// an agent points at the local or the shared hub). Best-effort: `None` if unconfigured/unreadable.
-fn configured_hub(def: &HostDef) -> Option<String> {
+/// The hub a host is currently wired to, plus the join secret written beside it (so `--list --json`
+/// can tell the desktop app where an agent points, and a bare re-run can keep both). Best-effort:
+/// `None` if unconfigured/unreadable.
+fn configured_env(def: &HostDef) -> Option<(String, Option<String>)> {
     match &def.wiring {
         Wiring::ClaudeCli => {
             let claude = resolve_claude()?;
@@ -211,33 +243,33 @@ fn configured_hub(def: &HostDef) -> Option<String> {
             if !out.status.success() {
                 return None;
             }
-            parse_hub_from_text(&String::from_utf8_lossy(&out.stdout))
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let hub = parse_env_from_text(&text, "PARLER_HUB")?;
+            Some((hub, parse_env_from_text(&text, "PARLER_JOIN_SECRET")))
         }
-        Wiring::Json(path) => read_json(path)
-            .ok()?
-            .get("mcpServers")?
-            .get(SERVER_NAME)?
-            .get("env")?
-            .get("PARLER_HUB")?
-            .as_str()
-            .map(String::from),
+        Wiring::Json(path) => {
+            let root = read_json(path).ok()?;
+            let env = root.get("mcpServers")?.get(SERVER_NAME)?.get("env")?;
+            let hub = env.get("PARLER_HUB")?.as_str().map(String::from)?;
+            let secret = env.get("PARLER_JOIN_SECRET").and_then(Value::as_str).map(String::from);
+            Some((hub, secret))
+        }
         Wiring::Toml(path) => {
             let doc: toml_edit::DocumentMut = std::fs::read_to_string(path).ok()?.parse().ok()?;
-            doc.get("mcp_servers")?
-                .get(SERVER_NAME)?
-                .get("env")?
-                .get("PARLER_HUB")?
-                .as_str()
-                .map(String::from)
+            let env = doc.get("mcp_servers")?.get(SERVER_NAME)?.get("env")?;
+            let hub = env.get("PARLER_HUB")?.as_str().map(String::from)?;
+            let secret =
+                env.get("PARLER_JOIN_SECRET").and_then(|v| v.as_str()).map(String::from);
+            Some((hub, secret))
         }
     }
 }
 
-/// Pull the first `PARLER_HUB=<value>` (or `: <value>`) token out of free-form text — used to read the
-/// hub back from `claude mcp get`'s human output without pulling in a regex dependency.
-fn parse_hub_from_text(s: &str) -> Option<String> {
-    let idx = s.find("PARLER_HUB")?;
-    let rest = s[idx + "PARLER_HUB".len()..].trim_start_matches([':', '=', ' ', '"']);
+/// Pull the first `<key>=<value>` (or `<key>: <value>`) token out of free-form text — used to read
+/// env vars back from `claude mcp get`'s human output without pulling in a regex dependency.
+fn parse_env_from_text(s: &str, key: &str) -> Option<String> {
+    let idx = s.find(key)?;
+    let rest = s[idx + key.len()..].trim_start_matches([':', '=', ' ', '"']);
     let val: String = rest
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ',')
@@ -290,7 +322,7 @@ fn write_json(path: &Path, env: &[(String, String)], binpath: &str) -> Result<()
 
 /// Write our server into a TOML `[mcp_servers.parler]` table (Codex), preserving comments + others.
 fn write_toml(path: &Path, env: &[(String, String)], binpath: &str) -> Result<()> {
-    use toml_edit::DocumentMut;
+    use toml_edit::{DocumentMut, Item, Table};
     let mut doc: DocumentMut = if path.exists() {
         std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?
@@ -299,8 +331,13 @@ fn write_toml(path: &Path, env: &[(String, String)], binpath: &str) -> Result<()
     } else {
         DocumentMut::new()
     };
+    // Materialize `mcp_servers` as a real (implicit) table first: indexing it into existence on a
+    // doc that doesn't have one yields an empty inline `mcp_servers = {}` that drops our entry.
+    let mut holder = Table::new();
+    holder.set_implicit(true);
+    let servers = doc.entry("mcp_servers").or_insert(Item::Table(holder));
     // Replace our table wholesale (idempotent) while leaving the user's other servers untouched.
-    doc["mcp_servers"][SERVER_NAME] = parler_toml_item(env, binpath);
+    servers[SERVER_NAME] = parler_toml_item(env, binpath);
     write_secure(path, &doc.to_string())
 }
 
@@ -501,10 +538,15 @@ struct Report {
     status: &'static str, // wired | printed | error
     detail: String,
     config: Option<String>,
+    /// The hub this host was wired to (differs from the run's default when it was kept).
+    hub: Option<String>,
+    /// True when a bare re-run preserved the host's previously configured hub + secret.
+    kept: bool,
 }
 
-/// `parler connect` entry point.
-pub fn run(opts: Options) -> Result<()> {
+/// `parler connect` entry point. Returns the successfully wired agents so the caller can offer to
+/// `--verify` them (watch each one dial its hub).
+pub fn run(opts: Options) -> Result<Vec<WiredAgent>> {
     let binpath = binary_path();
     let hub_url = opts.hub.url();
     // An explicit secret wins; otherwise `--team` mints one. Any other mode has no secret.
@@ -515,11 +557,13 @@ pub fn run(opts: Options) -> Result<()> {
         .or_else(|| matches!(opts.hub, Hub::Team { .. }).then(parler_hub::random_secret));
 
     if opts.list {
-        return print_list(opts.json);
+        print_list(opts.json)?;
+        return Ok(Vec::new());
     }
 
     if opts.remove {
-        return run_remove(&opts);
+        run_remove(&opts)?;
+        return Ok(Vec::new());
     }
 
     // Resolve the set of targets.
@@ -550,10 +594,17 @@ pub fn run(opts: Options) -> Result<()> {
 
     let mut reports: Vec<Report> = Vec::new();
     let mut snippets: Vec<(String, String)> = Vec::new();
+    let mut wired: Vec<WiredAgent> = Vec::new();
     for t in &targets {
         match t {
             Target::Known(def) => {
-                let env = env_for(def.id, &opts, &hub_url, secret.as_deref());
+                // A bare re-run keeps an already-wired host on its current hub (+ its secret); an
+                // explicit hub flag moves everyone to the chosen hub.
+                let kept_env = if opts.hub_pinned { None } else { configured_env(def) };
+                let kept = kept_env.is_some();
+                let (host_hub, host_secret) =
+                    kept_env.unwrap_or_else(|| (hub_url.clone(), secret.clone()));
+                let env = env_for(def.id, &opts, &host_hub, host_secret.as_deref());
                 if opts.print {
                     snippets.push((def.name.to_string(), snippet_for(def, &env, &binpath)));
                     reports.push(Report {
@@ -562,22 +613,35 @@ pub fn run(opts: Options) -> Result<()> {
                         status: "printed",
                         detail: "snippet printed".into(),
                         config: None,
+                        hub: Some(host_hub),
+                        kept,
                     });
                 } else {
                     match wire(def, &env, &binpath) {
-                        Ok(where_) => reports.push(Report {
-                            id: def.id.into(),
-                            name: def.name.into(),
-                            status: "wired",
-                            detail: where_.clone(),
-                            config: Some(where_),
-                        }),
+                        Ok(where_) => {
+                            wired.push(WiredAgent {
+                                name: opts.name.clone().unwrap_or_else(|| def.id.to_string()),
+                                hub: host_hub.clone(),
+                                secret: host_secret.clone(),
+                            });
+                            reports.push(Report {
+                                id: def.id.into(),
+                                name: def.name.into(),
+                                status: "wired",
+                                detail: where_.clone(),
+                                config: Some(where_),
+                                hub: Some(host_hub),
+                                kept,
+                            });
+                        }
                         Err(e) => reports.push(Report {
                             id: def.id.into(),
                             name: def.name.into(),
                             status: "error",
                             detail: format!("{e}"),
                             config: None,
+                            hub: Some(host_hub),
+                            kept,
                         }),
                     }
                 }
@@ -591,6 +655,8 @@ pub fn run(opts: Options) -> Result<()> {
                     status: "printed",
                     detail: "snippet printed".into(),
                     config: None,
+                    hub: Some(hub_url.clone()),
+                    kept: false,
                 });
             }
         }
@@ -601,7 +667,7 @@ pub fn run(opts: Options) -> Result<()> {
     } else {
         emit_human(&opts, &hub_url, secret.as_deref(), &reports, &snippets);
     }
-    Ok(())
+    Ok(wired)
 }
 
 /// `parler connect --remove` — the inverse of a wire. Unwires the named hosts, or every configured
@@ -636,6 +702,8 @@ fn run_remove(opts: &Options) -> Result<()> {
                     status: "removed",
                     detail: "removed".into(),
                     config: None,
+                    hub: None,
+                    kept: false,
                 }),
                 Ok(false) => reports.push(Report {
                     id: def.id.into(),
@@ -643,6 +711,8 @@ fn run_remove(opts: &Options) -> Result<()> {
                     status: "not-configured",
                     detail: "wasn't connected".into(),
                     config: None,
+                    hub: None,
+                    kept: false,
                 }),
                 Err(e) => reports.push(Report {
                     id: def.id.into(),
@@ -650,6 +720,8 @@ fn run_remove(opts: &Options) -> Result<()> {
                     status: "error",
                     detail: format!("{e}"),
                     config: None,
+                    hub: None,
+                    kept: false,
                 }),
             },
             Target::Unknown(name) => reports.push(Report {
@@ -658,6 +730,8 @@ fn run_remove(opts: &Options) -> Result<()> {
                 status: "not-configured",
                 detail: "unknown host — nothing to remove".into(),
                 config: None,
+                hub: None,
+                kept: false,
             }),
         }
     }
@@ -716,7 +790,11 @@ fn emit_human(opts: &Options, hub_url: &str, secret: Option<&str>, reports: &[Re
         Hub::Explicit(_) => "the hub you named".to_string(),
     };
     println!("\nParler · connecting your agents to {where_}");
-    println!("         {hub_url}\n");
+    println!("         {hub_url}");
+    if !opts.hub_pinned && reports.iter().any(|r| r.kept) {
+        println!("         (already-wired agents keep their hub — move them with --shared / --local / --team)");
+    }
+    println!();
 
     let installed_ids: Vec<&'static str> = registry().iter().filter(|d| is_installed(d)).map(|d| d.id).collect();
     for r in reports {
@@ -725,7 +803,13 @@ fn emit_human(opts: &Options, hub_url: &str, secret: Option<&str>, reports: &[Re
             "error" => "  ✗",
             _ => "  ·",
         };
-        println!("{mark} {:<15} {}", r.name, r.detail);
+        // Name the hub inline whenever it isn't the run's default, so a kept host is never a surprise.
+        let hub_note = match &r.hub {
+            Some(h) if r.kept => format!("  → {h} (kept)"),
+            Some(h) if h != hub_url => format!("  → {h}"),
+            _ => String::new(),
+        };
+        println!("{mark} {:<15} {}{hub_note}", r.name, r.detail);
     }
     // In an auto run, name the known hosts we skipped because they weren't detected.
     if opts.hosts.is_empty() && !opts.print {
@@ -745,7 +829,12 @@ fn emit_human(opts: &Options, hub_url: &str, secret: Option<&str>, reports: &[Re
 
     let wired = reports.iter().any(|r| r.status == "wired");
     if wired {
-        println!("\nRestart those apps to load Parler. Each agent gets its own identity under {}.", display_path(&parler_root().join("agents")));
+        println!("\nLoad it — per host:");
+        for r in reports.iter().filter(|r| r.status == "wired") {
+            println!("  {:<15} {}", r.name, restart_hint(&r.id));
+        }
+        println!("\nEach agent gets its own identity under {}.", display_path(&parler_root().join("agents")));
+        println!("Watch them come online:  parler connect --verify   (or check later: parler connect --list)");
     }
 
     // The hub-run + teammate instructions, only where they apply.
@@ -777,7 +866,8 @@ fn emit_human(opts: &Options, hub_url: &str, secret: Option<&str>, reports: &[Re
 fn emit_json(opts: &Options, hub_url: &str, secret: Option<&str>, binpath: &str, reports: &[Report], snippets: &[(String, String)]) {
     let results: Vec<Value> = reports
         .iter()
-        .map(|r| json!({ "id": r.id, "name": r.name, "status": r.status, "detail": r.detail, "config": r.config }))
+        .map(|r| json!({ "id": r.id, "name": r.name, "status": r.status, "detail": r.detail, "config": r.config,
+                          "hub": r.hub, "kept": r.kept, "restart": restart_hint(&r.id) }))
         .collect();
     let snips: Vec<Value> = snippets.iter().map(|(l, t)| json!({ "label": l, "text": t })).collect();
     let run_hub = match &opts.hub {
@@ -816,7 +906,7 @@ fn print_list(as_json: bool) -> Result<()> {
                     Wiring::Json(p) | Wiring::Toml(p) => display_path(p),
                 };
                 let connected = is_configured(d);
-                let hub = connected.then(|| configured_hub(d)).flatten();
+                let hub = connected.then(|| configured_env(d)).flatten().map(|(h, _)| h);
                 json!({ "id": d.id, "name": d.name, "installed": is_installed(d), "connected": connected, "config": path, "hub": hub })
             })
             .collect();
@@ -969,6 +1059,20 @@ mod tests {
     }
 
     #[test]
+    fn toml_write_works_on_a_fresh_file() {
+        // Regression: on a doc with no `[mcp_servers.*]` yet, plain index-assignment used to leave
+        // an empty inline `mcp_servers = {}` and silently drop our entry (fresh Codex install).
+        let path = tmp("codex-fresh").join("config.toml");
+        write_toml(&path, &env(), "/usr/local/bin/parler").unwrap();
+        let txt = std::fs::read_to_string(&path).unwrap();
+        let doc: toml_edit::DocumentMut = txt.parse().unwrap();
+        assert_eq!(doc["mcp_servers"]["parler"]["command"].as_str(), Some("/usr/local/bin/parler"));
+        assert_eq!(doc["mcp_servers"]["parler"]["env"]["PARLER_HUB"].as_str(), Some("wss://parler-hub.fly.dev"));
+        assert!(txt.contains("[mcp_servers.parler]"), "must render as a real table header");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn remove_json_drops_only_our_entry() {
         let path = tmp("rm-json").join("mcp.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1009,17 +1113,67 @@ mod tests {
     }
 
     #[test]
-    fn parse_hub_from_text_reads_the_wired_hub() {
-        assert_eq!(
-            parse_hub_from_text("PARLER_HOME=/x\nPARLER_HUB=ws://127.0.0.1:7071\nPARLER_NAME=cursor"),
-            Some("ws://127.0.0.1:7071".to_string())
-        );
+    fn parse_env_from_text_reads_the_wired_values() {
+        let text = "PARLER_HOME=/x\nPARLER_HUB=ws://127.0.0.1:7071\nPARLER_JOIN_SECRET=s3cr3t\nPARLER_NAME=cursor";
+        assert_eq!(parse_env_from_text(text, "PARLER_HUB"), Some("ws://127.0.0.1:7071".to_string()));
+        assert_eq!(parse_env_from_text(text, "PARLER_JOIN_SECRET"), Some("s3cr3t".to_string()));
         // Tolerate the `KEY: value` shape claude's human output uses.
         assert_eq!(
-            parse_hub_from_text("  PARLER_HUB: wss://parler-hub.fly.dev  "),
+            parse_env_from_text("  PARLER_HUB: wss://parler-hub.fly.dev  ", "PARLER_HUB"),
             Some("wss://parler-hub.fly.dev".to_string())
         );
-        assert_eq!(parse_hub_from_text("nothing here"), None);
+        assert_eq!(parse_env_from_text("nothing here", "PARLER_HUB"), None);
+        assert_eq!(parse_env_from_text(text, "PARLER_ROLE"), None);
+    }
+
+    #[test]
+    fn configured_env_reads_hub_and_secret_back() {
+        // JSON host (cursor-style).
+        let jpath = tmp("cfg-env-json").join("mcp.json");
+        let mut env_with_secret = env();
+        env_with_secret.push(("PARLER_JOIN_SECRET".into(), "shh".into()));
+        write_json(&jpath, &env_with_secret, "/bin/parler").unwrap();
+        let jdef = HostDef {
+            id: "cursor",
+            name: "Cursor",
+            wiring: Wiring::Json(jpath.clone()),
+            hints: vec![],
+        };
+        assert_eq!(
+            configured_env(&jdef),
+            Some(("wss://parler-hub.fly.dev".to_string(), Some("shh".to_string())))
+        );
+
+        // TOML host (codex-style), no secret.
+        let tpath = tmp("cfg-env-toml").join("config.toml");
+        write_toml(&tpath, &env(), "/bin/parler").unwrap();
+        let tdef = HostDef {
+            id: "codex",
+            name: "Codex",
+            wiring: Wiring::Toml(tpath.clone()),
+            hints: vec![],
+        };
+        assert_eq!(configured_env(&tdef), Some(("wss://parler-hub.fly.dev".to_string(), None)));
+
+        // Unconfigured → None.
+        let missing = HostDef {
+            id: "cursor",
+            name: "Cursor",
+            wiring: Wiring::Json(tmp("cfg-env-none").join("mcp.json")),
+            hints: vec![],
+        };
+        assert_eq!(configured_env(&missing), None);
+
+        std::fs::remove_dir_all(jpath.parent().unwrap()).ok();
+        std::fs::remove_dir_all(tpath.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn every_known_host_has_a_specific_restart_hint() {
+        for d in registry() {
+            assert_ne!(restart_hint(d.id), restart_hint("something-unknown"),
+                "{} should have a per-host load hint", d.id);
+        }
     }
 
     #[test]
@@ -1082,6 +1236,7 @@ mod tests {
             list: false,
             remove: false,
             json: false,
+            hub_pinned: false,
         };
         let with = env_for("codex", &opts, "wss://h", Some("s3cr3t"));
         assert!(with.iter().any(|(k, v)| k == "PARLER_JOIN_SECRET" && v == "s3cr3t"));
