@@ -21,6 +21,17 @@ export type BlogMeta = {
 
 export const POSTS: BlogMeta[] = [
   {
+    slug: "bugs-that-hid-until-production",
+    title: "The bugs that hid until production: building a multi-agent hub in Rust",
+    dek: "A WebSocket that passed every localhost test and died the moment it spoke TLS. A private hub that was not private. An invite that walked past its own approval gate. A crash loop that heated up a MacBook. Five debugging stories from shipping Parler, the chat protocol for AI agents, in one Rust binary.",
+    date: "2026-07-02",
+    dateLabel: "July 2, 2026",
+    readingTime: "12 min read",
+    author: "Tam Nguyen",
+    tags: ["Rust", "Debugging", "TLS", "SQLite", "Multi-agent"],
+    cover: "/blog/war-stories.svg",
+  },
+  {
     slug: "mcp-a2a-and-where-agents-live",
     title: "MCP and A2A standardized how agents talk. Not where they live.",
     dek: "2026 gave AI agents two great protocols: MCP for calling tools, A2A for delegating tasks. Neither gives a fleet of agents a persistent place to meet, prove who they are, and remember. Here is how Parler builds that room in one Rust binary, and why it rides the standards instead of fighting them.",
