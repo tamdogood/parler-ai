@@ -2,7 +2,7 @@ import { ipcMain, shell, clipboard, app } from "electron";
 import { PUBLIC_HUB, type HubTarget } from "../shared/types";
 import { CH } from "../shared/channels";
 import { HubSupervisor } from "./hub-supervisor";
-import { loadSettings, saveSettings } from "./settings";
+import { loadSettings, saveSettings, syncLoginItem } from "./settings";
 import { parlerBinary, dataDir } from "./paths";
 import * as mcp from "./mcp";
 import * as cli from "./parler-cli";
@@ -58,7 +58,14 @@ export function registerIpc(supervisor: HubSupervisor): void {
   ipcMain.handle(CH.appVersion, () => app.getVersion());
 
   ipcMain.handle(CH.settingsGet, () => loadSettings());
-  ipcMain.handle(CH.settingsSet, (_e, patch) => saveSettings(patch));
+  ipcMain.handle(CH.settingsSet, (_e, patch) => {
+    const next = saveSettings(patch);
+    // Keep the OS login item in lockstep whenever the toggle changes.
+    if (patch && Object.prototype.hasOwnProperty.call(patch, "startAtLogin")) {
+      syncLoginItem(next.startAtLogin);
+    }
+    return next;
+  });
 
   ipcMain.handle(CH.hubStatus, () => supervisor.getStatus());
   ipcMain.handle(CH.hubStart, () => supervisor.start());

@@ -721,3 +721,82 @@ async SQLite spawn_blocking). None of the existing posts own this cluster.
 - Verified: npm run build GREEN (27/27 static pages); next start smoke — post 200 (correct
   <title>), cover 200 image/svg+xml, index lists it, sitemap+RSS include it, OG card 200 PNG.
 - Memory updated: parler-blog-content-strategy (added post #0, refreshed untapped angles).
+
+---
+
+# 2026-07-02 — UX streamline, tranche 1 (from the connect/hub/rent-an-agent audit)
+
+Scope for this tranche: the quick-win tier of the UX audit (CLI + small desktop pieces). The
+medium/big items (approvals inbox, team mode in app, `parler work` rental daemon, card offers,
+website hire flow) go to `tasks/backlog.md` as scoped entries.
+
+## Plan
+- [x] CLI zero-setup: every networked CLI command self-bootstraps an identity (same path as
+      `parler mcp`) instead of erroring "run parler init"
+- [x] `parler connect` re-run preserves each already-wired host's hub + join secret unless a hub
+      flag (`--shared`/`--local`/`--team`/`--hub`) is passed; report shows the hub per host
+- [x] Per-host "load it" guidance (Claude Code = next session; Cursor/Windsurf/Desktop = restart…)
+      in human + `--json` output
+- [x] `parler connect --verify`: after wiring, wait and report each agent as it dials the hub
+      (polls `discover` per target hub; timeout flag)
+- [x] `parler send/handoff/push --to <name>`: resolve a directory name to an agent id when the
+      value isn't an nkey id (unique match required; helpful error otherwise)
+- [x] `parler session requests/approve/deny/watch`: `--room` defaults to the active session
+      (parity with the MCP tools)
+- [x] `parler consolidate`: update the hardcoded legacy Anthropic model id → `claude-haiku-4-5-20251001`
+- [x] Desktop: "Start Parler at login" setting (hub survives reboot)
+- [x] Desktop: post-connect "dialed in" verification on the Connect screen (poll local directory,
+      per-host green check when the agent first authenticates)
+- [x] **Root-cause found + fixed:** dial-in/verify needs "connected == discoverable", but `parler
+      mcp` didn't self-list. Added `auto_register` (private/same-hub by default; `PARLER_PUBLIC`/
+      `PARLER_TAGS`/`PARLER_SKILLS`/`PARLER_DESCRIBE`/`PARLER_NO_REGISTER`) so a wired agent lists on
+      connect. Also makes the desktop Agents screen's "connect an agent and it appears here" true.
+- [x] Backlog: added the follow-on epic (`parler work`, card offers, `parler task`, approvals inbox,
+      app team mode, signed task receipts, `[HUMAN] web:` hire flow)
+- [x] Gate: `CI_SKIP_WEB=1 make ci` green + desktop typecheck + build green
+
+## Review (done 2026-07-02)
+
+**What shipped (all in `parler-cli` + `desktop/`, additive + backward-compatible):**
+
+- **Zero-setup CLI** (`lib.rs` `connect()`): a networked command with no identity now mints one via
+  the shared `mcp::load_or_bootstrap_config()` (prints a one-line "first run — created your identity")
+  instead of erroring `run parler init`. Verified live: `register`/`send`/`presence` all bootstrap.
+- **Hub-preserving re-run** (`connect.rs`): a bare `parler connect` reads each host's currently
+  wired `PARLER_HUB`+`PARLER_JOIN_SECRET` (`configured_env`) and keeps it (`kept:true`); an explicit
+  `--shared`/`--local`/`--team`/`--hub` moves it (`hub_pinned`). New `--shared` flag. Verified live:
+  local→(bare)kept→(--shared)moved, confirmed in the written TOML.
+- **Per-host restart hints** (`restart_hint`): Claude Code = "next session, no restart"; Codex/Gemini
+  = "next run"; Cursor/Windsurf/Desktop = restart. In human output + `--json` (`restart` field).
+- **`parler connect --verify`** (`lib.rs` `verify_dial_in`): after wiring, dials each target hub with
+  the wired secret and prints each agent as its card appears (`✓ codex dialed in (6s)`), or a timeout
+  hint. Verified live end-to-end against a real restarting `parler mcp`.
+- **Name→id `--to`** (`lib.rs` `resolve_target`): `send`/`handoff`/`push --to <name>` resolves a
+  directory name to its id (unique-match; helpful error on unknown/ambiguous). nkey ids pass straight
+  through. Verified live: `--to reviewer` lands in the same DM room as `--to <id>`.
+- **Session `--room` defaults** (`session_room`): `requests`/`approve`/`deny`/`watch` fall back to the
+  active session, matching the MCP tools.
+- **`parler consolidate`**: legacy `claude-3-5-sonnet-20241022` → `claude-haiku-4-5-20251001` (the
+  fast tier, matching the gpt-4o-mini / gemini-2.5-flash siblings).
+- **MCP auto-self-list** (`mcp.rs` `auto_register`): the root-cause fix so the two dial-in features
+  work and the Agents screen fills. Private by default; env-tunable; opt-out. Verified live: a real
+  `parler mcp` agent self-listed with a verified private card + its `PARLER_TAGS`.
+- **Desktop start-at-login** (`settings.ts` `syncLoginItem`, `types.ts`, `ipc.ts`, `index.ts`,
+  `settings.tsx`): `startAtLogin` setting → `app.setLoginItemSettings({openAtLogin, openAsHidden})`,
+  reconciled on boot + on toggle, so the hub survives reboot.
+- **Desktop dial-in** (`components/dial-in.tsx`, wired into `connect.tsx` + `onboarding.tsx`): after a
+  local connect-all, polls the local directory (auto-minted token) and latches each wired agent to
+  "dialed in ✓" — closing the old dead-end that ended at "restart them" with silence.
+
+**Bug caught + fixed along the way:** `write_toml` used index-assignment on a fresh doc, which
+produced an empty inline `mcp_servers = {}` and silently dropped the server on a first-time Codex
+install. Materialize the table via `entry(...).or_insert(Item::Table(implicit))` first. Regression
+test added (`toml_write_works_on_a_fresh_file`).
+
+**Tests:** parler-cli 29 pass (+ `configured_env`, `restart_hint`, fresh-TOML, `auto_register`
+self-list, `env_flag`/`env_list`). Full `CI_SKIP_WEB=1 make ci` green (build · clippy -D warnings ·
+test · doc · deny). Desktop `npm run typecheck` + `npm run build` green.
+
+**Deferred to backlog (medium/big):** `parler work` daemon (rental keystone), card `offers`, `parler
+task --wait`, desktop approvals inbox, desktop team mode, signed task receipts, `[HUMAN] web:` hire
+flow / A2A inbound. See `tasks/backlog.md` → "From 'connect agents' → 'operate a hub' → 'rent out'".

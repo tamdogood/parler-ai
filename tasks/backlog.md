@@ -79,6 +79,51 @@ ideas. Each item additive + backward-compatible.*
 
 ## Next
 
+### Epic: From "connect agents" → "operate a hub" → "rent out an agent" (2026-07-02 UX audit)
+*Tranche 1 (zero-setup CLI, connect --verify, hub-preserving re-run, name-based `--to`, session
+`--room` defaults, per-host restart hints, mcp auto-self-list, desktop start-at-login + dial-in
+verification) shipped — see `tasks/todo.md` 2026-07-02. These are the follow-on medium/big items.*
+
+- [ ] **[P1] `parler work` — the worker daemon** (the rental keystone). `parler work --service
+  code-review --runner 'claude -p "{task}"'`: watch a service queue (reuse `recv --watch`), spawn a
+  headless runner per task, post the result back to the requester (DM the task author). Safety flags
+  for exposing to strangers: `--approve` (each task pends until accepted — reuse the session
+  join-approval pattern + a desktop notification), `--allow-from <ids>`, `--max-per-hour`. *Prereq:*
+  promote the **[P2] self-healing connection (auto-reconnect + cursor resume)** item in the "Now"
+  epic above — a long-lived worker must survive socket loss.
+  *Done when:* the subcommand, a runner-exec seam, an e2e that enqueues a task and asserts a result DM,
+  and docs. `[HUMAN] web:` a "this agent is for hire" surface can come later.
+
+- [ ] **[P1] Card `offers` — advertise a service on the directory card** so discover→submit needs no
+  human reading prose. Add an `offers` field (queue name + one-line what-it-does + input hint) to
+  `AgentCard`, surface it in `discover`/`card`, and project it onto the A2A skill list. `parler
+  discover --offers` filters to hireable agents. Additive (new optional card field). Pairs with
+  `parler work`. `[HUMAN] web:` show offers on the agent page.
+
+- [ ] **[P2] `parler task <agent|service> "…" --wait`** — send + long-poll the reply in one call (the
+  "hire" verb; pure sugar over `send` + `recv --watch`). Also the natural home for the name→id
+  resolution just added to `send`.
+
+- [ ] **[P2] Desktop approvals inbox** — the app can act as any *local* identity (seeds live under
+  `~/.parler/agents/<id>`), so it can poll `join_requests`/pending `work` tasks for locally-owned rooms
+  and fire a native notification ("gemini wants to join 'auth-redesign' — Approve / Deny"). Turns the
+  app into the hub's control tower. Needs new IPC (`session.requests/approve/deny`) — none exists yet.
+  `[HUMAN] web:` n/a (desktop only).
+
+- [ ] **[P2] Desktop team mode** — expose the CLI's `--team` (LAN bind + minted join secret +
+  teammate one-liner) as a GUI panel: one click flips the local hub to `0.0.0.0` + secret and shows
+  the exact `PARLER_HUB=… PARLER_JOIN_SECRET=… parler connect` line (+ optional QR). `HubTarget` is
+  currently only `local | public` — extend it. `[HUMAN] web:` n/a (desktop only).
+
+- [ ] **[P1] Signed task receipts** (trust rail before any payments) — a request+result pair signed
+  with the existing `com.parler.sig` machinery, a per-service audit log, and caps. Builds on shipped
+  message signatures + the hash-chain backlog item. No money — reputation/attribution first.
+
+- [ ] **[HUMAN] web: hire flow on the agent page** — today an agent's page on parler-hub.fly.dev is a
+  dead end. Short term: a "send this agent work" copy-paste block. Medium term: the inbound A2A
+  `message/send` endpoint (already the documented phase-2 in `docs/a2a-interop.md`) translating into a
+  service-queue post, so the whole A2A ecosystem can hire Parler agents.
+
 - [ ] **[P2] sqlite-vec semantic memory** (`docs/storage-and-memory.md` P4) — this needs a client
   embedding source that does not exist yet, so it is **blocked**: land it only as a self-contained
   follow-up so the deployed protocol isn't left half-changed. Until unblocked, leave checked-off-able

@@ -3,8 +3,10 @@ import { Plug, Check, RefreshCw, AlertTriangle, Terminal, Loader2, ChevronDown, 
 import type { ConnectAllResult, ConnectSnippet, HubStatus, HubTarget, McpHost } from "@shared/types";
 import { parler } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
+import { useHubUrl } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 import { CodeBlock } from "@/components/copyable";
+import { DialInList } from "@/components/dial-in";
 
 /**
  * Connect an agent — the app's primary job. One click wires *every* detected agent (the CLI's
@@ -21,6 +23,7 @@ export function ConnectScreen({
   onGoToAgents: () => void;
 }) {
   const [target, setTarget] = useState<HubTarget>("local");
+  const localUrl = useHubUrl("local", status);
   const [hosts, setHosts] = useState<McpHost[] | null>(null);
   const [snippet, setSnippet] = useState<ConnectSnippet | null>(null);
   const [showManual, setShowManual] = useState(false);
@@ -75,7 +78,7 @@ export function ConnectScreen({
       )}
 
       {/* Primary action: wire everything at once. */}
-      <ConnectAllCard hosts={hosts} target={target} disabled={localNotReady} onDone={refresh} />
+      <ConnectAllCard hosts={hosts} target={target} localUrl={localUrl} disabled={localNotReady} onDone={refresh} />
 
       {/* Which hub the agents point at. */}
       <div className="mt-3 flex items-center justify-between">
@@ -149,11 +152,13 @@ export function ConnectScreen({
 function ConnectAllCard({
   hosts,
   target,
+  localUrl,
   disabled,
   onDone,
 }: {
   hosts: McpHost[] | null;
   target: HubTarget;
+  localUrl: string | null;
   disabled: boolean;
   onDone: () => Promise<void>;
 }) {
@@ -221,6 +226,14 @@ function ConnectAllCard({
             <p className="text-[12.5px] text-complained-yellow">{result.message}</p>
           )}
         </div>
+      )}
+
+      {/* Close the loop: watch each wired agent actually dial into the local hub. */}
+      {result && result.connected > 0 && target === "local" && localUrl && (
+        <DialInList
+          base={localUrl}
+          hosts={result.results.filter((r) => r.status === "wired").map((r) => ({ id: r.id, name: r.name }))}
+        />
       )}
     </div>
   );

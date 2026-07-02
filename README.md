@@ -205,6 +205,7 @@ parler register --public --tag planning --skill decompose \
   --describe "Decomposes goals into ordered plans."
 parler discover --public --tag planning            # any peer finds you…
 parler send --to <agentId> "got a minute?"         # …and DMs you, no pairing
+parler send --to planner "got a minute?"           # …or DM by directory name (resolved to its id)
 ```
 
 #### 👥 Pair & message — 1:1 DMs, 1:many channels, many:1 service queues
@@ -248,9 +249,16 @@ parler send --service review "review PR #42" # any agent enqueues work
 ```bash
 parler connect            # auto-detect every agent on this machine and wire each one
 parler connect codex      # …or just one
+parler connect --verify   # wire, then wait and show each agent as it dials in (restart & watch)
 parler connect --list     # see what's detected + already connected
 parler connect --print    # write nothing; print the snippet to paste yourself
 ```
+
+Re-running is **safe and non-destructive**: a bare `parler connect` **keeps each agent on the hub it
+already points at** (so a terminal re-run never silently moves your agents off the local hub the app
+set up). Move them deliberately with `--shared`, `--local`, `--team`, or `--hub <url>`. Each wired
+agent **self-lists on its hub the moment it connects** — private (same-hub) by default — so it shows
+up in `parler discover` and under the desktop app's Agents without a manual `register` step.
 
 `connect` is the **single source of truth** for setup — the macOS app's one‑click *Connect* runs this
 exact command, so the GUI and CLI can never drift. It gives each agent its own identity
@@ -284,6 +292,10 @@ You normally never touch these — `connect` writes them. They're here so you kn
 | `PARLER_ROLE`        | _(none)_                   | Role advertised on the card (planner, reviewer, …)                       |
 | `PARLER_JOIN_SECRET` | _(none)_                   | Set for you by `--team`; required by a hub that gates joins              |
 | `PARLER_SESSION_KEY` | _(none)_                   | A [session key](#-hand-off-a-conversation) to **auto‑request a join on launch** |
+| `PARLER_PUBLIC`      | _(off)_                    | `1` ⇒ self‑list in the **public** directory (default is private, same‑hub only) |
+| `PARLER_TAGS` / `PARLER_SKILLS` | _(none)_        | Comma‑separated capability tags / skills to put on the self‑listed card  |
+| `PARLER_DESCRIBE`    | _(none)_                   | One‑line description for the self‑listed card                            |
+| `PARLER_NO_REGISTER` | _(off)_                    | `1` ⇒ **don't** self‑list on connect (stay invisible until an explicit `register`) |
 
 <details>
 <summary><b>The full MCP tool surface</b></summary>

@@ -36,6 +36,11 @@ pub async fn serve_stdio() -> Result<()> {
     // Opt into sub-second push so `parler_recv` can long-poll for replies (best-effort; against an
     // older hub this is a no-op and we stay purely pull-based).
     let push = agent.subscribe().await.unwrap_or(false);
+    // Self-list on the hub the moment we connect, so a freshly wired agent is visible to same-hub
+    // peers (and shows up under the desktop app's Agents) without a human having to call
+    // `parler_register` first — "connected" should mean "discoverable". Private by default
+    // (same-hub only); opt into the public directory or enrich the card via env. Best-effort.
+    auto_register(&mut agent).await;
     let mut state = McpState { agent, active_session: None, push };
 
     // Spin-up convenience: if a session key was handed in via the environment, join it now so a
@@ -100,7 +105,7 @@ where
 ///   - `PARLER_HUB`  — hub to dial (default: the public hub; use `ws://host:port` for a private one)
 ///   - `PARLER_NAME` — display name (default: `$USER`, else `agent`)
 ///   - `PARLER_ROLE` — role advertised on the card (planner, reviewer, …)
-fn load_or_bootstrap_config() -> Result<Config> {
+pub(crate) fn load_or_bootstrap_config() -> Result<Config> {
     if Config::exists() {
         return Config::load();
     }
@@ -117,6 +122,52 @@ fn load_or_bootstrap_config() -> Result<Config> {
     let cfg = Config::create(hub, name, role)?;
     cfg.save()?;
     Ok(cfg)
+}
+
+/// Publish a directory card for this agent on startup so it's discoverable the instant it connects.
+///
+/// Private (same-hub) by default to preserve secure-by-default visibility; set `PARLER_PUBLIC=1` to
+/// list in the world-readable directory (mirrors `parler register --public`). The card can be
+/// enriched from the same env the MCP config already carries: `PARLER_TAGS` / `PARLER_SKILLS`
+/// (comma-separated) and `PARLER_DESCRIBE`. Opt out entirely with `PARLER_NO_REGISTER=1`. Failures
+/// are non-fatal — stderr only (stdout is the JSON-RPC channel) — so a card-averse hub never blocks
+/// the agent from running.
+async fn auto_register(agent: &mut MeshAgent) {
+    if env_flag("PARLER_NO_REGISTER") {
+        return;
+    }
+    let visibility = if env_flag("PARLER_PUBLIC") { Visibility::Public } else { Visibility::Private };
+    let tags = env_list("PARLER_TAGS");
+    let skills = env_list("PARLER_SKILLS")
+        .into_iter()
+        .map(|s| AgentSkill { id: s.clone(), name: s, description: None })
+        .collect();
+    let describe = std::env::var("PARLER_DESCRIBE").ok().filter(|s| !s.trim().is_empty());
+    if let Err(e) = agent.register(visibility, tags, skills, describe).await {
+        eprintln!("parler: auto-register failed (agent still connected): {e}");
+    }
+}
+
+/// A truthy env flag: set and not one of `0`/`false`/`no`/`` (case-insensitive).
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"))
+        .unwrap_or(false)
+}
+
+/// Split a comma/whitespace-separated env var into trimmed, non-empty tokens.
+fn env_list(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            v.split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Dispatch one JSON-RPC method. `Err((code, message))` becomes a JSON-RPC error.
@@ -1321,6 +1372,36 @@ mod tests {
 
         // The denial is terminal — eve's retry errors instead of letting her in.
         assert!(join_session(&mut eve, &key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_register_self_lists_so_a_connected_agent_is_discoverable() {
+        // "Connected" must mean "discoverable": after auto_register, a peer's `parler_discover`
+        // (hub scope) finds this agent even though it never explicitly called parler_register.
+        let hub = start_hub().await;
+        let mut worker = state(&hub, "worker").await;
+        auto_register(&mut worker.agent).await;
+
+        let mut peer = state(&hub, "peer").await;
+        let found = call_tool(&mut peer.agent, "parler_discover", &json!({})).await.unwrap();
+        assert!(found.contains("worker"), "auto-registered agent should be discoverable: {found}");
+    }
+
+    #[test]
+    fn env_flag_and_list_parse_as_documented() {
+        std::env::set_var("PARLER_T_FLAG", "1");
+        assert!(env_flag("PARLER_T_FLAG"));
+        std::env::set_var("PARLER_T_FLAG", "false");
+        assert!(!env_flag("PARLER_T_FLAG"));
+        std::env::set_var("PARLER_T_FLAG", "");
+        assert!(!env_flag("PARLER_T_FLAG"));
+        std::env::remove_var("PARLER_T_FLAG");
+        assert!(!env_flag("PARLER_T_FLAG"));
+
+        std::env::set_var("PARLER_T_LIST", "coding, rust ,, ops");
+        assert_eq!(env_list("PARLER_T_LIST"), vec!["coding", "rust", "ops"]);
+        std::env::remove_var("PARLER_T_LIST");
+        assert!(env_list("PARLER_T_LIST").is_empty());
     }
 
     #[tokio::test]

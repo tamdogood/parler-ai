@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { HubSupervisor } from "./hub-supervisor";
 import { registerIpc } from "./ipc";
 import { installTray } from "./tray";
-import { loadSettings } from "./settings";
+import { loadSettings, syncLoginItem } from "./settings";
 import { appIcon } from "./paths";
 import { EV } from "../shared/channels";
 import type { HubStatus } from "../shared/types";
@@ -145,6 +145,9 @@ app.whenReady().then(() => {
   installTray(supervisor, () => mainWindow);
 
   const settings = loadSettings();
+  // Reconcile the OS login item with the persisted preference on every boot (covers a manual
+  // System Settings change, or a first run where the default must be written through).
+  syncLoginItem(settings.startAtLogin);
   if (settings.autoStartHub && settings.onboarded) {
     void supervisor.start();
   }

@@ -98,6 +98,28 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   hub** (code-handoff did it with `com.parler.bundle`; message signing does it with `com.parler.sig`).
   Reach for a first-class frame field only when the hub itself must act on the data.
 
+- **`discover` == registered cards only, not "who's connected":** the hub's `discover`/`/api/directory`
+  query is `FROM directory d JOIN agents a` — an agent that connects (Hello upserts the `agents` row +
+  presence) but never `register`s a card is **invisible** to discovery. So any "watch an agent come
+  online" UX (the CLI `connect --verify`, the desktop dial-in list, even the desktop Agents screen)
+  needs the agent to have a card. Root-cause fix chosen: `parler mcp` now `auto_register`s a private
+  (same-hub) card on connect, so "connected" means "discoverable". If you build presence-style UX,
+  don't assume a bare connection lists — either read the card or make the agent self-list.
+
+- **`toml_edit` index-assignment on a *fresh* doc makes an empty inline table:** `doc["mcp_servers"]["parler"]
+  = item` on a `DocumentMut` that has no `mcp_servers` yet renders `mcp_servers = {}` and **drops the
+  entry** — a silent data loss that only bit the first-time-Codex path (a seeded config round-tripped
+  fine, which is why the existing test missed it). Materialize the parent as a real implicit table
+  first: `doc.entry("mcp_servers").or_insert(Item::Table({ let mut t=Table::new(); t.set_implicit(true); t }))`,
+  then index into that. Test the empty-file path, not just the merge-into-existing path.
+
+- **Verify a UX loop end-to-end with the *real* entry point, not a proxy:** `connect --verify` looked
+  done against a `parler presence` stand-in, but presence doesn't register a card, so the real
+  `parler mcp` restart is what had to be simulated — that's what surfaced the "connected ≠ discoverable"
+  gap. When a feature waits on a side effect of *how users actually run the thing* (here: the wired
+  agent runs `parler mcp`), drive that exact binary in the verification, not a lighter command that
+  merely connects.
+
 - **Sign only fields the hub doesn't rewrite:** the hub `normalize_mentions()`-es `mentions` in flight
   but stores `reply_to`/`parts` verbatim. A signature must cover the verbatim fields and **exclude the
   normalized ones**, or it fails verification on the receive side for messages the hub legitimately

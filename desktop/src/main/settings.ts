@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
+import { app } from "electron";
 import type { Settings } from "../shared/types";
 import { settingsPath } from "./paths";
 
@@ -19,6 +20,7 @@ function defaults(): Settings {
     hubName: `${who}'s Hub`,
     hubPort: DEFAULT_HUB_PORT,
     connectTarget: "local",
+    startAtLogin: false,
     onboarded: false,
   };
 }
@@ -36,6 +38,19 @@ export function loadSettings(): Settings {
   }
   cache = { ...defaults(), ...stored };
   return cache;
+}
+
+/**
+ * Reflect the "start at login" preference into the OS login-item registry. Opens hidden (straight to
+ * the tray) so a reboot brings the hub up before agents dial in, without a window stealing focus.
+ * Best-effort: unsupported on some Linux setups, where Electron makes this a no-op.
+ */
+export function syncLoginItem(enabled: boolean): void {
+  try {
+    app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: enabled });
+  } catch (e) {
+    console.error("failed to set login item", e);
+  }
 }
 
 /** Merge a patch, persist, and return the full settings. */

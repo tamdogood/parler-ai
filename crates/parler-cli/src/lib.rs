@@ -144,11 +144,15 @@ struct ConnectArgs {
     /// agent found on this machine.
     hosts: Vec<String>,
     /// Keep everything on THIS machine: point agents at a local hub (nothing leaves the box).
-    #[arg(long, conflicts_with_all = ["team", "hub"])]
+    #[arg(long, conflicts_with_all = ["team", "hub", "shared"])]
     local: bool,
     /// Like `--local`, but reachable by teammates on your network; generates a join secret.
-    #[arg(long, conflicts_with_all = ["local", "hub"])]
+    #[arg(long, conflicts_with_all = ["local", "hub", "shared"])]
     team: bool,
+    /// Move agents to the shared hub explicitly. (A bare `parler connect` keeps an already-wired
+    /// agent on its current hub; this flag is how you move it back.)
+    #[arg(long, conflicts_with_all = ["local", "team", "hub"])]
+    shared: bool,
     /// Advanced: dial this explicit hub URL instead of the shared/local one.
     #[arg(long)]
     hub: Option<String>,
@@ -173,6 +177,13 @@ struct ConnectArgs {
     /// Emit machine-readable JSON (used by the Parler desktop app).
     #[arg(long)]
     json: bool,
+    /// After wiring, wait and report each agent as it dials the hub — restart your agents and watch
+    /// them come online. (Human output only; ignored with --json.)
+    #[arg(long)]
+    verify: bool,
+    /// How long --verify waits before giving up, in seconds.
+    #[arg(long, default_value_t = 180)]
+    verify_timeout_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -203,32 +214,32 @@ enum SessionCmd {
     },
     /// List the agents waiting for your approval to join a session you opened.
     Requests {
-        /// The session room (printed when you opened it).
+        /// The session room (defaults to your active session).
         #[arg(long)]
-        room: String,
+        room: Option<String>,
     },
     /// Approve a pending joiner into a session you opened — they can then read it and participate.
     Approve {
-        /// The session room (printed when you opened it).
+        /// The session room (defaults to your active session).
         #[arg(long)]
-        room: String,
+        room: Option<String>,
         /// The id of the joiner to admit.
         agent: String,
     },
     /// Reject a pending joiner's request — they are turned away and cannot re-request.
     Deny {
-        /// The session room (printed when you opened it).
+        /// The session room (defaults to your active session).
         #[arg(long)]
-        room: String,
+        room: Option<String>,
         /// The id of the joiner to reject.
         agent: String,
     },
     /// Mint a read-only WATCH code for a session you opened — paste it into the website's session
     /// viewer to watch the conversation and how many agents are in the room (no joining). Owner-only.
     Watch {
-        /// The session room (printed when you opened it).
+        /// The session room (defaults to your active session).
         #[arg(long)]
-        room: String,
+        room: Option<String>,
         /// How long the watch code stays valid, in seconds (default 3600).
         #[arg(long)]
         ttl: Option<u64>,
@@ -442,7 +453,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Hub(a) => cmd_hub(a).await,
-        Cmd::Connect(a) => cmd_connect(a),
+        Cmd::Connect(a) => cmd_connect(a).await,
         Cmd::Init(a) => cmd_init(a),
         Cmd::Invite(a) => cmd_invite(a).await,
         Cmd::Join { code } => cmd_join(code).await,
@@ -483,6 +494,16 @@ async fn connect() -> Result<MeshAgent> {
             if fallback_path.exists() {
                 std::env::set_var("PARLER_HOME", fallback_path.parent().unwrap());
                 Config::load().map_err(|_| e)?
+            } else if !Config::exists() {
+                // Zero-setup, same as `parler mcp`: mint an identity on first use instead of
+                // telling the user to go run `parler init` first.
+                let cfg = mcp::load_or_bootstrap_config()?;
+                eprintln!(
+                    "✱ first run — created your identity at {} (hub: {})",
+                    parler_connector::home_dir().display(),
+                    cfg.hub_url
+                );
+                cfg
             } else {
                 return Err(e);
             }
@@ -529,7 +550,9 @@ async fn cmd_hub(a: HubArgs) -> Result<()> {
     parler_hub::serve(listener, state).await
 }
 
-fn cmd_connect(a: ConnectArgs) -> Result<()> {
+async fn cmd_connect(a: ConnectArgs) -> Result<()> {
+    // "Pinned" = the user said where traffic goes; a bare run keeps already-wired agents in place.
+    let hub_pinned = a.shared || a.team || a.local || a.hub.is_some();
     let hub = if let Some(u) = a.hub {
         connect::Hub::Explicit(u)
     } else if a.team {
@@ -539,7 +562,7 @@ fn cmd_connect(a: ConnectArgs) -> Result<()> {
     } else {
         connect::Hub::Shared
     };
-    connect::run(connect::Options {
+    let wired = connect::run(connect::Options {
         hosts: a.hosts,
         hub,
         name: a.name,
@@ -548,7 +571,65 @@ fn cmd_connect(a: ConnectArgs) -> Result<()> {
         list: a.list,
         remove: a.remove,
         json: a.json,
-    })
+        hub_pinned,
+    })?;
+    if a.verify && !a.json && !wired.is_empty() {
+        verify_dial_in(wired, Duration::from_secs(a.verify_timeout_secs)).await?;
+    }
+    Ok(())
+}
+
+/// The `--verify` tail of `parler connect`: dial each hub the agents were wired to and report every
+/// agent the moment it first authenticates (its `Hello` upserts it into the hub directory). Closes
+/// the loop that used to end at "restart them" with silence.
+async fn verify_dial_in(wired: Vec<connect::WiredAgent>, timeout: Duration) -> Result<()> {
+    use std::collections::BTreeMap;
+    // One dial per (hub, secret); a gated hub needs the same join secret the agents were given.
+    let mut by_hub: BTreeMap<(String, Option<String>), Vec<String>> = BTreeMap::new();
+    for w in wired {
+        by_hub.entry((w.hub, w.secret)).or_default().push(w.name);
+    }
+    println!("Waiting for your agents to dial in — restart them now (Ctrl-C to stop waiting).");
+    let started = std::time::Instant::now();
+    for ((hub, secret), mut names) in by_hub {
+        match &secret {
+            Some(s) => std::env::set_var("PARLER_JOIN_SECRET", s),
+            None => std::env::remove_var("PARLER_JOIN_SECRET"),
+        }
+        let mut cfg = mcp::load_or_bootstrap_config()?;
+        cfg.hub_url = hub.clone();
+        let mut ag = match MeshAgent::connect(&cfg).await {
+            Ok(ag) => ag,
+            Err(e) => {
+                println!("  ✗ can't reach {hub}: {e}");
+                if hub.contains("127.0.0.1") || hub.contains("localhost") {
+                    println!("    (is your local hub running? start it with: parler hub --local)");
+                }
+                continue;
+            }
+        };
+        while !names.is_empty() && started.elapsed() < timeout {
+            let seen = ag
+                .discover(DiscoverScope::Hub, None, None, None, None, Some(500))
+                .await
+                .unwrap_or_default();
+            names.retain(|n| {
+                let online = seen.iter().any(|e| e.card.name.eq_ignore_ascii_case(n));
+                if online {
+                    println!("  ✓ {n} dialed in ({}s)", started.elapsed().as_secs());
+                }
+                !online
+            });
+            if names.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        for n in &names {
+            println!("  ⏳ {n} hasn't dialed in after {}s — restart it, then check with: parler connect --list", timeout.as_secs());
+        }
+    }
+    Ok(())
 }
 
 fn cmd_init(a: InitArgs) -> Result<()> {
@@ -674,6 +755,7 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
             println!("send with:  parler send --room {room} \"…\"    receive with:  parler recv --room {room}");
         }
         SessionCmd::Requests { room } => {
+            let room = session_room(room)?;
             let reqs = ag.join_requests(&room).await?;
             if reqs.is_empty() {
                 println!("(no agents waiting to join '{room}')");
@@ -687,14 +769,17 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
             println!("approve:  parler session approve --room {room} <id>     deny:  parler session deny --room {room} <id>");
         }
         SessionCmd::Approve { room, agent } => {
+            let room = session_room(room)?;
             ag.resolve_join(&room, &agent, true).await?;
             println!("✓ approved {agent} into '{room}' — they can now read the conversation and participate.");
         }
         SessionCmd::Deny { room, agent } => {
+            let room = session_room(room)?;
             ag.resolve_join(&room, &agent, false).await?;
             println!("✓ denied {agent}'s request to join '{room}'.");
         }
         SessionCmd::Watch { room, ttl } => {
+            let room = session_room(room)?;
             let (token, expires_at) = ag.mint_watch_token(&room, ttl).await?;
             println!("✓ read-only watch code for '{room}' (expires at {expires_at}):");
             println!();
@@ -706,6 +791,13 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve an optional `--room` for the session subcommands: explicit wins, else the active
+/// session (parity with the MCP tools, which have defaulted this way from day one).
+fn session_room(room: Option<String>) -> Result<String> {
+    room.or_else(load_active_session)
+        .ok_or_else(|| anyhow::anyhow!("specify --room, or open/join a session first"))
 }
 
 async fn cmd_register(a: RegisterArgs) -> Result<()> {
@@ -777,10 +869,51 @@ fn target_from(room: Option<String>, to: Option<String>, service: Option<String>
     }
 }
 
+/// True when `s` parses as an nkey public key (an agent id); anything else is treated as a name.
+fn looks_like_agent_id(s: &str) -> bool {
+    nkeys::KeyPair::from_public_key(s).is_ok()
+}
+
+/// Let `--to` take a directory *name* as well as a full id: a non-id value is resolved against the
+/// hub directory and must match exactly one agent (case-insensitive on the card name). Kills the
+/// "copy a 56-char key between terminals" step for the common case.
+async fn resolve_target(ag: &mut MeshAgent, target: Target) -> Result<Target> {
+    let Target::Dm { agent } = &target else { return Ok(target) };
+    if looks_like_agent_id(agent) {
+        return Ok(target);
+    }
+    // Try the hub's free-text query first; fall back to a plain listing in case the query
+    // tokenization misses an exact name.
+    let mut found = ag
+        .discover(DiscoverScope::Hub, Some(agent.clone()), None, None, None, Some(50))
+        .await?;
+    if !found.iter().any(|e| e.card.name.eq_ignore_ascii_case(agent)) {
+        found = ag.discover(DiscoverScope::Hub, None, None, None, None, Some(500)).await?;
+    }
+    let hits: Vec<&DirectoryEntry> =
+        found.iter().filter(|e| e.card.name.eq_ignore_ascii_case(agent)).collect();
+    match hits.len() {
+        1 => {
+            eprintln!("→ '{agent}' is {}", hits[0].card.id);
+            Ok(Target::Dm { agent: hits[0].card.id.clone() })
+        }
+        0 => bail!("no agent named '{agent}' on this hub — check `parler discover`, or pass the full agent id"),
+        _ => {
+            let list = hits
+                .iter()
+                .map(|e| format!("  {}  {}", e.card.name, e.card.id))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!("'{agent}' matches more than one agent on this hub — pass the id instead:\n{list}")
+        }
+    }
+}
+
 async fn cmd_send(a: SendArgs) -> Result<()> {
     let target = target_from(a.room, a.to, a.service)?;
     let text = a.text.join(" ");
     let mut ag = connect().await?;
+    let target = resolve_target(&mut ag, target).await?;
     let (_id, seq, room) = ag.send_text(target, &text).await?;
     println!("✓ sent to '{room}' (seq {seq})");
     Ok(())
@@ -795,6 +928,7 @@ async fn cmd_handoff(a: HandoffArgs) -> Result<()> {
         bundle: a.bundle,
     };
     let mut ag = connect().await?;
+    let target = resolve_target(&mut ag, target).await?;
     // Mention the addressee so the hub's push layer wakes them as well as the typed addressing.
     let mentions = a.for_who.map(|w| vec![w]);
     let (_id, seq, room) = ag.send(target, vec![handoff.to_part()], mentions, None).await?;
@@ -817,6 +951,7 @@ async fn cmd_push(a: PushArgs) -> Result<()> {
         media_type: Some("application/x-git-bundle".into()),
     };
     let mut ag = connect().await?;
+    let target = resolve_target(&mut ag, target).await?;
     let r = ag.push(target, &bytes, meta, a.note).await?;
     println!("✓ pushed git bundle to '{}' (seq {}, {} bytes)", r.room, r.seq, bytes.len());
     println!("  tip:  {}  {summary}", short(&tip));
@@ -1418,7 +1553,7 @@ async fn cmd_consolidate() -> Result<()> {
     } else if let Some(key) = anthropic_key {
         println!("  • Requesting consolidation from Anthropic...");
         let payload = serde_json::json!({
-            "model": "claude-3-5-sonnet-20241022",
+            "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": prompt}]
         });
