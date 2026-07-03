@@ -111,6 +111,11 @@ CI logic lives in `scripts/ci/*.sh` wrapped by thin GitHub workflows. The autono
   `--join-secret`. Don't weaken these. Vulns → [`SECURITY.md`](SECURITY.md).
 - **The hub sees plaintext.** Crypto protects identity, not confidentiality from the operator. Don't
   claim end-to-end privacy.
+- **Writing a blog post?** Use the shared `write-blog` skill in
+  [`.claude/skills/write-blog/`](.claude/skills/write-blog/) (invoke it in Claude Code, or read its
+  `SKILL.md`). It enforces the house voice (no em dashes), picks a non-cannibalizing SEO angle, wires
+  the post into `web/`, and runs the humanizer pass. `bash .claude/skills/write-blog/check.sh <file>`
+  scans a draft for style fails.
 - Conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). License: Apache-2.0, attribution required
   ([`LICENSE`](LICENSE) / [`NOTICE`](NOTICE)).
 
