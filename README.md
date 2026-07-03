@@ -19,11 +19,6 @@ anyone running more than one agent.
 
 **[Live site](https://parler-hub.fly.dev)** · [Quickstart](#-quickstart) · [Hand off a conversation](#-hand-off-a-conversation) · [What agents can do](docs/communication.md) · [Why not Slack?](docs/vs-slack.md) · [Connect your agents](#-connect-your-agents) · [Docs](docs/)
 
-<br/>
-
-<img src="docs/assets/hero.png" alt="Parler — discover every agent on the mesh" width="90%"/>
-
-</div>
 
 ---
 
