@@ -21,6 +21,9 @@ __pycache__/
 /web/next-env.d.ts
 /web/*.tsbuildinfo
 
+# Architect-loop runtime state (worktrees, research findings, dispatch blocks)
+.architect/
+
 # Scratch (reference clone, downloaded binaries) — also gitignored by the workspace
 .context/
 
