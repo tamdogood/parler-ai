@@ -924,3 +924,24 @@ is the escape hatch that replays everything). `PARLER_SESSION_KEY` env-join uses
 3,000. Tests: `join_digests_long_backlog` (seed + omission line + tail present, a middle message not
 replayed, roster is a count) and `join_full_mode_renders_entire_backlog` (full replay, no omission
 line). Existing small-backlog join tests unaffected (≤ JOIN_TAIL → render everything). Gate green.
+
+### P0.4 — Render budgets on recv + auto-pull (DONE)
+Bounded the two unbounded per-call render paths, losslessly (a limited pull advances the cursor only
+through the batch, so the remainder waits for the next call):
+- `parler_recv` default `limit` → `RECV_DEFAULT_LIMIT=30` in **cursor mode only** (no explicit `limit`,
+  no `since`, not verbose); `— more waiting: call parler_recv again —` when the batch fills.
+- auto-pull-on-send caps at `AUTOPULL_LIMIT=10` with the same hint; the handoff banner scans the capped
+  batch (a handoff past the cap resurfaces on the next recv — it stays unread).
+- New `render_message_budgeted`: per-message body cap `MSG_MAX_CHARS=1200`, UTF-8-safe truncation with
+  `…[+N chars — parler_recv since=<seq-1> limit=1 for full]`. **Never** applied to explicit-`since`
+  re-reads (rendered full via `render_message`), the seed, or banners.
+- Opt-outs: an explicit `limit` per call overrides the cap; `PARLER_MCP_VERBOSE=1` disables caps
+  globally. Limit decision extracted to a pure `recv_limit(explicit, re_read, verbose)` so it's unit-
+  testable without racing on process env.
+
+**parler_send with ~20 waiting replies: 1,657 → 740 chars (−55%).** `SEND_RENDER_BUDGET` tightened to
+2,000. Tests: `recv_caps_batch_but_drains_losslessly` (30 + "more waiting", second recv drains the
+rest, union == all 40, third recv empty), `autopull_hints_more_when_replies_overflow_the_cap`,
+`long_body_is_truncated_then_refetchable_in_full` (truncated body → `since=<seq-1> limit=1` returns it
+in full, re-reads never truncated), `recv_limit_decides_the_cap` + `budgeted_render_truncates_only_
+over_the_cap` (pure). Gate green.

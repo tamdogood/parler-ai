@@ -684,18 +684,28 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             // Auto-pull right after sending so an already-waiting reply shows up without a separate
             // parler_recv (read-after-write); for a reply that hasn't landed yet, use parler_recv with
             // wait_secs to long-poll. Our own just-sent message is filtered out; the pull advances our
-            // cursor so these aren't re-delivered later.
+            // cursor so these aren't re-delivered later. The pull is capped (AUTOPULL_LIMIT) so a
+            // reply flood can't balloon the send result — the remainder stays unread for the next
+            // parler_recv (a limited pull only advances the cursor through what it returned).
             let mut out = format!("sent to '{room}' (seq {seq})");
-            if let Ok((msgs, _cursor)) = state.agent.pull(&room, None, None).await {
+            let auto_limit = if verbose_render() { None } else { Some(AUTOPULL_LIMIT) };
+            if let Ok((msgs, _cursor)) = state.agent.pull(&room, None, auto_limit).await {
+                let batch_full = auto_limit.is_some_and(|l| msgs.len() as u32 >= l);
                 let me = state.agent.id.clone();
                 let incoming: Vec<_> = msgs.iter().filter(|m| m.from.id != me).collect();
                 if !incoming.is_empty() {
                     if let Some(banner) = handoff_banner(state, &incoming) {
                         out.push_str(&format!("\n\n{banner}"));
                     }
-                    let body =
-                        incoming.into_iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                    let body = incoming
+                        .into_iter()
+                        .map(render_message_budgeted)
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     out.push_str(&format!("\n— new messages —\n{body}"));
+                    if batch_full {
+                        out.push_str("\n— more waiting: call parler_recv again —");
+                    }
                 }
             }
             // Surface any pending join requests so the host (this owner) is shown the accept/reject
@@ -733,8 +743,13 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
                 .or_else(|| state.active_session.clone())
                 .ok_or_else(|| anyhow!("missing 'room' (open/join a session, or pass room)"))?;
             let since = args.get("since").and_then(Value::as_i64);
-            let limit = u32opt("limit");
-            let (mut msgs, mut cursor) = state.agent.pull(&room, since, limit).await?;
+            let explicit_limit = u32opt("limit");
+            // Cursor mode with no explicit limit → apply the default cap (lossless: a limited pull
+            // advances the cursor only through the batch, so the rest waits for the next call). An
+            // explicit `since` is a full-detail history re-read: never cap it, never budget its bodies.
+            let re_read = since.is_some();
+            let effective_limit = recv_limit(explicit_limit, re_read, verbose_render());
+            let (mut msgs, mut cursor) = state.agent.pull(&room, since, effective_limit).await?;
             // Long-poll: if nothing new yet and the caller asked to wait (and the hub is pushing),
             // block up to `wait_secs` for a peer message, then re-pull to read + advance the cursor.
             // Only in cursor mode (`since` absent) — an explicit `since` is a history re-read.
@@ -742,20 +757,27 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
                 if let Some(secs) = args.get("wait_secs").and_then(Value::as_u64).filter(|w| *w > 0) {
                     let secs = secs.min(60);
                     if state.agent.next_delivery(Duration::from_secs(secs)).await?.is_some() {
-                        let (m, c) = state.agent.pull(&room, None, limit).await?;
+                        let (m, c) = state.agent.pull(&room, None, effective_limit).await?;
                         msgs = m;
                         cursor = c;
                     }
                 }
             }
+            let batch_full = effective_limit.is_some_and(|l| msgs.len() as u32 >= l);
             let mut out = if msgs.is_empty() {
                 format!("(no new messages in '{room}')")
             } else {
                 let refs: Vec<&_> = msgs.iter().collect();
-                let body = msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                // Re-reads (explicit `since`) render in full; cursor-mode reads budget long bodies.
+                let body = msgs
+                    .iter()
+                    .map(|m| if re_read { crate::render_message(m) } else { render_message_budgeted(m) })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let more = if batch_full { "\n— more waiting: call parler_recv again —" } else { "" };
                 match handoff_banner(state, &refs) {
-                    Some(banner) => format!("{banner}\n\n{body}\n— cursor at {cursor} —"),
-                    None => format!("{body}\n— cursor at {cursor} —"),
+                    Some(banner) => format!("{banner}\n\n{body}\n— cursor at {cursor} —{more}"),
+                    None => format!("{body}\n— cursor at {cursor} —{more}"),
                 }
             };
             // Surface any pending join requests so a host sees the accept/reject choice inline, even
@@ -843,6 +865,50 @@ const SEED_MARKER: &str = "📋 session context";
 /// How many trailing messages a "recent" join/handoff digest renders in full. Enough to see the live
 /// thread of the conversation; the rest is one omission line pointing at `parler_recv since=<seq>`.
 const JOIN_TAIL: usize = 15;
+
+/// Default cap on how many messages a cursor-mode `parler_recv` renders per call. Lossless: a limited
+/// `Pull` advances the cursor only through the returned batch, so the remainder stays unread for the
+/// next call (see store.rs). An explicit `limit`/`since` overrides this.
+const RECV_DEFAULT_LIMIT: u32 = 30;
+
+/// Default cap on the auto-pull appended to a `parler_send` result. Same losslessness as
+/// [`RECV_DEFAULT_LIMIT`]; a peer flood past this resurfaces on the next `parler_recv`.
+const AUTOPULL_LIMIT: u32 = 10;
+
+/// Per-message body cap (chars) for the budgeted render. A longer body is truncated with a pointer to
+/// re-read that one message in full. Big enough that ordinary chat is never touched.
+const MSG_MAX_CHARS: usize = 1200;
+
+/// Render a message, truncating an over-long body to [`MSG_MAX_CHARS`] with a hint to re-read it in
+/// full via an explicit `since` (which is never truncated). UTF-8 safe (truncates on a char boundary).
+/// Used only on the *cursor-mode* render paths (recv default, auto-pull); explicit-`since` re-reads,
+/// the seed, and banners always render in full through [`crate::render_message`].
+fn render_message_budgeted(m: &StoredMessage) -> String {
+    let full = crate::render_message(m);
+    if full.chars().count() <= MSG_MAX_CHARS {
+        return full;
+    }
+    let kept: String = full.chars().take(MSG_MAX_CHARS).collect();
+    let dropped = full.chars().count() - MSG_MAX_CHARS;
+    // since = seq-1 so `parler_recv since=<seq-1> limit=1` returns exactly this message, in full.
+    format!("{kept}…[+{dropped} chars — parler_recv since={} limit=1 for full]", m.seq - 1)
+}
+
+/// True when the caller wants uncapped output — the global escape hatch (`PARLER_MCP_VERBOSE=1`).
+fn verbose_render() -> bool {
+    env_flag("PARLER_MCP_VERBOSE")
+}
+
+/// The message limit a `parler_recv` should pull with. Pure so it's unit-testable without touching the
+/// process env: an explicit `limit` always wins; a history re-read (`since`) or verbose mode is
+/// uncapped (`None`); otherwise the default cap applies.
+fn recv_limit(explicit: Option<u32>, re_read: bool, verbose: bool) -> Option<u32> {
+    match (explicit, re_read, verbose) {
+        (Some(l), _, _) => Some(l),
+        (None, false, false) => Some(RECV_DEFAULT_LIMIT),
+        _ => None,
+    }
+}
 
 /// Whether a join renders the whole backlog or a digest. `Recent` (default) is the token-efficient
 /// path: seed + tail + an omission line. `Full` is the escape hatch — replay everything.
@@ -1339,9 +1405,10 @@ mod tests {
     /// chars; P0.3's digest render (seed + tail + omission line) brings it to ~1,458. Ceiling leaves
     /// headroom for a larger tail / longer messages.
     const JOIN_RENDER_BUDGET: usize = 3_000;
-    /// Rendered `parler_send` output when ~20 replies are already waiting (auto-pull). P0.4's caps
-    /// bound this.
-    const SEND_RENDER_BUDGET: usize = 12_000;
+    /// Rendered `parler_send` output when ~20 replies are already waiting (auto-pull). Uncapped
+    /// baseline was 1,657 chars; P0.4's AUTOPULL_LIMIT=10 cap brings it to ~740. Ceiling leaves
+    /// headroom for longer bodies (each capped at MSG_MAX_CHARS).
+    const SEND_RENDER_BUDGET: usize = 2_000;
 
     /// A body of exactly `len` ASCII chars (deterministic sizing for budget assertions).
     fn body_of(len: usize) -> String {
@@ -1484,6 +1551,132 @@ mod tests {
             "send render {} B exceeds budget {SEND_RENDER_BUDGET} B",
             sent.len()
         );
+    }
+
+    #[tokio::test]
+    async fn recv_caps_batch_but_drains_losslessly() {
+        // A default recv is bounded (RECV_DEFAULT_LIMIT) and hints "more waiting"; a second recv
+        // returns the remainder — no message is lost, because a limited pull advances the cursor
+        // only through what it returned.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+        let mut bob = state(&hub, "bob").await;
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        // Drain bob's own "joined" announce so his inbox starts empty relative to what alice posts.
+        call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+
+        // Alice posts 40 uniquely-tagged messages while bob isn't looking.
+        for i in 0..40 {
+            alice.agent.send_text(Target::Room { room: room.clone() }, &format!("u{i}_msg")).await.unwrap();
+        }
+
+        let first = call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+        assert!(first.contains("more waiting"), "a full batch hints there's more:\n{first}");
+        let second = call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+
+        // Every one of the 40 messages appears across the two calls (lossless drain).
+        for i in 0..40 {
+            let tag = format!("u{i}_msg");
+            assert!(
+                first.contains(&tag) || second.contains(&tag),
+                "message {tag} lost across the capped drain"
+            );
+        }
+        // The second call cleared the backlog — a third recv is empty.
+        let third = call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+        assert!(third.contains("no new messages"), "backlog fully drained:\n{third}");
+    }
+
+    #[tokio::test]
+    async fn autopull_hints_more_when_replies_overflow_the_cap() {
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+        let mut bob = state(&hub, "bob").await;
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+
+        // Bob leaves more than AUTOPULL_LIMIT replies waiting before alice sends.
+        for i in 0..15 {
+            bob.agent.send_text(Target::Room { room: room.clone() }, &format!("r{i}")).await.unwrap();
+        }
+        let sent = call_session_tool(&mut alice, "parler_send", &json!({ "text": "?" })).await.unwrap();
+        assert!(sent.contains("more waiting"), "auto-pull hints there's more past the cap:\n{sent}");
+    }
+
+    #[tokio::test]
+    async fn long_body_is_truncated_then_refetchable_in_full() {
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+        let mut bob = state(&hub, "bob").await;
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap(); // drain own announce
+
+        // Alice posts a body well over MSG_MAX_CHARS.
+        let long = "A".repeat(MSG_MAX_CHARS + 500);
+        alice.agent.send_text(Target::Room { room: room.clone() }, &long).await.unwrap();
+
+        // Bob's cursor-mode recv truncates it with a refetch pointer.
+        let recv = call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+        assert!(recv.contains("chars — parler_recv since="), "long body truncated with a hint:\n{}", &recv[..recv.len().min(200)]);
+        assert!(recv.len() < long.len(), "truncated render is shorter than the full body");
+
+        // Extract the seq the hint points at and re-read that one message: it comes back in full.
+        let seq: i64 = recv
+            .split("since=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("a since=<seq> in the truncation hint");
+        let full = call_session_tool(&mut bob, "parler_recv", &json!({ "since": seq, "limit": 1 })).await.unwrap();
+        assert!(full.contains(&long), "explicit since re-read returns the full body");
+        assert!(!full.contains("chars — parler_recv since="), "re-reads are never truncated");
+    }
+
+    #[test]
+    fn recv_limit_decides_the_cap() {
+        // Explicit limit always wins (even in re-read / verbose).
+        assert_eq!(recv_limit(Some(5), false, false), Some(5));
+        assert_eq!(recv_limit(Some(5), true, true), Some(5));
+        // Plain cursor read → the default cap.
+        assert_eq!(recv_limit(None, false, false), Some(RECV_DEFAULT_LIMIT));
+        // A history re-read (`since`) is uncapped (full detail).
+        assert_eq!(recv_limit(None, true, false), None);
+        // Verbose is the global escape hatch → uncapped.
+        assert_eq!(recv_limit(None, false, true), None);
+    }
+
+    #[test]
+    fn budgeted_render_truncates_only_over_the_cap() {
+        // A short message renders identically to the plain render (no hint appended).
+        let short = StoredMessage {
+            seq: 7,
+            id: "i".into(),
+            room: "r".into(),
+            from: parler_protocol::EndpointRef { id: "a".into(), name: "alice".into(), role: None },
+            parts: vec![parler_protocol::Part::text("hi")],
+            mentions: None,
+            reply_to: None,
+            ts: 0,
+        };
+        assert_eq!(render_message_budgeted(&short), crate::render_message(&short));
+        assert!(!render_message_budgeted(&short).contains("parler_recv since="));
+
+        // A long message is truncated with a pointer to re-read it in full at seq-1.
+        let long = StoredMessage {
+            parts: vec![parler_protocol::Part::text("z".repeat(MSG_MAX_CHARS + 100))],
+            ..short.clone()
+        };
+        let out = render_message_budgeted(&long);
+        assert!(out.chars().count() < MSG_MAX_CHARS + 200, "truncated to ~the cap");
+        assert!(out.contains("parler_recv since=6 limit=1 for full"), "hint points at seq-1:\n{out}");
     }
 
     #[tokio::test]
