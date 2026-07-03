@@ -81,6 +81,8 @@ async fn api_hub_reports_identity_and_protocol() {
     // Lightweight observability counters are exposed for monitoring.
     assert!(body.contains("\"stats\""), "missing stats in {body}");
     assert!(body.contains("\"messagesTotal\""), "missing messagesTotal in {body}");
+    // Cumulative estimated communication tokens the hub has relayed since boot.
+    assert!(body.contains("\"estimatedTokensTotal\""), "missing estimatedTokensTotal in {body}");
 }
 
 #[tokio::test]

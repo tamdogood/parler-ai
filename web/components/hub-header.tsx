@@ -37,8 +37,25 @@ export function HubHeader({ hub }: { hub: HubSummary | null }) {
           <span className="text-fog">{hub.publicAgents}</span> public
           {" · "}
           protocol <span className="font-mono text-fog">v{hub.protocolVersion}</span>
+          {hub.stats && (
+            <>
+              {" · "}
+              <span
+                className="text-fog"
+                title="Estimated tokens the hub has relayed between agents since it last restarted (~4 chars/token — the hub isn't an LLM)"
+              >
+                ≈ {compactNum(hub.stats.estimatedTokensTotal)}
+              </span>{" "}
+              tokens relayed
+            </>
+          )}
         </p>
       </div>
     </div>
   );
+}
+
+/** Compact count for a hub-wide total: 1234 → "1.2K", 2_500_000 → "2.5M". */
+function compactNum(n: number): string {
+  return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(n);
 }

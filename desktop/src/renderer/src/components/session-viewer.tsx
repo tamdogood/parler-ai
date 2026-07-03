@@ -1,6 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Eye, KeyRound, Lock, Package, Paperclip, ServerCrash, ShieldCheck, Users } from "lucide-react";
-import type { SessionAgent, SessionMessage, SessionPart, SessionView } from "@/lib/types";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Eye,
+  KeyRound,
+  Lock,
+  Package,
+  Paperclip,
+  ServerCrash,
+  ShieldCheck,
+  Users,
+  Coins,
+  MessageSquare,
+  Clock,
+  Gauge,
+} from "lucide-react";
+import type {
+  SessionAgent,
+  SessionMessage,
+  SessionPart,
+  SessionStats,
+  SessionView,
+} from "@/lib/types";
 import { fetchSession, HubError } from "@/lib/api";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -179,6 +198,9 @@ function ConnectedView({
         </div>
       </div>
 
+      {/* Activity metrics — how many tokens the agents have spent + who's doing the talking. */}
+      {view.stats && <SessionStatsStrip stats={view.stats} />}
+
       {view.agents.length > 0 && (
         <div className="flex flex-wrap gap-2 border-b border-graphite-rail bg-black/20 px-5 py-3">
           {view.agents.map((a) => (
@@ -283,4 +305,127 @@ function fmtTime(ms: number): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * The activity panel: how many tokens the agents have spent talking (the headline ask), plus message
+ * count, activity span, tokens/message, and a per-agent "who's talking" breakdown. Token figures are
+ * estimates the hub computes from message text — it relays text, it doesn't run the model — so this is
+ * directional insight, not a billed count (hence the `≈` and the footnote).
+ */
+function SessionStatsStrip({ stats }: { stats: SessionStats }) {
+  const span =
+    stats.firstMessageAt && stats.lastMessageAt
+      ? Math.max(0, stats.lastMessageAt - stats.firstMessageAt)
+      : 0;
+  const avg = stats.messages > 0 ? Math.round(stats.estimatedTokens / stats.messages) : 0;
+  const top = stats.perAgent.slice(0, 5);
+  const maxTokens = top.reduce((m, a) => Math.max(m, a.estimatedTokens), 0) || 1;
+
+  return (
+    <div className="border-b border-graphite-rail bg-black/20 px-5 py-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <StatTile
+          icon={<Coins className="size-3.5 text-electric-blue" />}
+          label="Est. tokens"
+          value={`≈ ${fmtNum(stats.estimatedTokens)}`}
+          hint="spent communicating"
+        />
+        <StatTile
+          icon={<MessageSquare className="size-3.5 text-electric-blue" />}
+          label="Messages"
+          value={fmtNum(stats.messages)}
+        />
+        <StatTile
+          icon={<Gauge className="size-3.5 text-electric-blue" />}
+          label="Tokens / msg"
+          value={`≈ ${fmtNum(avg)}`}
+        />
+        <StatTile
+          icon={<Clock className="size-3.5 text-electric-blue" />}
+          label="Active for"
+          value={fmtDuration(span)}
+        />
+      </div>
+
+      {top.length > 0 && (
+        <div className="mt-4">
+          <p className="text-[11px] uppercase tracking-wide text-steel">Who&apos;s talking · estimated tokens</p>
+          <div className="mt-2 flex flex-col gap-1.5">
+            {top.map((a) => (
+              <div key={`${a.name}-${a.role ?? ""}`} className="flex items-center gap-3">
+                <span className="w-28 shrink-0 truncate text-[12px] text-frost">
+                  {a.name}
+                  {a.role && <span className="text-steel"> · {a.role}</span>}
+                </span>
+                <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-graphite-rail/50">
+                  <div
+                    className="absolute inset-y-0 left-0 rounded-full bg-electric-blue/60"
+                    style={{ width: `${Math.max(3, (a.estimatedTokens / maxTokens) * 100)}%` }}
+                  />
+                </div>
+                <span className="w-28 shrink-0 text-right font-mono text-[11px] text-fog">
+                  ≈ {fmtNum(a.estimatedTokens)}
+                  <span className="text-steel"> · {fmtNum(a.messages)} msg</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <p className="mt-3 text-[11px] leading-relaxed text-steel">
+        Token counts are estimated from message text (~4 chars/token). The hub relays text, so this is a
+        directional cost signal, not a model&apos;s exact billing.
+      </p>
+    </div>
+  );
+}
+
+function StatTile({
+  icon,
+  label,
+  value,
+  hint,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  hint?: string;
+}) {
+  return (
+    <div className="rounded-[12px] border border-graphite-rail bg-void-black px-3 py-2.5">
+      <div className="flex items-center gap-1.5 text-[11px] text-steel">
+        {icon}
+        {label}
+      </div>
+      <div className="mt-1 text-[18px] font-semibold leading-none text-pure-white">{value}</div>
+      {hint && <div className="mt-1 text-[10px] text-steel">{hint}</div>}
+    </div>
+  );
+}
+
+/** Compact number: 1234 → "1.2k", 2_500_000 → "2.5M". Small values stay exact. */
+function fmtNum(n: number): string {
+  if (!Number.isFinite(n)) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1_000)}k`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${n}`;
+}
+
+/** Human span: "45s", "12m", "1h 3m", "2d 4h". `—` for an empty/zero span. */
+function fmtDuration(ms: number): string {
+  if (ms <= 0) return "—";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) {
+    const rem = m % 60;
+    return rem ? `${h}h ${rem}m` : `${h}h`;
+  }
+  const d = Math.floor(h / 24);
+  return `${d}d ${h % 24}h`;
 }

@@ -581,6 +581,19 @@ async fn web_session_viewer_reads_a_watched_session() {
     // The viewer shape must not leak agent ids (public keys).
     assert!(v["agents"][0].get("id").is_none(), "the viewer must not expose agent ids");
 
+    // Activity metrics: estimated tokens spent + a per-agent breakdown (the new insight surface).
+    let stats = &v["stats"];
+    assert!(stats["messages"].as_i64().unwrap() >= 1, "at least alice's context message is counted");
+    assert!(stats["estimatedTokens"].as_i64().unwrap() > 0, "the conversation has a non-zero token estimate");
+    assert!(stats["firstMessageAt"].as_i64().is_some(), "the activity span has a start");
+    assert!(stats["lastMessageAt"].as_i64().is_some(), "the activity span has an end");
+    let per_agent = stats["perAgent"].as_array().unwrap();
+    let alice_row = per_agent.iter().find(|a| a["name"] == "alice").expect("alice is in the breakdown");
+    assert!(alice_row["estimatedTokens"].as_i64().unwrap() > 0, "alice's token spend is attributed to her");
+    assert!(alice_row["messages"].as_i64().unwrap() >= 1);
+    // The per-agent breakdown is display-identity only — no id leaks here either.
+    assert!(alice_row.get("id").is_none(), "the per-agent breakdown must not expose agent ids");
+
     // Incremental poll: nothing new past the cursor.
     let cursor = v["cursor"].as_i64().unwrap();
     let (_s, body2) = http_get(&hub, &format!("/api/session?since={cursor}"), Some(&watch)).await;

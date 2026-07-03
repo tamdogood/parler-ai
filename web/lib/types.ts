@@ -34,12 +34,24 @@ export interface DirectoryEntry {
   lastSeen: number;
 }
 
+/** Cumulative-since-boot hub counters (in-memory; reset on restart). All token figures are estimates. */
+export interface HubStats {
+  liveConnections: number;
+  connectionsTotal: number;
+  messagesTotal: number;
+  /** Estimated total tokens the hub has relayed since boot (~4 chars/token; the hub isn't an LLM). */
+  estimatedTokensTotal: number;
+  pushesTotal: number;
+}
+
 export interface HubSummary {
   name: string;
   mode: "public" | "private";
   agents: number;
   publicAgents: number;
   protocolVersion: string;
+  /** Present on hubs new enough to report observability counters. */
+  stats?: HubStats;
 }
 
 export type Scope = "public" | "hub";
@@ -70,6 +82,27 @@ export interface SessionMessage {
   parts: SessionPart[];
 }
 
+/** One participant's slice of the session's activity, by display identity (never an agent id). */
+export interface SessionAgentStat {
+  name: string;
+  role?: string;
+  messages: number;
+  /** Estimated tokens this agent has spent talking in the room (~4 chars/token; an estimate). */
+  estimatedTokens: number;
+}
+
+/** Whole-room activity metrics — the "how much have my agents been talking / spending" insight. */
+export interface SessionStats {
+  messages: number;
+  /** Estimated total tokens spent communicating in this room (an estimate, not a billed count). */
+  estimatedTokens: number;
+  /** Epoch-ms of the first / last message, or null for an empty room (the activity span). */
+  firstMessageAt: number | null;
+  lastMessageAt: number | null;
+  /** Per-agent breakdown, most estimated tokens first. */
+  perAgent: SessionAgentStat[];
+}
+
 /** The read-only view of a session the `/api/session` endpoint returns for a valid watch token. */
 export interface SessionView {
   room: string;
@@ -80,4 +113,6 @@ export interface SessionView {
   messages: SessionMessage[];
   /** The highest `seq` returned — pass back as `since` to poll for newer messages. */
   cursor: number;
+  /** Whole-room activity metrics. Optional so an older hub without it still renders the viewer. */
+  stats?: SessionStats;
 }

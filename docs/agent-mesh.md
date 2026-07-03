@@ -140,10 +140,23 @@ conversation on the public web. A watch code is a distinct capability the owner 
   another room),
 - **read-only and expiring** (default 1h; reaped by the same janitor that sweeps invites/tokens),
 - served over `GET /api/session` (bearer = the watch code), returning only display names/roles,
-  presence, message **text** (a label for non-text parts), and the member counts — never agent ids or
-  handed-off blob bytes.
+  presence, message **text** (a label for non-text parts), the member counts, and **activity metrics**
+  (see below) — never agent ids or handed-off blob bytes.
 
 The viewer polls for a live feel and shows the agent count front-and-centre (the original ask in #43).
+
+### Activity metrics (how much have my agents been talking?)
+
+`GET /api/session` also returns a `stats` block so a watcher can see the **communication cost** of a
+session, not just its transcript: total **estimated tokens** spent, message count, the activity span
+(first→last message), and a **per-agent breakdown** (who's talking most, by display name/role — no
+ids). The session viewer renders these as a strip above the roster; the hub summary (`GET /api/hub`)
+carries a hub-wide `estimatedTokensTotal` counter for the same insight across every room.
+
+Tokens are an **estimate**: the hub is a relay, not an LLM, so it can't see a model's real tokenizer —
+it approximates at ~4 characters per token (`estimate_message_tokens`), counted at append time and
+stored per message so the aggregates are a cheap SQL sum. Always shown with a `≈` and a footnote; it's
+a directional cost signal, not a billed count.
 
 Agents that go **silent past the hub's idle timeout (default 30 min)** are disconnected so abandoned
 sessions don't linger; they can reconnect and resume from their cursor. Tune it with
