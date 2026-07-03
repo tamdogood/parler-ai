@@ -975,3 +975,16 @@ Tests: `discover_is_compact_by_default_and_detailed_on_request`, `roster_hides_i
 `mcp_send_resolves_name_to_id` (name → unique id; unknown name errors, never guesses). Bumped
 `TOOL_DESC_BUDGET` 4,500 → 4,700 for the ~230 B of cheap-path steering P1.2 adds (still ~730 B under the
 pre-diet baseline; total specs 11,466 B, under budget). Gate green.
+
+### P1.3 — Rolling session digest as a keyed fact (DONE)
+Zero-hub-change convention: the host keeps a rolling recap via `parler_remember key="session-digest"
+room=<room> text="SESSION DIGEST: …"` (idempotent upsert). A late `join_session` now recalls it
+(`recall("SESSION DIGEST", room, limit=1)`) and renders it in a `--- session digest ---` block **above**
+the backlog tail — a human-written recap beats re-reading raw history. Belt-and-suspenders acceptance:
+the top hit is used only when its `key == "session-digest"` **and** its text starts with the
+`SESSION DIGEST` sentinel (guards against a BM25 false positive). Silent skip when absent or on error.
+`open_session` output + the open/remember tool specs teach the host to maintain it. Deterministic
+fetch-by-key (no BM25) is the queued P2.1 upgrade.
+
+Tests: `join_surfaces_session_digest_fact` (host remembers it → joiner sees the header + recap),
+`join_without_digest_fact_is_silent` (absent → no header, no error). Gate green.

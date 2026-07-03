@@ -891,6 +891,8 @@ async fn open_session(
          {oneliner}\n\
          Either way they land in the SAME conversation with the full context — no copy-paste.\n\
          {gate}\n\
+         Keep a rolling recap so late joiners catch up cheaply: parler_remember key=\"session-digest\" \
+         room=\"{room}\" text=\"SESSION DIGEST: …\" (re-save to update).\n\
          To let the user watch this session in their browser, call parler_watch_session for a read-only \
          web viewer code.\n\
          link: {url}",
@@ -907,6 +909,13 @@ const SEED_MARKER: &str = "📋 session context";
 /// How many trailing messages a "recent" join/handoff digest renders in full. Enough to see the live
 /// thread of the conversation; the rest is one omission line pointing at `parler_recv since=<seq>`.
 const JOIN_TAIL: usize = 15;
+
+/// The reserved key for the host's rolling session recap. Re-saving it overwrites (idempotent upsert),
+/// so it's always the *current* summary. A late join recalls and surfaces it above the tail.
+const SESSION_DIGEST_KEY: &str = "session-digest";
+/// The sentinel the digest text starts with — both the query we recall by and the check that a hit is
+/// genuinely the digest (guards against a BM25 false positive matching only the query words).
+const SESSION_DIGEST_SENTINEL: &str = "SESSION DIGEST";
 
 /// Default cap on how many messages a cursor-mode `parler_recv` renders per call. Lossless: a limited
 /// `Pull` advances the cursor only through the returned batch, so the remainder stays unread for the
@@ -1065,6 +1074,12 @@ async fn join_session(state: &mut McpState, key: &str, backlog: Backlog) -> Resu
         .send_text(Target::Room { room: room.clone() }, &format!("{} joined the session", state.agent.name))
         .await;
     let body = digest_backlog(&msgs, backlog);
+    // If the host maintains a rolling `session-digest` fact (P1.3 convention), surface it above the
+    // tail — it's a human-written recap that beats re-reading the raw backlog. Silent when absent.
+    let digest_line = session_digest(&mut state.agent, &room)
+        .await
+        .map(|d| format!("--- session digest ---\n{d}\n"))
+        .unwrap_or_default();
     // Roster as a count, not a full listing — the join stays cheap; parler_roster gives the details.
     let roster_line = match state.agent.roster(&room).await {
         Ok(entries) => format!("\n— {} agent(s) in the room —", entries.len()),
@@ -1072,8 +1087,25 @@ async fn join_session(state: &mut McpState, key: &str, backlog: Backlog) -> Resu
     };
     Ok(format!(
         "joined session — room '{room}', now your active session.\n\
-         --- context so far ---\n{body}\n--- end context ---{roster_line}"
+         {digest_line}--- context so far ---\n{body}\n--- end context ---{roster_line}"
     ))
+}
+
+/// The rolling session digest, if the host maintains one. Convention (P1.3): the host upserts a
+/// room-scoped fact `remember(key="session-digest", room, text="SESSION DIGEST: …")`, so a late joiner
+/// gets a human-written recap for free. We recall the top hit and accept it only when it's actually
+/// that keyed fact (key match) **and** carries the sentinel — belt-and-suspenders against a BM25 false
+/// positive matching the query words. `None` (silent) when there's no digest or the recall fails.
+/// A deterministic fetch-by-key (no BM25) is the P2.1 upgrade.
+async fn session_digest(agent: &mut MeshAgent, room: &str) -> Option<String> {
+    let hits = agent
+        .recall(SESSION_DIGEST_SENTINEL, Some(room.to_string()), Some(1), None)
+        .await
+        .ok()?;
+    let hit = hits.into_iter().next()?;
+    let is_the_key = hit.key.as_deref() == Some(SESSION_DIGEST_KEY);
+    let has_sentinel = hit.text.trim_start().starts_with(SESSION_DIGEST_SENTINEL);
+    (is_the_key && has_sentinel).then_some(hit.text)
 }
 
 /// How long `join_session` waits for a host approval before returning a "pending" message: a short
@@ -1575,6 +1607,39 @@ mod tests {
         assert!(joined.contains("m5 "), "full mode replays the middle:\n{joined}");
         assert!(joined.contains("m30 "), "full mode replays late-middle messages too");
         assert!(!joined.contains("earlier message(s) omitted"), "full mode has no omission line");
+    }
+
+    #[tokio::test]
+    async fn join_surfaces_session_digest_fact() {
+        // When the host maintains the rolling session-digest fact, a late joiner sees it above the tail.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), Some("plan".into()), None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+        // Host writes the keyed recap.
+        alice
+            .agent
+            .remember("SESSION DIGEST: auth done, next is billing", Some(SESSION_DIGEST_KEY.into()), Some(room.clone()), None, None)
+            .await
+            .unwrap();
+
+        let mut bob = state(&hub, "bob").await;
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        assert!(joined.contains("session digest"), "the digest header is shown:\n{joined}");
+        assert!(joined.contains("auth done, next is billing"), "the recap text is surfaced:\n{joined}");
+    }
+
+    #[tokio::test]
+    async fn join_without_digest_fact_is_silent() {
+        // No digest fact → no header, no error (silent skip).
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), Some("plan".into()), None, None, false).await.unwrap();
+        let key = key_of(&opened);
+        let mut bob = state(&hub, "bob").await;
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        assert!(!joined.contains("session digest"), "no digest header when the fact is absent:\n{joined}");
     }
 
     #[tokio::test]
