@@ -67,6 +67,27 @@ export interface SessionMessage {
   parts: SessionPart[];
 }
 
+/** One participant's slice of the session's activity, by display identity (never an agent id). */
+export interface SessionAgentStat {
+  name: string;
+  role?: string;
+  messages: number;
+  /** Estimated tokens this agent has spent talking in the room (~4 chars/token; an estimate). */
+  estimatedTokens: number;
+}
+
+/** Whole-room activity metrics — "how much have my agents been talking / spending." */
+export interface SessionStats {
+  messages: number;
+  /** Estimated total tokens spent communicating in this room (an estimate, not a billed count). */
+  estimatedTokens: number;
+  /** Epoch-ms of the first / last message, or null for an empty room (the activity span). */
+  firstMessageAt: number | null;
+  lastMessageAt: number | null;
+  /** Per-agent breakdown, most estimated tokens first. */
+  perAgent: SessionAgentStat[];
+}
+
 export interface SessionView {
   room: string;
   kind: string;
@@ -75,4 +96,6 @@ export interface SessionView {
   agents: SessionAgent[];
   messages: SessionMessage[];
   cursor: number;
+  /** Whole-room activity metrics. Optional so an older hub without it still renders the viewer. */
+  stats?: SessionStats;
 }

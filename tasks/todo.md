@@ -1,3 +1,70 @@
+# Task: Communication metrics — estimated tokens + activity (hub & session viewer) — 2026-07-03
+
+**User:** "build a feature into the agent hub, and session viewer so that we can keep track of how many
+tokens the users' agents have spent communicating within the hub ... better insight ... also add any
+other metrics that you think can be useful for the users to know about their agents activity."
+
+**Design:** the hub relays plaintext and is **not** an LLM, so it can't read a model's real tokenizer —
+it **estimates** tokens from message text (~4 chars/token, Unicode-scalar counted), always shown as an
+estimate ("≈"). This measures the cost of the inter-agent communication the hub actually carries —
+exactly "tokens spent communicating within the hub." Store an estimated `tokens` per message (new
+column via the existing `add_column_if_missing`, backfilled once) so aggregates are cheap SQL, not a
+re-parse per poll. **No new wire frame / protocol type** — purely additive helpers + REST fields.
+
+## Steps
+- [x] Explore protocol, hub store/server, session viewer, web types
+- [x] `parler-protocol`: `estimate_tokens(&str)` + `estimate_message_tokens(&[Part])` pure helpers + 2 tests
+- [x] `store.rs`: migrate `messages.tokens` (+ one-time backfill); `append_message(..., tokens)`;
+      `RoomStats`/`AgentStat` + `room_stats(room)`; store test
+- [x] `server.rs`: `Metrics.tokens_total`; `estimatedTokensTotal` in `/api/hub`; count+store tokens in
+      `Send`; `stats` object in `/api/session`; smoke + e2e assertions
+- [x] `web`: `types.ts` (`HubStats`/`HubSummary.stats?`, `SessionStats`/`SessionView.stats`); metrics
+      strip in `session-viewer.tsx`; hub-wide tokens in `hub-header.tsx`
+- [x] `desktop`: mirrored the same metrics strip + types in the app's session viewer
+- [x] `docs/agent-mesh.md`: "Activity metrics" subsection
+- [x] Verify: `CI_SKIP_WEB=1 make ci` (rust) + `web` build + desktop typecheck + **live binary round-trip**
+
+## Review — DONE & VERIFIED (2026-07-03) ✅
+
+Agents' **communication cost is now visible** in the hub summary and the session viewer (web + desktop),
+led by the headline the user asked for: *how many tokens have my agents spent talking through the hub.*
+
+**Design honesty:** the hub is a **relay, not an LLM**, so it can't know a model's real tokenizer — it
+**estimates** at ~4 chars/token (`estimate_message_tokens`, Unicode-scalar counted), computed once at
+append time and **stored per message** so every aggregate is a cheap SQL sum instead of a re-parse on
+each 4s viewer poll. Everything is labelled `≈` with a footnote. **No new protocol frame/type** — pure
+additive helpers + REST fields, so no wire-contract ripple.
+
+**What shipped:**
+- **`parler-protocol`** — `estimate_tokens` / `estimate_message_tokens` pure helpers (skip the sig part;
+  count text + string leaves of data/extension parts). 2 unit tests.
+- **`parler-hub` store** — `messages.tokens` column (in the DDL *and* `add_column_if_missing`, which now
+  returns whether it added it → one-time `backfill_message_tokens` for pre-existing rows).
+  `append_message` returns `(id, seq, tokens)`. New `room_stats(room)` → totals, activity span, and a
+  per-agent breakdown **grouped by display name/role (no agent id leaks)**, chattiest first. Store test.
+- **`parler-hub` server** — `Metrics.tokens_total` (bumped from the same estimate the row stored);
+  `estimatedTokensTotal` on `/api/hub`; a `stats` object on `/api/session`. Smoke test + the watch e2e
+  now assert the new fields (incl. the no-id-leak invariant on the per-agent rows).
+- **`web`** — `HubStats`/`SessionStats` types; a metrics strip (est. tokens · messages · tokens/msg ·
+  active-for + a "who's talking" per-agent bar chart) above the roster; hub-wide "≈ N tokens relayed"
+  on the hub header.
+- **`desktop`** — the same strip + types mirrored into the app's session viewer.
+- **`docs/agent-mesh.md`** — an "Activity metrics" subsection.
+
+**Verified:**
+- `CI_SKIP_WEB=1 make ci` → "all gates passed" (build · clippy -D warnings · test --locked · doc · deny).
+- Web `next build` green (all routes prerender; `/hub` 13.2→14.3 kB). Desktop `npm run typecheck` green.
+- **Live binary round-trip** (real `parler` CLI ⇄ real `parler-hub`): opened a session, sent 3 messages,
+  minted a watch code → `GET /api/session` returned `stats.estimatedTokens: 71`, `messages: 4`, the
+  activity span, and a per-agent row for alice (planner) **with no `id` field**; `GET /api/hub` showed
+  `estimatedTokensTotal: 82`, `messagesTotal: 4`. Fresh hub reports `estimatedTokensTotal: 0`.
+
+**Not committed** — working tree, ready for review/PR. **Deferred (noted):** desktop Local-Hub stats
+panel could also surface `estimatedTokensTotal` (the session viewer, the actual ask, is done); agent-
+reported *real* usage would need the MCP host to plumb token counts, which it doesn't expose today.
+
+---
+
 # Task: Full-app audit (arch · security · setup UX) + Wave 1 remediation — 2026-07-03
 
 **User:** "act as a senior engineer and architect, audit my entire app and draft a plan so that I can

@@ -520,6 +520,62 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+// ---- communication-cost metrics (estimated) ------------------------------------------------------
+
+/// A rough token estimate for a piece of text.
+///
+/// The hub is a **relay, not an LLM** — it never runs a model, so it cannot know a given model's exact
+/// tokenization. This approximates it with the widely-used **~4 characters per token** heuristic,
+/// counting Unicode scalar values (not bytes, so multi-byte text isn't overcounted). It exists for
+/// directional "how much have these agents been talking / how much has this cost" insight and is always
+/// surfaced as an estimate (`≈`), never an exact billing figure.
+pub fn estimate_tokens(text: &str) -> u64 {
+    chars_to_tokens(text.chars().count())
+}
+
+/// `ceil(chars / 4)` — the shared core, so a whole message and a bare string agree on the rule.
+fn chars_to_tokens(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+/// Estimated tokens carried by a message's parts — the language content an agent actually exchanged.
+///
+/// Sums every human-readable string the message carries: [`Part::Text`] verbatim, plus the string
+/// values inside [`Part::Data`] and extension parts (a tool observation's output, a handoff's
+/// instruction, …). The detached author-signature part ([`MESSAGE_SIG_KIND`]) is skipped — it is
+/// plumbing, not conversation. Uses the same [`estimate_tokens`] heuristic, so it is an estimate by the
+/// same rule.
+pub fn estimate_message_tokens(parts: &[Part]) -> u64 {
+    let mut chars = 0usize;
+    for p in parts {
+        match p {
+            Part::Text(t) => chars += t.chars().count(),
+            Part::Data(v) => chars += json_string_chars(v),
+            Part::Extension { fields, .. } => {
+                // The message signature is a base64 blob + routing echo, not words the agents said.
+                if is_message_sig_part(p) {
+                    continue;
+                }
+                for v in fields.values() {
+                    chars += json_string_chars(v);
+                }
+            }
+        }
+    }
+    chars_to_tokens(chars)
+}
+
+/// Total length (in Unicode scalar values) of every string leaf in a JSON value — so a structured part
+/// contributes the text it actually carries, not its JSON punctuation or numeric/boolean scaffolding.
+fn json_string_chars(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::String(s) => s.chars().count(),
+        serde_json::Value::Array(a) => a.iter().map(json_string_chars).sum(),
+        serde_json::Value::Object(m) => m.values().map(json_string_chars).sum(),
+        _ => 0,
+    }
+}
+
 /// The reverse-DNS [`Part`] kind that references a code/artifact bundle handed off through a room.
 pub const BUNDLE_KIND: &str = "com.parler.bundle";
 
@@ -1155,5 +1211,39 @@ mod tests {
         assert_eq!(j["message"]["parts"][0]["kind"], "text");
         let back: ServerFrame = serde_json::from_value(j).unwrap();
         assert_eq!(back, ServerFrame::Delivery { message: msg });
+    }
+
+    #[test]
+    fn estimate_tokens_is_ceil_quarter_of_unicode_chars() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("a"), 1); // ceil(1/4)
+        assert_eq!(estimate_tokens("abcd"), 1); // 4 chars → 1
+        assert_eq!(estimate_tokens("abcde"), 2); // ceil(5/4) = 2
+        // Unicode scalar values, not bytes: 4 emoji are 4 "chars" → 1 token, not 16 bytes → 4.
+        assert_eq!(estimate_tokens("😀😀😀😀"), 1);
+    }
+
+    #[test]
+    fn estimate_message_tokens_sums_text_and_extension_strings_but_skips_the_sig() {
+        // A text part (4 chars) + an observation extension whose string leaves total 8 chars.
+        let mut obs = serde_json::Map::new();
+        obs.insert("tool_name".into(), serde_json::json!("Bash")); // 4
+        obs.insert("tool_output".into(), serde_json::json!("done")); // 4
+        obs.insert("exit".into(), serde_json::json!(0)); // non-string ⇒ ignored
+        let sig = MessageSig {
+            sig: "AAAABBBBCCCCDDDD".into(),
+            ts: 1,
+            uid: "uid".into(),
+            target: Target::Room { room: "team".into() },
+        };
+        let parts = vec![
+            Part::text("abcd"), // 4
+            Part::Extension { kind: "com.parler.observation".into(), fields: obs }, // 8
+            sig.to_part(),      // excluded — plumbing, not conversation
+        ];
+        // 4 + 8 = 12 chars → ceil(12/4) = 3. The sig's base64/target must not inflate the count.
+        assert_eq!(estimate_message_tokens(&parts), 3);
+        // Dropping the sig part changes nothing (it never counted).
+        assert_eq!(estimate_message_tokens(&parts[..2]), 3);
     }
 }

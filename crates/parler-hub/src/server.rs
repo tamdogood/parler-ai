@@ -144,6 +144,9 @@ struct Metrics {
     connections_total: AtomicU64,
     /// Messages appended to any room since boot.
     messages_total: AtomicU64,
+    /// Estimated tokens carried by those messages since boot — the hub's total communication cost (an
+    /// estimate; see `estimate_message_tokens`, the hub is a relay, not an LLM).
+    tokens_total: AtomicU64,
     /// Live pushes delivered to subscribers since boot (a dropped/best-effort push is not counted).
     pushes_total: AtomicU64,
 }
@@ -667,6 +670,8 @@ async fn api_hub(State(state): State<Arc<HubState>>) -> impl IntoResponse {
             "liveConnections": state.conn_count.load(Ordering::Relaxed),
             "connectionsTotal": m.connections_total.load(Ordering::Relaxed),
             "messagesTotal": m.messages_total.load(Ordering::Relaxed),
+            // Estimated total tokens the hub has relayed since boot (see estimate_message_tokens).
+            "estimatedTokensTotal": m.tokens_total.load(Ordering::Relaxed),
             "pushesTotal": m.pushes_total.load(Ordering::Relaxed),
         },
     }))
@@ -802,6 +807,25 @@ async fn api_session(
     };
     let cursor = msgs.last().map(|m| m.seq).unwrap_or(since);
     let messages: Vec<_> = msgs.iter().map(viewer_message).collect();
+    // Whole-room activity metrics (independent of the viewer's `since` page): estimated tokens spent,
+    // message count, the activity span, and a per-agent breakdown. Cheap SQL aggregation, so it's fine
+    // to recompute on every poll. Token figures are estimates (the hub is a relay, not an LLM).
+    let stats = match state.store.room_stats(&room) {
+        Ok(s) => s,
+        Err(e) => return session_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let per_agent: Vec<_> = stats
+        .per_agent
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "name": a.name,
+                "role": a.role,
+                "messages": a.messages,
+                "estimatedTokens": a.tokens,
+            })
+        })
+        .collect();
     Json(serde_json::json!({
         "room": room,
         "kind": kind,
@@ -810,6 +834,13 @@ async fn api_session(
         "agents": agents,
         "messages": messages,
         "cursor": cursor,
+        "stats": {
+            "messages": stats.messages,
+            "estimatedTokens": stats.tokens,
+            "firstMessageAt": stats.first_ts,
+            "lastMessageAt": stats.last_ts,
+            "perAgent": per_agent,
+        },
     }))
     .into_response()
 }
@@ -1582,9 +1613,11 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             let mentions = mentions.as_deref().and_then(normalize_mentions);
             let from = EndpointRef { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
             let now = now_ms();
-            let (id, seq) =
+            let (id, seq, tokens) =
                 store.append_message(&room, &from, &parts, mentions.as_deref(), reply_to.as_deref(), now)?;
             state.metrics.messages_total.fetch_add(1, Ordering::Relaxed);
+            // Same estimate the row stored, so the hub-wide counter and the per-room totals agree.
+            state.metrics.tokens_total.fetch_add(tokens.max(0) as u64, Ordering::Relaxed);
             // Best-effort live push to subscribed members (the durable cursor is still the source of
             // truth, so this only lowers latency — it never replaces `Pull`). Built from the same
             // fields just persisted, so a pushed message is byte-identical to the pulled one.

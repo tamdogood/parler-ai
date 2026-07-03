@@ -8,8 +8,8 @@
 
 use anyhow::{anyhow, bail, Result};
 use parler_protocol::{
-    AgentCard, DirectoryEntry, DiscoverScope, EndpointRef, Fact, JoinRequest, Part, RecallHit,
-    RoomInfo, RoomKind, RosterEntry, StoredMessage, Visibility,
+    estimate_message_tokens, AgentCard, DirectoryEntry, DiscoverScope, EndpointRef, Fact,
+    JoinRequest, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, StoredMessage, Visibility,
 };
 use rusqlite::{named_params, params, Connection, OpenFlags, OptionalExtension};
 use std::collections::HashMap;
@@ -86,7 +86,11 @@ CREATE TABLE IF NOT EXISTS messages (
   parts       TEXT NOT NULL,
   mentions    TEXT,
   reply_to    TEXT,
-  ts          INTEGER NOT NULL
+  ts          INTEGER NOT NULL,
+  -- Estimated communication tokens this message carries (see `estimate_message_tokens`), stored at
+  -- append time so per-room/per-agent totals are a cheap aggregate. An estimate, not a billed count.
+  -- Also added to older DBs via `add_column_if_missing` (which backfills historical rows once).
+  tokens      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room, seq);
 -- Retention's age scan (`prune_messages`) filters `WHERE ts < cutoff`; without this it's a full table
@@ -194,6 +198,32 @@ CREATE TABLE IF NOT EXISTS blob_rooms (
 /// the protocol's intent that `offline` is "derived by observers, not self-set while live".
 pub const PRESENCE_STALE_MS: i64 = 300_000;
 
+/// Aggregate communication metrics for one room (see [`Store::room_stats`]) — the numbers behind the
+/// session viewer's "activity" panel. Every token figure is an **estimate** stored at append time
+/// (see [`estimate_message_tokens`]); the hub relays text and can't see a model's real tokenizer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoomStats {
+    /// Total messages appended to the room.
+    pub messages: i64,
+    /// Estimated tokens summed across every message — the room's communication cost.
+    pub tokens: i64,
+    /// Epoch-ms of the first / last message, or `None` for an empty room (the activity span).
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+    /// Per-agent breakdown, most estimated tokens first. Display identity only — never an agent id.
+    pub per_agent: Vec<AgentStat>,
+}
+
+/// One agent's slice of a [`RoomStats`] — how much this participant has said, keyed by the display
+/// name/role the viewer shows (an agent id is deliberately never exposed here).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentStat {
+    pub name: String,
+    pub role: Option<String>,
+    pub messages: i64,
+    pub tokens: i64,
+}
+
 /// The durable store. Cheaply cloneable (shares the connections behind an `Arc`).
 ///
 /// SQLite in WAL mode allows one writer and many concurrent readers, so the store keeps a single
@@ -262,6 +292,12 @@ impl Store {
         add_column_if_missing(&writer, "rooms", "owner", "TEXT")?;
         add_column_if_missing(&writer, "invites", "require_approval", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&writer, "facts", "embedding_model", "TEXT")?;
+        // Estimated communication tokens per message (see `estimate_message_tokens`). When freshly
+        // added to an existing DB, backfill historical rows once so a watched session's totals aren't
+        // skewed toward zero by messages that predate the column.
+        if add_column_if_missing(&writer, "messages", "tokens", "INTEGER NOT NULL DEFAULT 0")? {
+            backfill_message_tokens(&writer)?;
+        }
 
         // Vector index for semantic recall (sqlite-vec, registered via auto_extension above).
         let vec_dim = VEC_DIMENSION;
@@ -467,6 +503,9 @@ impl Store {
 
     // ---- messages ----
 
+    /// Append a message and return `(id, seq, tokens)` — `tokens` is the stored estimate of this
+    /// message's communication cost (see [`estimate_message_tokens`]), returned so the caller can also
+    /// bump the hub's cumulative counter from the same computation.
     pub fn append_message(
         &self,
         room: &str,
@@ -475,20 +514,23 @@ impl Store {
         mentions: Option<&[String]>,
         reply_to: Option<&str>,
         ts: i64,
-    ) -> Result<(String, i64)> {
+    ) -> Result<(String, i64, i64)> {
         let id = Uuid::now_v7().to_string();
         let parts_json = serde_json::to_string(parts)?;
         let mentions_json = match mentions {
             Some(m) => Some(serde_json::to_string(m)?),
             None => None,
         };
+        // Estimate + persist the token cost at write time, so per-room/per-agent totals are a cheap SQL
+        // aggregate later instead of a re-parse of every row on each viewer poll.
+        let tokens = estimate_message_tokens(parts) as i64;
         let conn = self.w();
         conn.execute(
-            "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts],
+            "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts, tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts, tokens],
         )?;
-        Ok((id, conn.last_insert_rowid()))
+        Ok((id, conn.last_insert_rowid(), tokens))
     }
 
     /// `pull`'s cursor read shares the same already-held connection (see [`Store::pull`]); the
@@ -592,6 +634,50 @@ impl Store {
             msgs.push(raw.to_stored()?);
         }
         Ok(msgs)
+    }
+
+    /// Aggregate communication metrics for `room` — total messages + estimated tokens, the activity
+    /// span (first/last message time), and a per-agent breakdown by **display identity** (name/role,
+    /// never an agent id). Powers the session viewer's activity panel; like [`Store::room_messages`]
+    /// the caller authorizes access first (a valid watch token for exactly this room). All token
+    /// figures are the estimates stored at append time — see [`estimate_message_tokens`].
+    pub fn room_stats(&self, room: &str) -> Result<RoomStats> {
+        let conn = self.r();
+        let (messages, tokens, first_ts, last_ts) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tokens), 0), MIN(ts), MAX(ts) FROM messages WHERE room = ?1",
+            params![room],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?;
+        // Group by the display identity we actually surface (name/role) — never the agent id — so a
+        // stable agent is one row and no public key can leak into the viewer. Chattiest (most estimated
+        // tokens) first, ties broken by message count then name for a deterministic order.
+        let per_agent = {
+            let mut stmt = conn.prepare(
+                "SELECT author_name, author_role, COUNT(*) AS n, COALESCE(SUM(tokens), 0) AS toks
+                   FROM messages WHERE room = ?1
+                  GROUP BY author_name, author_role
+                  ORDER BY toks DESC, n DESC, author_name ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![room], |r| {
+                    Ok(AgentStat {
+                        name: r.get(0)?,
+                        role: r.get(1)?,
+                        messages: r.get(2)?,
+                        tokens: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        Ok(RoomStats { messages, tokens, first_ts, last_ts, per_agent })
     }
 
     // ---- invites ----
@@ -1375,9 +1461,10 @@ fn room_owned_by(conn: &Connection, room: &str, owner: &str) -> Result<bool> {
 }
 
 /// Idempotently add a column to a table (SQLite has no `ADD COLUMN IF NOT EXISTS`), so an older
-/// on-disk schema can gain a column without a destructive rebuild. `table`/`col`/`decl` are internal
-/// constants, never user input.
-fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<()> {
+/// on-disk schema can gain a column without a destructive rebuild. Returns `true` iff it actually added
+/// the column (so a caller can run a one-time backfill only on first upgrade). `table`/`col`/`decl` are
+/// internal constants, never user input.
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<bool> {
     let present = conn
         .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -1387,6 +1474,35 @@ fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) 
     if !present {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl};"))?;
     }
+    Ok(!present)
+}
+
+/// One-time backfill of the `messages.tokens` estimate for rows that predate the column: parse each
+/// message's stored `parts`, estimate its tokens, and write them in a single transaction. Runs only the
+/// first time the column is added (see [`Store::open`]); on a fresh DB there are no rows, so it is a
+/// no-op. A row whose `parts` fail to parse is left at 0 rather than failing the whole migration.
+fn backfill_message_tokens(conn: &Connection) -> Result<()> {
+    let updates: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare("SELECT seq, parts FROM messages")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in mapped {
+            let (seq, parts_json) = row?;
+            let tokens = serde_json::from_str::<Vec<Part>>(&parts_json)
+                .map(|p| estimate_message_tokens(&p) as i64)
+                .unwrap_or(0);
+            out.push((seq, tokens));
+        }
+        out
+    };
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut up = tx.prepare("UPDATE messages SET tokens = ?1 WHERE seq = ?2")?;
+        for (seq, tokens) in &updates {
+            up.execute(params![tokens, seq])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2059,6 +2175,31 @@ mod tests {
         // The viewer is not a member, so its read must leave the member's pull cursor untouched.
         let (pulled, _cursor) = s.pull("room.s", "U_A", None, None).unwrap();
         assert_eq!(pulled.len(), 2, "member still sees the full backlog — room_messages didn't advance it");
+    }
+
+    #[test]
+    fn room_stats_aggregates_tokens_messages_span_and_per_agent() {
+        let s = Store::open(None).unwrap();
+        // "hello world" = 11 chars → ceil(11/4) = 3 tokens; "hi" = 2 → 1; "bug report here" = 15 → 4.
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 10).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hi")], None, None, 20).unwrap();
+        s.append_message("team", &eref("U_B", "bob"), &[Part::text("bug report here")], None, None, 30).unwrap();
+
+        let st = s.room_stats("team").unwrap();
+        assert_eq!(st.messages, 3);
+        assert_eq!(st.tokens, 3 + 1 + 4, "total = sum of the per-message estimates");
+        assert_eq!(st.first_ts, Some(10));
+        assert_eq!(st.last_ts, Some(30), "the activity span is MIN/MAX ts");
+
+        // Per-agent, most tokens first; alice (4) ties bob (4) on tokens but wins the message-count
+        // tiebreak (2 vs 1). Only display identity is exposed — the test never sees an agent id.
+        assert_eq!(st.per_agent.len(), 2);
+        assert_eq!((st.per_agent[0].name.as_str(), st.per_agent[0].messages, st.per_agent[0].tokens), ("alice", 2, 4));
+        assert_eq!((st.per_agent[1].name.as_str(), st.per_agent[1].messages, st.per_agent[1].tokens), ("bob", 1, 4));
+
+        // An unknown room is all-zeros with no span and no agents (not an error).
+        let empty = s.room_stats("nope").unwrap();
+        assert_eq!(empty, super::RoomStats::default());
     }
 
     // ---- vector / semantic recall ----
