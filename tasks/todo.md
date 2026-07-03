@@ -945,3 +945,17 @@ rest, union == all 40, third recv empty), `autopull_hints_more_when_replies_over
 `long_body_is_truncated_then_refetchable_in_full` (truncated body → `since=<seq-1> limit=1` returns it
 in full, re-reads never truncated), `recv_limit_decides_the_cap` + `budgeted_render_truncates_only_
 over_the_cap` (pure). Gate green.
+
+### P1.1 — Digest the MCP prompts (DONE)
+- `parler_session_handoff` prompt: now renders the shared `digest_backlog(Backlog::Recent)` (seed +
+  recent tail + omission line) instead of the full replay, with a roster **count** and a "parler_recv
+  since=<seq> / parler_recall for more" pointer.
+- `parler_consolidate_session` prompt: analyzes at most the **last 100** messages and instructs writing
+  the recap via `parler_remember key="session-digest" room="<room>"` (idempotent rolling digest — sets
+  up P1.3), keeping "extract 1–5 decisions".
+- Backlog **resource** doc string: relabeled as the explicit full-replay escape hatch and notes the hub's
+  200/page cap (`since` pages). The resource read itself stays a full pull — it IS the escape hatch.
+
+Test: `session_handoff_prompt_digests_not_replays` (drives `prompts/get` through the `run` loop; asserts
+seed + omission line + roster count + `parler_recv since=` pointer, and that a mid-backlog message is not
+replayed). Gate green.

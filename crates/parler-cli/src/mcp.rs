@@ -290,7 +290,7 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
                 {
                     "uri": "parler://active-session/backlog",
                     "name": "Active Session Backlog",
-                    "description": "Chronological history of the active session's conversation (all messages in the room).",
+                    "description": "Full chronological history of the active session — the explicit full-replay escape hatch when the join/recv digests aren't enough. The hub returns up to 200 messages per page (page older ranges with parler_recv since=<seq>).",
                     "mimeType": "text/plain"
                 },
                 {
@@ -349,23 +349,27 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
             match name {
                 "parler_session_handoff" => {
                     let room = state.active_session.clone().unwrap_or_else(|| "none".to_string());
+                    // Digest the backlog (seed + recent tail + an omission line), not a full replay —
+                    // the same token-efficient render a late join gets. `since=Some(0)` reads history
+                    // without touching the cursor.
                     let mut backlog = String::new();
-                    let mut roster_str = String::new();
+                    let mut roster_count = 0usize;
                     if let Some(ref r) = state.active_session {
                         if let Ok((msgs, _)) = state.agent.pull(r, Some(0), None).await {
-                            backlog = msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                            backlog = digest_backlog(&msgs, Backlog::Recent);
                         }
                         if let Ok(entries) = state.agent.roster(r).await {
-                            roster_str = entries.iter().map(|e| format!("- {} {} [{}]", e.name, e.id, e.status)).collect::<Vec<_>>().join("\n");
+                            roster_count = entries.len();
                         }
                     }
                     let text = format!(
                         "You are joining a Parler collaborative session.\n\
-                         Active Room: {room}\n\n\
-                         Roster:\n{roster_str}\n\n\
-                         Here is the chronological backlog of the conversation:\n\
+                         Active Room: {room} — {roster_count} agent(s) in the room.\n\n\
+                         Context so far (digest — seed + recent messages):\n\
                          {backlog}\n\n\
-                         Please review the backlog to catch up on the task, key decisions, relevant file paths, and current status. Then, continue coordinating with other agents or address the task at hand."
+                         For anything older, parler_recv since=<seq> re-reads a range in full and \
+                         parler_recall surfaces saved decisions. Review this, then continue \
+                         coordinating with the other agents or address the task at hand."
                     );
                     Ok(json!({
                         "description": "Handoff instructions for the active session",
@@ -380,17 +384,22 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
                 }
                 "parler_consolidate_session" => {
                     let room = state.active_session.clone().unwrap_or_else(|| "none".to_string());
+                    // Analyze at most the last 100 messages — enough to consolidate recent work
+                    // without pulling an unbounded backlog into context.
                     let mut backlog = String::new();
                     if let Some(ref r) = state.active_session {
                         if let Ok((msgs, _)) = state.agent.pull(r, Some(0), None).await {
-                            backlog = msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+                            let tail = &msgs[msgs.len().saturating_sub(100)..];
+                            backlog = tail.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
                         }
                     }
                     let text = format!(
-                        "Analyze the following conversation backlog from a collaborative session (Room: {room}).\n\
-                         Extract 1 to 5 key decisions, architectural choices, modified file paths, or lessons learned.\n\
-                         Write them down as room-scoped facts using the `parler_remember` tool with the room name '{room}'.\n\n\
-                         Backlog:\n{backlog}"
+                        "Analyze this recent conversation from a collaborative session (Room: {room}).\n\
+                         Extract 1 to 5 key decisions, architectural choices, modified file paths, or lessons learned, \
+                         then write a concise rolling recap with:\n\
+                         parler_remember key=\"session-digest\" room=\"{room}\" text=\"SESSION DIGEST: …\"\n\
+                         Re-saving that key overwrites it, so late joiners always get the current summary cheaply.\n\n\
+                         Recent messages:\n{backlog}"
                     );
                     Ok(json!({
                         "description": "Consolidate the session backlog into facts",
@@ -1967,6 +1976,31 @@ mod tests {
         // the open_session call ran and returned a key, and set the active session.
         assert!(out.contains("KEY: "));
         assert!(alice.active_session.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_handoff_prompt_digests_not_replays() {
+        // The parler_session_handoff prompt returns a digest (seed + tail + omission line + a roster
+        // count + a since/recall pointer), not the whole backlog replayed.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        open_session(&mut alice, Some("the handoff plan: finish auth"), Some("plan".into()), None, None, false)
+            .await
+            .unwrap();
+        let room = alice.active_session.clone().unwrap();
+        seed_room(&mut alice, &room, 40).await;
+
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/get\",\"params\":{\"name\":\"parler_session_handoff\"}}\n";
+        let mut output: Vec<u8> = Vec::new();
+        run(&mut alice, BufReader::new(input.as_bytes()), &mut output).await.unwrap();
+        let out = String::from_utf8(output).unwrap();
+
+        assert!(out.contains("the handoff plan: finish auth"), "seed present in the prompt digest:\n{out}");
+        assert!(out.contains("earlier message(s) omitted"), "middle summarized, not replayed:\n{out}");
+        assert!(out.contains("agent(s) in the room"), "roster rendered as a count");
+        assert!(out.contains("parler_recv since="), "prompt points at the full-detail re-read");
+        // A mid-backlog message is NOT replayed in the prompt (JSON-escaped, so match the tag).
+        assert!(!out.contains("m5 "), "an omitted middle message must not be in the prompt");
     }
 
     #[test]
