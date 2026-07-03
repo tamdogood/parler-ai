@@ -896,3 +896,16 @@ start loose (~20% headroom) and get tightened by the item that produces each sav
 - parler_send with ~20 waiting replies: **1,657 chars**.
 
 Gate: `scripts/verify.sh --rust-only` green.
+
+### P0.2 — Tool-spec diet + cheap-path steering (DONE)
+Rewrote the 23 tool descriptions tight while teaching the cheap path in the prose: prefer `wait_secs`
+long-poll over polling; keyed facts (`parler_remember key="session-digest"`) for durable state instead
+of re-reading history; `since`+`limit` re-reads render in full (never truncated). Kept the security
+guidance ("confirm with the user before approving", the join-key-can't-read warning) and kept specs
+fully static (prompt-cache friendly). Added the `backlog: recent|full` param to `parler_join_session`
+(wired in P0.3) and `to`-takes-a-name / `since`/`limit` param hints (wired in P1.2/P0.4).
+
+**Descriptions 5,261 B → 4,304 B (−957 B).** Full `tools/list` payload 11,598 B → 11,030 B (net −568 B;
+the description cut is partly offset by the new cheap-path param hints, which are themselves the steering
+payoff). Tightened `TOOL_SPECS_BUDGET` to 11,600 and added a `TOOL_DESC_BUDGET` (4,500) so the diet
+can't silently regress. Gate green.

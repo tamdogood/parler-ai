@@ -991,7 +991,7 @@ fn tool_specs() -> Vec<Value> {
     vec![
         tool(
             "parler_open_session",
-            "Open a shared live session and get a KEY to hand to other agents — the fastest way to bring another agent (Claude/Codex/Hermes/…) into your current conversation. Pass `context`: a thorough recap of the conversation so far (the task, key decisions, relevant files/paths, current state); it is posted as the session's first message so whoever joins is immediately caught up. Returns a key — give it to the other agent (it calls parler_join_session, or launch it with env PARLER_SESSION_KEY=<key>). Many agents can join one key. By default joiners must be APPROVED by you before they can read the conversation: when one redeems the key you'll be shown an accept/reject prompt (and can list/approve via parler_join_requests / parler_approve_join). This becomes your active session, so parler_send/parler_recv then need no room argument.",
+            "Open a shared live session; returns a KEY to hand another agent so it joins your conversation already caught up. `context` is posted as the first message — recap the task, decisions, files, state. Joiners need YOUR approval by default (you're shown an accept/reject prompt; confirm with the user). Becomes your active session (parler_send/parler_recv then need no room). Keep a durable recap current with parler_remember key=\"session-digest\" so late joiners get it cheaply.",
             json!({
                 "context": { "type": "string", "description": "summary of the conversation/state used to catch up whoever joins" },
                 "topic": { "type": "string", "description": "optional short name for the session" },
@@ -1003,25 +1003,28 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_join_session",
-            "Join a shared session using a KEY another agent gave you. If the session requires approval you'll be held as a pending request until the host admits you (this call reports that — retry it to check); once admitted you immediately receive the conversation context so far (the backlog is returned in the same call). This becomes your active session, so parler_send/parler_recv then need no room argument.",
-            json!({ "key": { "type": "string", "description": "the session key or link you were handed" } }),
+            "Join a session with a KEY. If approval is required you're held pending until the host admits you (retry to check). Once in, you get a digest of the context (seed + recent tail); backlog:\"full\" replays everything, or parler_recv since=<seq> re-reads a range in full. Becomes your active session (parler_send/parler_recv need no room).",
+            json!({
+                "key": { "type": "string", "description": "the session key or link you were handed" },
+                "backlog": { "type": "string", "enum": ["recent", "full"], "description": "recent (default): seed + recent tail; full: replay the entire backlog" }
+            }),
             &["key"],
         ),
         tool(
             "parler_close_session",
-            "Leave your active session — announces your departure and goes idle. The session stays alive for the other participants.",
+            "Leave your active session (announces departure, goes idle). The session stays alive for the others.",
             json!({}),
             &[],
         ),
         tool(
             "parler_join_requests",
-            "List the agents waiting for your approval to join a session you opened (defaults to your active session). Each line includes the joiner's id to pass to parler_approve_join / parler_deny_join.",
+            "List agents waiting for your approval to join a session you opened (defaults to active session). Each line carries the joiner's id for parler_approve_join / parler_deny_join.",
             json!({ "room": { "type": "string", "description": "the session room (defaults to your active session)" } }),
             &[],
         ),
         tool(
             "parler_approve_join",
-            "Approve a pending joiner into a session you opened — after this they can read the conversation and participate. Pass the joiner's agent id (from parler_join_requests or the prompt shown on send/recv). Defaults to your active session. Confirm with the user before approving.",
+            "Approve a pending joiner (from parler_join_requests or the send/recv prompt) — they can then read and participate. Defaults to active session. Confirm with the user before approving.",
             json!({
                 "agent": { "type": "string", "description": "the id of the joiner to admit" },
                 "room": { "type": "string", "description": "the session room (defaults to your active session)" }
@@ -1030,7 +1033,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_deny_join",
-            "Reject a pending joiner's request to join a session you opened — they are turned away and cannot re-request. Pass the joiner's agent id. Defaults to your active session.",
+            "Reject a pending joiner — turned away, can't re-request. Pass the joiner's id. Defaults to active session.",
             json!({
                 "agent": { "type": "string", "description": "the id of the joiner to reject" },
                 "room": { "type": "string", "description": "the session room (defaults to your active session)" }
@@ -1039,7 +1042,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_watch_session",
-            "Mint a read-only WATCH code for a session you opened, so the user can watch it from the Parler website (paste the code into the /session page → see the whole conversation and how many agents are in the room, live). Owner-only and separate from the join key: the join key can't read the backlog, so this is the safe way to let a human view the session. Defaults to your active session. Hand the returned code to the user.",
+            "Mint a read-only WATCH code so the user can watch this session live from the Parler website (/session page). Owner-only and separate from the join key (which can't read the backlog), so it's the safe way to let a human view it. Defaults to active session; hand the code to the user.",
             json!({
                 "room": { "type": "string", "description": "the session room (defaults to your active session)" },
                 "ttl_secs": { "type": "integer", "description": "how long the watch code stays valid (default 1h)" }
@@ -1048,7 +1051,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_invite",
-            "Mint an invite code/link to connect another agent. kind: dm (1:1, default), group (1:many channel), or service (many:1 queue). Hand the code/link to the other agent.",
+            "Mint an invite code/link for another agent. kind: dm (1:1, default), group (1:many channel), service (many:1 queue). Hand the code to the other agent.",
             json!({
                 "kind": { "type": "string", "enum": ["dm", "group", "service"] },
                 "name": { "type": "string", "description": "room/service name (group/service only)" },
@@ -1071,10 +1074,10 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_send",
-            "Send a message, and get back any replies already waiting in the same room (read-after-write; for a reply that hasn't arrived yet, use parler_recv with wait_secs). Defaults to your active session if you've opened/joined one; otherwise provide exactly one of: room (1:many channel), to (a peer agent id, 1:1 DM), or service (many:1 queue).",
+            "Send a message and get back replies already waiting in the room (read-after-write). Defaults to your active session; else give exactly one of room (channel), to (peer agent id or name, DM), service (queue). For a reply not landed yet, don't poll — parler_recv wait_secs long-polls for it.",
             json!({
                 "room": { "type": "string" },
-                "to": { "type": "string" },
+                "to": { "type": "string", "description": "a peer agent id or a directory name (resolved to a unique id)" },
                 "service": { "type": "string" },
                 "text": { "type": "string" }
             }),
@@ -1082,18 +1085,18 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_recv",
-            "Pull new messages since your cursor (which it advances). Defaults to your active session; pass room to read a different one. Use since/limit to re-read history. Set wait_secs to block (long-poll) up to that many seconds for a real-time push if nothing is waiting — returns as soon as a peer message arrives, or empty on timeout.",
+            "Pull new messages since your cursor (advances it). Defaults to active session; pass room for another. wait_secs long-polls that many seconds for a pushed reply instead of returning empty (cheaper than repeated calls). Long bodies are truncated with a refetch hint; since+limit re-reads that range in FULL (never truncated). Default batch is bounded — a 'more waiting' line means call again.",
             json!({
                 "room": { "type": "string" },
-                "since": { "type": "integer" },
-                "limit": { "type": "integer" },
+                "since": { "type": "integer", "description": "re-read from this seq in full (no cursor advance, no truncation)" },
+                "limit": { "type": "integer", "description": "max messages this call (default bounded; raise to read more at once)" },
                 "wait_secs": { "type": "integer", "description": "block up to this many seconds for a pushed message when nothing is waiting (sub-second wake; max 60)" }
             }),
             &[],
         ),
         tool(
             "parler_handoff",
-            "Hand the turn to another agent: post a structured 'you're up next' that the recipient sees as a 'HANDOFF TO YOU' banner on their next parler_recv (or instantly if they're long-polling with wait_secs), prompting them to continue without a human re-prompting. Use this when you've finished your part and want a specific teammate to take over. Defaults to your active session; or target room/to/service. Address it with `for` (an agent name or role); omit to hand off to anyone in the room. Attach handed-off code with `bundle` (a blob id from parler_push).",
+            "Hand the turn to another agent: posts a 'HANDOFF TO YOU' banner they see on their next parler_recv (instant if long-polling with wait_secs), so they continue without a human re-prompting. Use it when you finish your part. Defaults to active session; or target room/to/service. `for`: address by agent name or role (omit = anyone). `bundle`: attach a code blob id from parler_push.",
             json!({
                 "next": { "type": "string", "description": "what the next agent should do — the instruction to act on" },
                 "summary": { "type": "string", "description": "recap of what you just finished / current state, for the next agent's context" },
@@ -1107,7 +1110,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_remember",
-            "Save a fact to shared memory. With a key, re-saving the same key overwrites (idempotent). Optionally scope to a room. Pass an embedding vector for semantic recall (hybrid BM25 + vector search).",
+            "Save a durable fact to shared memory instead of re-reading history. With a key, re-saving overwrites (idempotent) — e.g. key=\"session-digest\" room=<room> keeps a rolling recap late joiners get cheaply. Optionally scope to a room; pass an embedding for hybrid semantic recall.",
             json!({
                 "text": { "type": "string" },
                 "key": { "type": "string" },
@@ -1119,7 +1122,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_recall",
-            "Recall from memory. Text-only runs BM25 full-text; with an embedding, runs hybrid BM25 + vector KNN (Reciprocal Rank Fusion). Either or both may be provided.",
+            "Recall saved facts (BM25 full-text; hybrid BM25 + vector KNN when an embedding is given). Cheaper than re-reading history for durable state you saved with parler_remember.",
             json!({
                 "query": { "type": "string" },
                 "room": { "type": "string" },
@@ -1130,7 +1133,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_push",
-            "Hand off code: build a git bundle from the current repo and push it to a room/peer/service. Provide exactly one of room / to / service. With base, bundle only base..gitref (a thin patch series). The peer applies it with `parler apply <blob>`.",
+            "Hand off code: build a git bundle from the repo and push it to a room/peer/service (exactly one). With base, bundle only base..gitref (a thin patch series). The peer applies it with `parler apply <blob>`.",
             json!({
                 "room": { "type": "string" },
                 "to": { "type": "string" },
@@ -1145,7 +1148,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_fetch",
-            "Download a pushed bundle's bytes by its blob id (from a com.parler.bundle message) and write them to a file. Does NOT apply — verify and fetch with git yourself.",
+            "Download a pushed bundle's bytes by blob id (from a com.parler.bundle message) to a file. Does NOT apply — verify/fetch with git yourself.",
             json!({
                 "id": { "type": "string" },
                 "out": { "type": "string", "description": "output file (default: <blob>.bundle)" }
@@ -1167,7 +1170,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_register",
-            "Publish your discovery card to the hub directory. visibility: private (default, same-hub only) or public (discoverable by anyone). The card is signed with your key so it is tamper-evident.",
+            "Publish your discovery card. visibility: private (default, same-hub) or public (anyone). Signed with your key, so it's tamper-evident.",
             json!({
                 "visibility": { "type": "string", "enum": ["public", "private"] },
                 "tags": { "type": "array", "items": { "type": "string" }, "description": "capability tags" },
@@ -1251,8 +1254,11 @@ mod tests {
     // Fixed-size synthetic messages keep the counts deterministic; consts carry ~20% headroom.
 
     /// Serialized `tools/list` payload size — permanent context cost, paid by every agent every
-    /// session. Baseline (pre-diet) ~13,532 B; tightened in P0.2.
-    const TOOL_SPECS_BUDGET: usize = 16_000;
+    /// session. Pre-diet baseline 11,598 B; post-diet (P0.2) 11,030 B. Ceiling with ~5% headroom.
+    const TOOL_SPECS_BUDGET: usize = 11_600;
+    /// Just the human-readable descriptions (the part the diet targets; schema scaffolding is
+    /// load-bearing). Pre-diet 5,261 B → post-diet 4,304 B. Ceiling with ~5% headroom.
+    const TOOL_DESC_BUDGET: usize = 4_500;
     /// Rendered `join_session` output with a ~100-message backlog. Full-replay baseline is large;
     /// P0.3's digest render brings it well under this.
     const JOIN_RENDER_BUDGET: usize = 30_000;
@@ -1294,6 +1300,10 @@ mod tests {
         assert!(
             bytes <= TOOL_SPECS_BUDGET,
             "tool specs {bytes} B exceed budget {TOOL_SPECS_BUDGET} B — trim descriptions"
+        );
+        assert!(
+            desc_bytes <= TOOL_DESC_BUDGET,
+            "tool descriptions {desc_bytes} B exceed budget {TOOL_DESC_BUDGET} B — keep them tight"
         );
     }
 
