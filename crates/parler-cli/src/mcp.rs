@@ -57,7 +57,7 @@ pub async fn serve_stdio() -> Result<()> {
     // host makes a single tool call. Failures are non-fatal — log to stderr (stdout is the
     // protocol channel) and carry on.
     if let Some(key) = std::env::var("PARLER_SESSION_KEY").ok().filter(|s| !s.is_empty()) {
-        match join_session(&mut state, &key).await {
+        match join_session(&mut state, &key, Backlog::Recent).await {
             Ok(msg) => eprintln!("parler: {msg}"),
             Err(e) => eprintln!("parler: PARLER_SESSION_KEY join failed: {e}"),
         }
@@ -616,7 +616,7 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
         }
         "parler_join_session" => {
             let key = s("key").ok_or_else(|| anyhow!("missing 'key'"))?;
-            join_session(state, &key).await
+            join_session(state, &key, Backlog::from_arg(s("backlog").as_deref())).await
         }
         "parler_close_session" => close_session(state).await,
         "parler_join_requests" => {
@@ -835,11 +835,85 @@ async fn open_session(
     ))
 }
 
+/// The marker the seed context message starts with (posted by `open_session`). A late joiner always
+/// gets the seed rendered in full — it's the recap the host wrote — while the middle of the backlog is
+/// summarized to an "N omitted" line. Kept in one place so the write path and the digest agree.
+const SEED_MARKER: &str = "📋 session context";
+
+/// How many trailing messages a "recent" join/handoff digest renders in full. Enough to see the live
+/// thread of the conversation; the rest is one omission line pointing at `parler_recv since=<seq>`.
+const JOIN_TAIL: usize = 15;
+
+/// Whether a join renders the whole backlog or a digest. `Recent` (default) is the token-efficient
+/// path: seed + tail + an omission line. `Full` is the escape hatch — replay everything.
+#[derive(Clone, Copy, PartialEq)]
+enum Backlog {
+    Recent,
+    Full,
+}
+
+impl Backlog {
+    fn from_arg(v: Option<&str>) -> Self {
+        match v {
+            Some("full") => Backlog::Full,
+            _ => Backlog::Recent,
+        }
+    }
+}
+
+/// Render a room backlog for a late joiner (and, via P1.1, the handoff prompt). In `Full` mode, or
+/// when the backlog is already short (≤ [`JOIN_TAIL`]), render every message. Otherwise digest:
+/// the context seed (always, in full) → an "N earlier messages omitted" line naming the
+/// `parler_recv since=<seq>` re-read → the last [`JOIN_TAIL`] messages in full. This is the ~85% cut
+/// for a late joiner: a full replay is paid by the LLM verbatim, but the middle is rarely needed and
+/// stays one `since`/`recall` call away.
+fn digest_backlog(msgs: &[StoredMessage], mode: Backlog) -> String {
+    if msgs.is_empty() {
+        return "(no prior context yet)".to_string();
+    }
+    let render_all = || msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n");
+    if mode == Backlog::Full || msgs.len() <= JOIN_TAIL {
+        return render_all();
+    }
+    // The seed is the earliest message whose rendered body opens with the marker (open_session posts
+    // it first). Rendered in full regardless of where the tail window starts, so the recap is never lost.
+    let seed_idx = msgs
+        .iter()
+        .position(|m| crate::render_parts(&m.parts).trim_start().starts_with(SEED_MARKER));
+    let tail_start = msgs.len() - JOIN_TAIL;
+    let mut out = Vec::new();
+    // Seed (if it exists and isn't already inside the tail window).
+    if let Some(i) = seed_idx {
+        if i < tail_start {
+            out.push(crate::render_message(&msgs[i]));
+        }
+    }
+    // The omitted middle: everything between the seed (exclusive) / start and the tail window. The
+    // re-read seq is one before the first omitted message so `parler_recv since=<seq>` returns it.
+    let omitted_start = match seed_idx {
+        Some(i) if i < tail_start => i + 1,
+        _ => 0,
+    };
+    if omitted_start < tail_start {
+        let n = tail_start - omitted_start;
+        let resume = msgs[omitted_start].seq - 1;
+        out.push(format!(
+            "— {n} earlier message(s) omitted; parler_recv since={resume} to re-read, parler_recall for decisions —"
+        ));
+    }
+    // The live tail, in full.
+    for m in &msgs[tail_start..] {
+        out.push(crate::render_message(m));
+    }
+    out.join("\n")
+}
+
 /// Join a shared session by key. For an approval-gated session the redeem only *requests* entry —
 /// the host must admit us first; we poll briefly for a fast approval, then return a clear "pending"
-/// message the agent can retry on. Once admitted, pull the full backlog (so the caller is caught up
-/// in one call), adopt it as the active session, and announce arrival.
-async fn join_session(state: &mut McpState, key: &str) -> Result<String> {
+/// message the agent can retry on. Once admitted, pull the backlog to catch up (and advance the
+/// cursor to the live edge), adopt it as the active session, and announce arrival. The backlog is
+/// rendered as a digest by default (`Backlog::Recent`) — `Backlog::Full` replays everything.
+async fn join_session(state: &mut McpState, key: &str, backlog: Backlog) -> Result<String> {
     let room = match state.agent.redeem(key).await? {
         JoinOutcome::Joined { room, .. } => room,
         JoinOutcome::Pending { room } => {
@@ -868,8 +942,9 @@ async fn join_session(state: &mut McpState, key: &str) -> Result<String> {
             }
         }
     };
-    // since=None advances our fresh cursor to the live edge, so a later parler_recv only returns
-    // genuinely new messages rather than re-delivering this backlog.
+    // since=None advances our fresh cursor to the live edge (this full pull is load-bearing), so a
+    // later parler_recv only returns genuinely new messages rather than re-delivering this backlog.
+    // We render a *digest* of what we pulled — the cursor still advanced past all of it.
     let (msgs, _cursor) = state.agent.pull(&room, None, None).await?;
     state.active_session = Some(room.clone());
     let _ = crate::save_active_session(&room);
@@ -877,14 +952,15 @@ async fn join_session(state: &mut McpState, key: &str) -> Result<String> {
         .agent
         .send_text(Target::Room { room: room.clone() }, &format!("{} joined the session", state.agent.name))
         .await;
-    let body = if msgs.is_empty() {
-        "(no prior context yet)".to_string()
-    } else {
-        msgs.iter().map(crate::render_message).collect::<Vec<_>>().join("\n")
+    let body = digest_backlog(&msgs, backlog);
+    // Roster as a count, not a full listing — the join stays cheap; parler_roster gives the details.
+    let roster_line = match state.agent.roster(&room).await {
+        Ok(entries) => format!("\n— {} agent(s) in the room —", entries.len()),
+        Err(_) => String::new(),
     };
     Ok(format!(
         "joined session — room '{room}', now your active session.\n\
-         --- context so far ---\n{body}\n--- end context ---"
+         --- context so far ---\n{body}\n--- end context ---{roster_line}"
     ))
 }
 
@@ -1259,9 +1335,10 @@ mod tests {
     /// Just the human-readable descriptions (the part the diet targets; schema scaffolding is
     /// load-bearing). Pre-diet 5,261 B → post-diet 4,304 B. Ceiling with ~5% headroom.
     const TOOL_DESC_BUDGET: usize = 4_500;
-    /// Rendered `join_session` output with a ~100-message backlog. Full-replay baseline is large;
-    /// P0.3's digest render brings it well under this.
-    const JOIN_RENDER_BUDGET: usize = 30_000;
+    /// Rendered `join_session` output with a ~100-message backlog. Full-replay baseline was 7,863
+    /// chars; P0.3's digest render (seed + tail + omission line) brings it to ~1,458. Ceiling leaves
+    /// headroom for a larger tail / longer messages.
+    const JOIN_RENDER_BUDGET: usize = 3_000;
     /// Rendered `parler_send` output when ~20 replies are already waiting (auto-pull). P0.4's caps
     /// bound this.
     const SEND_RENDER_BUDGET: usize = 12_000;
@@ -1320,7 +1397,7 @@ mod tests {
         seed_room(&mut alice, &room, 100).await;
 
         let mut bob = state(&hub, "bob").await;
-        let joined = join_session(&mut bob, &key).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         let chars = joined.chars().count();
         println!("[budget] join_session with ~100-msg backlog: {chars} chars rendered");
         assert!(
@@ -1328,6 +1405,57 @@ mod tests {
             "join render {} B exceeds budget {JOIN_RENDER_BUDGET} B",
             joined.len()
         );
+    }
+
+    #[tokio::test]
+    async fn join_digests_long_backlog() {
+        // A late joiner gets a *digest*: the seed in full, an omission line naming the re-read seq,
+        // and the last JOIN_TAIL messages — not the whole replay.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("the plan: ship auth by friday"), Some("plan".into()), None, None, false)
+            .await
+            .unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+        // Seed enough that the middle is omitted (well over JOIN_TAIL). Give the last one a marker we
+        // can assert appears (it's inside the tail window).
+        seed_room(&mut alice, &room, 40).await;
+        alice.agent.send_text(Target::Room { room: room.clone() }, "LAST_TAIL_MESSAGE").await.unwrap();
+
+        let mut bob = state(&hub, "bob").await;
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+
+        // Seed is always rendered in full (the host's recap).
+        assert!(joined.contains("the plan: ship auth by friday"), "seed present in digest:\n{joined}");
+        // The middle is summarized with a re-read pointer, not replayed.
+        assert!(joined.contains("earlier message(s) omitted"), "omission line present:\n{joined}");
+        assert!(joined.contains("parler_recv since="), "omission line names the re-read seq:\n{joined}");
+        // The live tail is present in full.
+        assert!(joined.contains("LAST_TAIL_MESSAGE"), "recent tail present:\n{joined}");
+        // A middle message (m5) is NOT replayed (it's in the omitted range).
+        assert!(!joined.contains("m5 "), "an omitted middle message must not be replayed:\n{joined}");
+        // Roster is a count, not a full listing.
+        assert!(joined.contains("agent(s) in the room"), "roster rendered as a count:\n{joined}");
+    }
+
+    #[tokio::test]
+    async fn join_full_mode_renders_entire_backlog() {
+        // The escape hatch: backlog:"full" replays every message (no digest, no omission line).
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), Some("plan".into()), None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+        seed_room(&mut alice, &room, 40).await;
+
+        let mut bob = state(&hub, "bob").await;
+        let joined = join_session(&mut bob, &key, Backlog::Full).await.unwrap();
+
+        // Full mode replays even a mid-backlog message and never emits the omission line.
+        assert!(joined.contains("m5 "), "full mode replays the middle:\n{joined}");
+        assert!(joined.contains("m30 "), "full mode replays late-middle messages too");
+        assert!(!joined.contains("earlier message(s) omitted"), "full mode has no omission line");
     }
 
     #[tokio::test]
@@ -1340,7 +1468,7 @@ mod tests {
 
         // Bob joins and posts ~20 fixed-size replies that are waiting when alice next sends.
         let mut bob = state(&hub, "bob").await;
-        join_session(&mut bob, &key).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         for i in 0..20 {
             bob.agent
                 .send_text(Target::Room { room: room.clone() }, &format!("reply {i} {}", body_of(60)))
@@ -1374,7 +1502,7 @@ mod tests {
         assert!(alice.active_session.is_some());
 
         let key = key_of(&opened);
-        let joined = join_session(&mut bob, &key).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         assert!(joined.contains("designing the auth flow"), "joiner should receive the seeded context");
         assert_eq!(bob.active_session, alice.active_session, "both share the same session room");
     }
@@ -1388,7 +1516,7 @@ mod tests {
         let opened = open_session(&mut alice, None, Some("empty".into()), None, None, false).await.unwrap();
         let key = key_of(&opened);
         // Bob joins; the only backlog should be his own "joined" announce — no seed context line.
-        let joined = join_session(&mut bob, &key).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         assert!(!joined.contains("session context"), "no seed message when context is omitted");
     }
 
@@ -1400,7 +1528,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), Some("design".into()), None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
 
         // Bob sends with no explicit target → goes to the active session.
         let bob_send = call_session_tool(&mut bob, "parler_send", &json!({ "text": "from bob" })).await.unwrap();
@@ -1421,7 +1549,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key).await.unwrap(); // advances bob's cursor to the live edge
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap(); // advances bob's cursor to the live edge
 
         // Alice posts after bob is caught up; bob's recv (no room) picks it up from the active session.
         call_session_tool(&mut alice, "parler_send", &json!({ "text": "ping bob" })).await.unwrap();
@@ -1438,8 +1566,8 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key).await.unwrap();
-        join_session(&mut carol, &key).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut carol, &key, Backlog::Recent).await.unwrap();
         // Drain each joiner's own "joined" announce so their cursors start clean.
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
         call_session_tool(&mut carol, "parler_recv", &json!({})).await.unwrap();
@@ -1474,7 +1602,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
 
         call_session_tool(&mut alice, "parler_handoff", &json!({ "next": "take it from here" }))
@@ -1495,7 +1623,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key).await.unwrap(); // bob caught up to the live edge
+        join_session(&mut bob, &key, Backlog::Recent).await.unwrap(); // bob caught up to the live edge
         // join_session posts bob's own "joined" announce *after* its catch-up pull, so it now sits
         // past bob's cursor — drain it so the long-poll below starts from a genuinely empty inbox
         // (otherwise the initial pull returns non-empty and short-circuits the wait).
@@ -1550,7 +1678,7 @@ mod tests {
         let key = key_of(&opened);
 
         // Bob redeems → held pending; he is NOT caught up and must not see the context.
-        let pending = join_session(&mut bob, &key).await.unwrap();
+        let pending = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         assert!(pending.contains("waiting for the host"), "joiner is gated: {pending}");
         assert!(!pending.contains("secret plan"), "a pending joiner must not receive the context");
         assert!(bob.active_session.is_none(), "a pending joiner has no active session yet");
@@ -1570,7 +1698,7 @@ mod tests {
         assert!(approved.contains("approved"));
 
         // Now bob's join succeeds and he receives the context in the same call.
-        let joined = join_session(&mut bob, &key).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
         assert!(joined.contains("secret plan: ship friday"), "an approved joiner gets the context: {joined}");
         assert_eq!(bob.active_session, alice.active_session, "both now share the session room");
     }
@@ -1583,7 +1711,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, true).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut eve, &key).await.unwrap(); // pending
+        join_session(&mut eve, &key, Backlog::Recent).await.unwrap(); // pending
 
         let denied = call_session_tool(&mut alice, "parler_deny_join", &json!({ "agent": eve.agent.id }))
             .await
@@ -1591,7 +1719,7 @@ mod tests {
         assert!(denied.contains("denied"));
 
         // The denial is terminal — eve's retry errors instead of letting her in.
-        assert!(join_session(&mut eve, &key).await.is_err());
+        assert!(join_session(&mut eve, &key, Backlog::Recent).await.is_err());
     }
 
     #[tokio::test]

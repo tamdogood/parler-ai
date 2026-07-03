@@ -909,3 +909,18 @@ fully static (prompt-cache friendly). Added the `backlog: recent|full` param to 
 the description cut is partly offset by the new cheap-path param hints, which are themselves the steering
 payoff). Tightened `TOOL_SPECS_BUDGET` to 11,600 and added a `TOOL_DESC_BUDGET` (4,500) so the diet
 can't silently regress. Gate green.
+
+### P0.3 — Digest-not-replay session joins (DONE)
+`join_session` now renders a *digest* of the backlog instead of a full replay. The load-bearing
+`pull(&room, None, None)` is unchanged (cursor still advances to the live edge past the whole backlog);
+only the render changed. New `digest_backlog(msgs, mode)` helper (shared with P1.1): in `Recent` mode
+(default) it renders the context **seed in full** (earliest message starting with the `📋 session
+context` marker) → `— N earlier message(s) omitted; parler_recv since=<seq> to re-read, parler_recall
+for decisions —` → the last `JOIN_TAIL=15` messages in full; roster is rendered as a **count** line, not
+a full listing. New `backlog: "recent"|"full"` param on `parler_join_session` (default recent; `full`
+is the escape hatch that replays everything). `PARLER_SESSION_KEY` env-join uses `Recent`.
+
+**join_session with ~100-msg backlog: 7,863 → 1,458 chars (−81%).** `JOIN_RENDER_BUDGET` tightened to
+3,000. Tests: `join_digests_long_backlog` (seed + omission line + tail present, a middle message not
+replayed, roster is a count) and `join_full_mode_renders_entire_backlog` (full replay, no omission
+line). Existing small-backlog join tests unaffected (≤ JOIN_TAIL → render everything). Gate green.
