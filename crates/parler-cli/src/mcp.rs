@@ -2351,7 +2351,7 @@ mod tests {
         let refname = format!("refs/parler/{}", crate::short(blob_id));
         let verify_out = std::process::Command::new("git")
             .current_dir(bob_dir.path())
-            .args(&["rev-parse", &refname])
+            .args(["rev-parse", &refname])
             .output()
             .unwrap();
         assert!(verify_out.status.success());
