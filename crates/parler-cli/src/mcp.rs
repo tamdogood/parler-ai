@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Result};
 use parler_connector::{BundleMeta, Config, JoinOutcome, MeshAgent};
 use parler_protocol::{AgentSkill, DiscoverScope, HandoffRef, RoomKind, StoredMessage, Target, Visibility};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -24,9 +24,6 @@ pub(crate) const DEFAULT_PUBLIC_HUB: &str = "wss://parler-hub.fly.dev";
 struct McpState {
     agent: MeshAgent,
     active_session: Option<String>,
-    /// Whether the hub is pushing to us (a successful `subscribe`), so `parler_recv` may long-poll
-    /// for a sub-second reply instead of returning empty.
-    push: bool,
 }
 
 /// Connect to the hub, then serve the MCP JSON-RPC loop on stdin/stdout until EOF.
@@ -38,7 +35,7 @@ pub async fn serve_stdio() -> Result<()> {
             return Err(e);
         }
     };
-    let mut agent = match MeshAgent::connect(&cfg).await {
+    let mut agent = match connect_with_retry(&cfg).await {
         Ok(a) => a,
         Err(e) => {
             // Leave a breadcrumb before we exit: a GUI host swallows stderr, so `parler doctor`
@@ -48,22 +45,27 @@ pub async fn serve_stdio() -> Result<()> {
         }
     };
     log_event(&format!("connected as {} ({}) → {}", cfg.name, cfg.identity.id, cfg.hub_url));
-    // Opt into sub-second push so `parler_recv` can long-poll for replies (best-effort; against an
-    // older hub this is a no-op and we stay purely pull-based).
-    let push = agent.subscribe().await.unwrap_or(false);
+    // Opt into sub-second push as a *latency optimization* (best-effort; a no-op against an older
+    // hub). It's no longer load-bearing for long-poll — `parler_recv wait_secs` uses the hub's
+    // server-side wait, which works with zero push machinery — so a failed subscribe here just means
+    // we lean on the server-side wait, not that long-poll is unavailable. The live subscription state
+    // lives in the connector (queried via `push_active()`), not cached here.
+    let _ = agent.subscribe().await;
     // Self-list on the hub the moment we connect, so a freshly wired agent is visible to same-hub
     // peers (and shows up under the desktop app's Agents) without a human having to call
     // `parler_register` first — "connected" should mean "discoverable". Private by default
     // (same-hub only); opt into the public directory or enrich the card via env. Best-effort.
     auto_register(&mut agent).await;
-    let mut state = McpState { agent, active_session: None, push };
+    let mut state = McpState { agent, active_session: None };
 
     // Spin-up convenience: if a session key was handed in via the environment, join it now so a
     // freshly launched agent is already in the shared conversation (with its context) before the
     // host makes a single tool call. Failures are non-fatal — log to stderr (stdout is the
     // protocol channel) and carry on.
     if let Some(key) = std::env::var("PARLER_SESSION_KEY").ok().filter(|s| !s.is_empty()) {
-        match join_session(&mut state, &key, Backlog::Recent).await {
+        // Auto-join is a spin-up convenience, not an interactive call — don't block boot on a human
+        // approval; a pending join returns its "waiting" message and the agent proceeds.
+        match join_session(&mut state, &key, Backlog::Recent, None).await {
             Ok(msg) => {
                 eprintln!("parler: {msg}");
                 log_event(&format!("session join SUCCESS ({key}): {msg}"));
@@ -117,7 +119,55 @@ where
     Ok(())
 }
 
-/// Load the saved identity, or — for zero-setup onboarding — mint one on first launch.
+/// How long `parler mcp` keeps retrying a down hub at startup before giving up. A host often
+/// launches the agent the instant the user opens the editor — possibly *before* their `--local`
+/// hub is up — so dying on the first refused connection would leave a dead MCP server with no
+/// visible cause (issue #102). Retrying for a short window lets the agent ride out a hub that's
+/// still coming up (or that the user starts a few seconds later).
+const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Connect to the hub, retrying a *reachability* failure for [`CONNECT_RETRY_WINDOW`] instead of
+/// dying instantly. An auth failure (bad/absent join secret) is returned immediately — retrying
+/// can't fix it and would only delay the breadcrumb. Each retry leaves a log line so `parler
+/// doctor` can show the agent was waiting on the hub, and names the exact start command.
+async fn connect_with_retry(cfg: &Config) -> Result<MeshAgent> {
+    let start = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        match MeshAgent::connect(cfg).await {
+            Ok(a) => return Ok(a),
+            Err(e) => {
+                // A join-secret / auth rejection won't heal by waiting — surface it now.
+                let msg = e.to_string();
+                let is_auth = msg.contains("authentication failed") || msg.contains("join secret");
+                if is_auth || start.elapsed() >= CONNECT_RETRY_WINDOW {
+                    return Err(e);
+                }
+                if !announced {
+                    announced = true;
+                    let hint = start_hub_hint(&cfg.hub_url);
+                    eprintln!("parler: hub {} not reachable yet — retrying for {}s. {hint}", cfg.hub_url, CONNECT_RETRY_WINDOW.as_secs());
+                    log_event(&format!("hub {} down at startup — retrying up to {}s ({hint})", cfg.hub_url, CONNECT_RETRY_WINDOW.as_secs()));
+                }
+                tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
+/// The one command that starts the hub an agent is waiting on — a loopback URL means `parler hub
+/// --local`; anything else is a remote hub the user must bring up (or already have running).
+pub(crate) fn start_hub_hint(hub_url: &str) -> String {
+    if hub_url.contains("127.0.0.1") || hub_url.contains("localhost") {
+        "Start it with:  parler hub --local".to_string()
+    } else {
+        "Start/reach the hub, then it will connect automatically.".to_string()
+    }
+}
+
+/// Load the saved identity, or — for zero-setup onboarding — mint one on first launch, then apply
+/// the one env/config precedence rule identically for the CLI and the MCP server.
 ///
 /// A new user shouldn't have to run `parler init` before wiring up the MCP server: the first time
 /// an MCP host starts `parler mcp`, we create an Ed25519 identity pointed at the public hub and
@@ -126,10 +176,19 @@ where
 ///   - `PARLER_HUB`  — hub to dial (default: the public hub; use `ws://host:port` for a private one)
 ///   - `PARLER_NAME` — display name (default: `$USER`, else `agent`)
 ///   - `PARLER_ROLE` — role advertised on the card (planner, reviewer, …)
+///
+/// The precedence is **explicit env var > saved config > default**, matching how
+/// `PARLER_JOIN_SECRET` is already read live from the environment on every connect. This is the
+/// single source of truth: both `parler mcp` and the CLI's [`crate::connect`]-time agent resolve
+/// their hub/name/role through here, so a re-run of `parler connect` that rewrites the env block
+/// genuinely moves/renames the agent on next launch instead of being silently ignored.
 pub(crate) fn load_or_bootstrap_config() -> Result<Config> {
     if Config::exists() {
-        return Config::load();
+        // A saved identity keeps its stable id + seed, but its hub/name/role follow the live env so
+        // that re-wiring via `parler connect` (which rewrites the env block) takes effect.
+        return Ok(apply_env_overrides(Config::load()?));
     }
+    // First run — mint the identity from the env (falling back to $USER / the public hub).
     let hub = std::env::var("PARLER_HUB")
         .ok()
         .filter(|s| !s.is_empty())
@@ -147,6 +206,56 @@ pub(crate) fn load_or_bootstrap_config() -> Result<Config> {
     eprintln!("parler: initialized new agent {} ({}) → {}", cfg.name, cfg.identity.id, cfg.hub_url);
     log_event(&format!("bootstrapped identity {} → {}", cfg.identity.id, cfg.hub_url));
     Ok(cfg)
+}
+
+/// Apply the `explicit env var > saved config > default` rule to a *loaded* config's hub/name/role.
+///
+/// The identity (id + seed) is untouched — only the mutable, re-wireable fields follow the live
+/// environment, so pointing an already-bootstrapped agent at a new hub is a matter of rewriting its
+/// `PARLER_HUB` env (what `parler connect` does) rather than editing `config.json`. Each field the
+/// env actually changes is announced once — stderr for the user, `log_event` so `parler doctor` can
+/// show which hub was chosen and why (clig.dev: "if you change state, tell the user").
+pub(crate) fn apply_env_overrides(cfg: Config) -> Config {
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    apply_overrides(cfg, env("PARLER_HUB"), env("PARLER_NAME"), env("PARLER_ROLE"), &mut |line| {
+        // Announce each real change once: stderr for the user, `log_event` so `parler doctor` can
+        // show which hub was chosen and why (clig.dev: "if you change state, tell the user").
+        eprintln!("parler: {line}");
+        log_event(&line);
+    })
+}
+
+/// The pure precedence rule, factored out of [`apply_env_overrides`] so it can be unit-tested
+/// without touching (racy, process-global) environment variables — each present env value wins over
+/// the saved config; the identity (id + seed) is never touched. `note` is called once per field the
+/// env actually changes, so the caller decides how to surface it.
+fn apply_overrides(
+    mut cfg: Config,
+    env_hub: Option<String>,
+    env_name: Option<String>,
+    env_role: Option<String>,
+    note: &mut dyn FnMut(String),
+) -> Config {
+    if let Some(hub) = env_hub {
+        if hub != cfg.hub_url {
+            note(format!("PARLER_HUB overrides saved hub — dialing {hub} (was {})", cfg.hub_url));
+            cfg.hub_url = hub;
+        }
+    }
+    if let Some(name) = env_name {
+        if name != cfg.name {
+            note(format!("PARLER_NAME overrides saved name — '{name}' (was '{}')", cfg.name));
+            cfg.name = name;
+        }
+    }
+    if let Some(role) = env_role {
+        if cfg.role.as_deref() != Some(role.as_str()) {
+            let was = cfg.role.as_deref().unwrap_or("none").to_string();
+            note(format!("PARLER_ROLE overrides saved role — '{role}' (was '{was}')"));
+            cfg.role = Some(role);
+        }
+    }
+    cfg
 }
 
 /// Where the MCP connection breadcrumb log lives (`~/.parler/mcp.log`).
@@ -712,7 +821,8 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
         }
         "parler_join_session" => {
             let key = s("key").ok_or_else(|| anyhow!("missing 'key'"))?;
-            join_session(state, &key, Backlog::from_arg(s("backlog").as_deref())).await
+            let wait_secs = args.get("wait_secs").and_then(Value::as_u64).filter(|w| *w > 0);
+            join_session(state, &key, Backlog::from_arg(s("backlog").as_deref()), wait_secs).await
         }
         "parler_close_session" => close_session(state).await,
         "parler_join_requests" => {
@@ -848,22 +958,35 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             let re_read = since.is_some();
             let effective_limit = recv_limit(explicit_limit, re_read, verbose_render());
             let (mut msgs, mut cursor) = state.agent.pull(&room, since, effective_limit).await?;
-            // Long-poll: if nothing new yet and the caller asked to wait (and the hub is pushing),
-            // block up to `wait_secs` for a peer message, then re-pull to read + advance the cursor.
-            // Only in cursor mode (`since` absent) — an explicit `since` is a history re-read.
-            if msgs.is_empty() && since.is_none() && state.push {
-                if let Some(secs) = args.get("wait_secs").and_then(Value::as_u64).filter(|w| *w > 0) {
-                    let secs = secs.min(60);
-                    if state.agent.next_delivery(Duration::from_secs(secs)).await?.is_some() {
-                        let (m, c) = state.agent.pull(&room, None, effective_limit).await?;
-                        msgs = m;
-                        cursor = c;
-                    }
+            // Long-poll: if nothing new yet and the caller asked to wait, prefer the hub's
+            // **server-side wait** (`pull_wait`) — it works with zero push machinery (even on a
+            // connection whose `Subscribe` failed), heartbeats the socket during the wait, and
+            // transparently reconnects a half-open transport. Only in cursor mode (`since` absent) —
+            // an explicit `since` is a full-detail history re-read, never a live tail.
+            let wait_secs = args.get("wait_secs").and_then(Value::as_u64).filter(|w| *w > 0);
+            let mut degraded = false;
+            if msgs.is_empty() && since.is_none() {
+                if let Some(secs) = wait_secs {
+                    let secs = secs.min(WAIT_SECS_MAX);
+                    // Retry a failed initial subscribe once (a latency win when it succeeds); the wait
+                    // itself doesn't depend on it.
+                    let _ = state.agent.resubscribe_if_needed().await;
+                    let (m, c, waited) = state.agent.pull_wait(&room, effective_limit, secs).await?;
+                    msgs = m;
+                    cursor = c;
+                    degraded = degraded_wait(msgs.is_empty(), waited, state.agent.push_active());
                 }
             }
             let batch_full = effective_limit.is_some_and(|l| msgs.len() as u32 >= l);
             let mut out = if msgs.is_empty() {
-                format!("(no new messages in '{room}')")
+                // Honest degraded mode: only when a wait was requested but genuinely couldn't happen
+                // (old hub, no push) — so the agent knows this returned immediately and can pace
+                // itself instead of hammering. One short line; never shown when the wait did work.
+                if degraded {
+                    format!("(no new messages in '{room}') — long-poll unavailable (hub too old for server-side wait, no push); polling instead")
+                } else {
+                    format!("(no new messages in '{room}')")
+                }
             } else {
                 let refs: Vec<&_> = msgs.iter().collect();
                 // Re-reads (explicit `since`) render in full; cursor-mode reads budget long bodies.
@@ -972,6 +1095,11 @@ const SESSION_DIGEST_SENTINEL: &str = "SESSION DIGEST";
 /// next call (see store.rs). An explicit `limit`/`since` overrides this.
 const RECV_DEFAULT_LIMIT: u32 = 30;
 
+/// Hard cap on a `parler_recv wait_secs` / `parler_join_session wait_secs` long-poll, matching the
+/// hub's own `MAX_WAIT_SECS` park bound so the client never asks the hub to hold a request longer
+/// than the hub will honor.
+const WAIT_SECS_MAX: u64 = 60;
+
 /// Default cap on the auto-pull appended to a `parler_send` result. Same losslessness as
 /// [`RECV_DEFAULT_LIMIT`]; a peer flood past this resurfaces on the next `parler_recv`.
 const AUTOPULL_LIMIT: u32 = 10;
@@ -1013,6 +1141,15 @@ fn recv_limit(explicit: Option<u32>, re_read: bool, verbose: bool) -> Option<u32
         (None, false, false) => Some(RECV_DEFAULT_LIMIT),
         _ => None,
     }
+}
+
+/// Whether a `parler_recv wait_secs` is **genuinely degraded** — i.e. the wait was requested but
+/// couldn't actually happen — so the result should carry an honest "polling instead" note. Pure so
+/// it's testable without a hub: true only when the room stayed empty AND no server-side wait occurred
+/// (`waited == false`) AND there's no push subscription to fall back on. Against a current hub the
+/// hub parks the request (`waited == true`), so this is `false` and the note never appears.
+fn degraded_wait(empty: bool, waited: bool, push_active: bool) -> bool {
+    empty && !waited && !push_active
 }
 
 /// Whether a join renders the whole backlog or a digest. `Recent` (default) is the token-efficient
@@ -1079,35 +1216,31 @@ fn digest_backlog(msgs: &[StoredMessage], mode: Backlog) -> String {
     out.join("\n")
 }
 
-/// Join a shared session by key. For an approval-gated session the redeem only *requests* entry —
-/// the host must admit us first; we poll briefly for a fast approval, then return a clear "pending"
-/// message the agent can retry on. Once admitted, pull the backlog to catch up (and advance the
-/// cursor to the live edge), adopt it as the active session, and announce arrival. The backlog is
-/// rendered as a digest by default (`Backlog::Recent`) — `Backlog::Full` replays everything.
-async fn join_session(state: &mut McpState, key: &str, backlog: Backlog) -> Result<String> {
+/// Join a shared session by key. For an approval-gated session the redeem only *requests* entry — the
+/// host must admit us first. With `wait_secs` this **one call** spans the approval wait (re-redeeming
+/// on an interval until the host decides or the budget runs out, keeping the socket alive with
+/// heartbeats), instead of returning "pending" and asking the agent to call again N times. Without
+/// `wait_secs` it keeps the original short poll (a quick approval still resolves in-call). A denial
+/// surfaces as an error from redeem and propagates out. Once admitted, pull the backlog to catch up
+/// (advancing the cursor to the live edge), adopt it as the active session, and announce arrival. The
+/// backlog renders as a digest by default (`Backlog::Recent`) — `Backlog::Full` replays everything.
+async fn join_session(
+    state: &mut McpState,
+    key: &str,
+    backlog: Backlog,
+    wait_secs: Option<u64>,
+) -> Result<String> {
     let room = match state.agent.redeem(key).await? {
         JoinOutcome::Joined { room, .. } => room,
         JoinOutcome::Pending { room } => {
-            // Short poll so a quick host approval still resolves in this one call; a denial surfaces
-            // as an error from redeem and propagates out.
-            let mut admitted = None;
-            for _ in 0..JOIN_POLL_ATTEMPTS {
-                tokio::time::sleep(std::time::Duration::from_millis(JOIN_POLL_INTERVAL_MS)).await;
-                match state.agent.redeem(key).await? {
-                    JoinOutcome::Joined { room, .. } => {
-                        admitted = Some(room);
-                        break;
-                    }
-                    JoinOutcome::Pending { .. } => continue,
-                }
-            }
-            match admitted {
+            match wait_for_approval(state, key, wait_secs).await? {
                 Some(room) => room,
                 None => {
                     return Ok(format!(
                         "⏳ join request sent — waiting for the host to approve you into session '{room}'.\n\
                          You are NOT in the conversation yet and cannot see its context until the host \
-                         approves. Call parler_join_session again with the same key to check.",
+                         approves. Call parler_join_session again with the same key (add wait_secs to \
+                         hold this one call open until the host decides).",
                     ))
                 }
             }
@@ -1158,11 +1291,58 @@ async fn session_digest(agent: &mut MeshAgent, room: &str) -> Option<String> {
     (is_the_key && has_sentinel).then_some(hit.text)
 }
 
-/// How long `join_session` waits for a host approval before returning a "pending" message: a short
+/// How long `join_session` waits for a host approval when the caller gave **no** `wait_secs`: a short
 /// poll (bounded by these) so a quick approval resolves in the same call, but a human-paced one
-/// doesn't block the joiner indefinitely.
+/// doesn't block the joiner indefinitely — it returns "pending" and the agent retries.
 const JOIN_POLL_ATTEMPTS: usize = 3;
 const JOIN_POLL_INTERVAL_MS: u64 = 500;
+
+/// How often the `wait_secs` approval wait re-redeems to check the host's decision. A pending joiner
+/// isn't a room member, so it can't park on a server-side `Pull` wait (that's member-gated) — instead
+/// it re-redeems (an idempotent poll: it charges no extra use and adds no queue entry) on this cadence,
+/// while heartbeats keep the socket alive across a multi-minute human approval.
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
+/// Wait for a host to approve a pending join, spanning **one** tool call. With `wait_secs` set, re-redeem
+/// `key` every [`APPROVAL_POLL_INTERVAL`] (heartbeating between polls to catch a half-open socket) until
+/// the host admits us (`Some(room)`), the budget runs out (`None` ⇒ still pending), or a denial errors
+/// out. Without `wait_secs`, fall back to the original short poll. A denial from `redeem` propagates as
+/// an error either way.
+async fn wait_for_approval(
+    state: &mut McpState,
+    key: &str,
+    wait_secs: Option<u64>,
+) -> Result<Option<String>> {
+    match wait_secs {
+        // No budget: the original short poll (a fast approval still resolves in-call).
+        None => {
+            for _ in 0..JOIN_POLL_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS)).await;
+                if let JoinOutcome::Joined { room, .. } = state.agent.redeem(key).await? {
+                    return Ok(Some(room));
+                }
+            }
+            Ok(None)
+        }
+        // Budgeted long-poll: hold this one call open until the host decides or the window closes.
+        Some(secs) => {
+            let deadline = Instant::now() + Duration::from_secs(secs.min(WAIT_SECS_MAX));
+            loop {
+                if let JoinOutcome::Joined { room, .. } = state.agent.redeem(key).await? {
+                    return Ok(Some(room));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None); // still pending when the window closed
+                }
+                // Keep the connection alive across a human-paced approval (detects + heals a half-open
+                // socket so the next re-redeem lands on a live connection), then poll again.
+                state.agent.heartbeat().await;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(APPROVAL_POLL_INTERVAL.min(remaining)).await;
+            }
+        }
+    }
+}
 
 /// If the caller owns `room` and agents are waiting to join it, render an approval prompt to append
 /// to a `parler_send`/`parler_recv` result — this is how the host is *shown* the accept/reject option
@@ -1273,10 +1453,11 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_join_session",
-            "Join a session with a KEY. If approval is required you're held pending until the host admits you (retry to check). Once in, you get a digest of the context (seed + recent tail); backlog:\"full\" replays everything, or parler_recv since=<seq> re-reads a range in full. Becomes your active session (parler_send/parler_recv need no room).",
+            "Join a session with a KEY. If approval is required you're held pending until the host admits you; pass wait_secs to hold this call open until they decide. Once in, you get a digest of the context (seed + recent tail); backlog:\"full\" replays everything, or parler_recv since=<seq> re-reads a range in full. Becomes your active session (parler_send/parler_recv need no room).",
             json!({
                 "key": { "type": "string", "description": "the session key or link you were handed" },
-                "backlog": { "type": "string", "enum": ["recent", "full"], "description": "recent (default): seed + recent tail; full: replay the entire backlog" }
+                "backlog": { "type": "string", "enum": ["recent", "full"], "description": "recent (default): seed + recent tail; full: replay the entire backlog" },
+                "wait_secs": { "type": "integer", "description": "approval-gated join: seconds to wait in THIS call for the host to approve (≤60); resolves the moment they do. Omit to return 'pending' now." }
             }),
             &["key"],
         ),
@@ -1514,8 +1695,18 @@ mod tests {
     async fn state(hub: &str, name: &str) -> McpState {
         let cfg = Config::create(hub.to_string(), name.to_string(), None).unwrap();
         let mut agent = MeshAgent::connect(&cfg).await.unwrap();
-        let push = agent.subscribe().await.unwrap_or(false);
-        McpState { agent, active_session: None, push }
+        // Subscribe for the push latency optimization (best-effort). Long-poll no longer depends on
+        // it — server-side wait works without push — so a failed subscribe here doesn't degrade recv.
+        let _ = agent.subscribe().await;
+        McpState { agent, active_session: None }
+    }
+
+    /// Like [`state`], but does **not** subscribe — exercises the long-poll path on a connection that
+    /// holds no push subscription (the previously-degraded mode #90 fixes).
+    async fn state_no_push(hub: &str, name: &str) -> McpState {
+        let cfg = Config::create(hub.to_string(), name.to_string(), None).unwrap();
+        let agent = MeshAgent::connect(&cfg).await.unwrap();
+        McpState { agent, active_session: None }
     }
 
     /// Pull the `KEY: <code>` line out of an `open_session` result.
@@ -1611,7 +1802,7 @@ mod tests {
         seed_room(&mut alice, &room, 100).await;
 
         let mut bob = state(&hub, "bob").await;
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         let chars = joined.chars().count();
         println!("[budget] join_session with ~100-msg backlog: {chars} chars rendered");
         assert!(
@@ -1638,7 +1829,7 @@ mod tests {
         alice.agent.send_text(Target::Room { room: room.clone() }, "LAST_TAIL_MESSAGE").await.unwrap();
 
         let mut bob = state(&hub, "bob").await;
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
 
         // Seed is always rendered in full (the host's recap).
         assert!(joined.contains("the plan: ship auth by friday"), "seed present in digest:\n{joined}");
@@ -1664,7 +1855,7 @@ mod tests {
         seed_room(&mut alice, &room, 40).await;
 
         let mut bob = state(&hub, "bob").await;
-        let joined = join_session(&mut bob, &key, Backlog::Full).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Full, None).await.unwrap();
 
         // Full mode replays even a mid-backlog message and never emits the omission line.
         assert!(joined.contains("m5 "), "full mode replays the middle:\n{joined}");
@@ -1688,7 +1879,7 @@ mod tests {
             .unwrap();
 
         let mut bob = state(&hub, "bob").await;
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(joined.contains("session digest"), "the digest header is shown:\n{joined}");
         assert!(joined.contains("auth done, next is billing"), "the recap text is surfaced:\n{joined}");
     }
@@ -1701,7 +1892,7 @@ mod tests {
         let opened = open_session(&mut alice, Some("seed"), Some("plan".into()), None, None, false).await.unwrap();
         let key = key_of(&opened);
         let mut bob = state(&hub, "bob").await;
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(!joined.contains("session digest"), "no digest header when the fact is absent:\n{joined}");
     }
 
@@ -1715,7 +1906,7 @@ mod tests {
 
         // Bob joins and posts ~20 fixed-size replies that are waiting when alice next sends.
         let mut bob = state(&hub, "bob").await;
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         for i in 0..20 {
             bob.agent
                 .send_text(Target::Room { room: room.clone() }, &format!("reply {i} {}", body_of(60)))
@@ -1744,7 +1935,7 @@ mod tests {
         let room = alice.active_session.clone().unwrap();
         let key = key_of(&opened);
         let mut bob = state(&hub, "bob").await;
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         // Drain bob's own "joined" announce so his inbox starts empty relative to what alice posts.
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
 
@@ -1778,7 +1969,7 @@ mod tests {
         let room = alice.active_session.clone().unwrap();
         let key = key_of(&opened);
         let mut bob = state(&hub, "bob").await;
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
 
         // Bob leaves more than AUTOPULL_LIMIT replies waiting before alice sends.
         for i in 0..15 {
@@ -1796,7 +1987,7 @@ mod tests {
         let room = alice.active_session.clone().unwrap();
         let key = key_of(&opened);
         let mut bob = state(&hub, "bob").await;
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap(); // drain own announce
 
         // Alice posts a body well over MSG_MAX_CHARS.
@@ -1883,7 +2074,7 @@ mod tests {
         assert!(opened.len() <= OPEN_RESULT_BUDGET, "open_session result {} B over budget {OPEN_RESULT_BUDGET} B", opened.len());
 
         let key = key_of(&opened);
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(joined.contains("designing the auth flow"), "joiner should receive the seeded context");
         assert_eq!(bob.active_session, alice.active_session, "both share the same session room");
     }
@@ -1897,7 +2088,7 @@ mod tests {
         let opened = open_session(&mut alice, None, Some("empty".into()), None, None, false).await.unwrap();
         let key = key_of(&opened);
         // Bob joins; the only backlog should be his own "joined" announce — no seed context line.
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(!joined.contains("session context"), "no seed message when context is omitted");
     }
 
@@ -1909,7 +2100,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), Some("design".into()), None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
 
         // Bob sends with no explicit target → goes to the active session.
         let bob_send = call_session_tool(&mut bob, "parler_send", &json!({ "text": "from bob" })).await.unwrap();
@@ -1930,7 +2121,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap(); // advances bob's cursor to the live edge
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap(); // advances bob's cursor to the live edge
 
         // Alice posts after bob is caught up; bob's recv (no room) picks it up from the active session.
         call_session_tool(&mut alice, "parler_send", &json!({ "text": "ping bob" })).await.unwrap();
@@ -1947,8 +2138,8 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
-        join_session(&mut carol, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
+        join_session(&mut carol, &key, Backlog::Recent, None).await.unwrap();
         // Drain each joiner's own "joined" announce so their cursors start clean.
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
         call_session_tool(&mut carol, "parler_recv", &json!({})).await.unwrap();
@@ -1983,7 +2174,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
 
         call_session_tool(&mut alice, "parler_handoff", &json!({ "next": "take it from here" }))
@@ -2000,11 +2191,11 @@ mod tests {
         let hub = start_hub().await;
         let mut alice = state(&hub, "alice").await;
         let mut bob = state(&hub, "bob").await;
-        assert!(bob.push, "the hub should support push so recv can long-poll");
+        assert!(bob.agent.push_active(), "the hub should support push so recv can long-poll");
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap(); // bob caught up to the live edge
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap(); // bob caught up to the live edge
         // join_session posts bob's own "joined" announce *after* its catch-up pull, so it now sits
         // past bob's cursor — drain it so the long-poll below starts from a genuinely empty inbox
         // (otherwise the initial pull returns non-empty and short-circuits the wait).
@@ -2020,6 +2211,138 @@ mod tests {
         let recv = call_session_tool(&mut bob, "parler_recv", &recv_args);
         let (_sent, got) = tokio::join!(send, recv);
         assert!(got.unwrap().contains("ping bob"), "long-poll recv should wake on the pushed message");
+    }
+
+    #[tokio::test]
+    async fn recv_wait_secs_long_polls_without_a_push_subscription() {
+        // #90 / #87: `parler_recv wait_secs` delivers on a connection that started with NO push
+        // subscription — the previously-degraded mode. Bob uses `state_no_push` (never subscribed);
+        // the message arrives via the hub's server-side wait (recv may opportunistically re-subscribe
+        // for future latency, per #87 — but the *wait itself* did not need it).
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let mut bob = state_no_push(&hub, "bob").await;
+        assert!(!bob.agent.push_active(), "bob starts with no push subscription");
+
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let key = key_of(&opened);
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
+        // Drain bob's own "joined" announce so the long-poll starts from an empty inbox.
+        call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+
+        let send_args = json!({ "text": "no sub needed" });
+        let recv_args = json!({ "wait_secs": 8 });
+        let send = async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            call_session_tool(&mut alice, "parler_send", &send_args).await.unwrap();
+        };
+        let recv = call_session_tool(&mut bob, "parler_recv", &recv_args);
+        let (_s, got) = tokio::join!(send, recv);
+        let got = got.unwrap();
+        assert!(got.contains("no sub needed"), "server-side wait delivered without a subscription:\n{got}");
+        assert!(!got.contains("long-poll unavailable"), "the wait worked, so no degraded note:\n{got}");
+    }
+
+    #[tokio::test]
+    async fn recv_wait_secs_shows_no_degraded_note_against_a_current_hub() {
+        // The "never otherwise" half of the degraded-note AC: even when the wait times out empty
+        // against a current (parking) hub, the note is absent — the wait *did* happen, it just found
+        // nothing. The note is reserved for a genuinely-old hub.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let mut bob = state(&hub, "bob").await;
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let key = key_of(&opened);
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
+        call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap(); // drain the announce
+
+        // A short wait with nobody sending → empty, but NOT degraded (the hub parked us).
+        let out = call_session_tool(&mut bob, "parler_recv", &json!({ "wait_secs": 1 })).await.unwrap();
+        assert!(out.contains("no new messages"), "empty at timeout: {out}");
+        assert!(!out.contains("long-poll unavailable"), "a real park is not degraded: {out}");
+    }
+
+    #[test]
+    fn degraded_wait_note_only_when_the_wait_truly_could_not_happen() {
+        // Pure decision table for the honest-degraded-mode note (issue #87 AC).
+        // Degraded ONLY when: room empty AND no server-side wait AND no push fallback.
+        assert!(degraded_wait(true, false, false), "empty + no wait + no push ⇒ degraded");
+        // Not degraded if the hub actually parked (waited)…
+        assert!(!degraded_wait(true, true, false));
+        // …or a push subscription exists to fall back on…
+        assert!(!degraded_wait(true, false, true));
+        // …or messages arrived (not empty), regardless of the rest.
+        assert!(!degraded_wait(false, false, false));
+        assert!(!degraded_wait(false, true, true));
+    }
+
+    #[tokio::test]
+    async fn join_session_wait_secs_resolves_when_host_approves_in_window() {
+        // #90: an approval-gated join with `wait_secs` resolves within ONE call when the host approves
+        // during the window — no manual retrying. Alice approves ~150ms into bob's 10s wait.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let mut bob = state(&hub, "bob").await;
+
+        let opened = open_session(
+            &mut alice,
+            Some("secret plan: ship friday"),
+            Some("plan".into()),
+            None,
+            None,
+            true, // approval-gated
+        )
+        .await
+        .unwrap();
+        let key = key_of(&opened);
+        let bob_id = bob.agent.id.clone();
+
+        // Bob joins with a wait; concurrently alice approves him shortly after his request lands.
+        let approve = async {
+            // Give bob's redeem time to register the pending request, then approve.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Poll until the request shows up, then approve (robust against scheduling jitter).
+            for _ in 0..40 {
+                let reqs = alice.agent.join_requests(alice.active_session.as_ref().unwrap()).await.unwrap();
+                if reqs.iter().any(|r| r.agent == bob_id) {
+                    alice
+                        .agent
+                        .resolve_join(alice.active_session.as_ref().unwrap(), &bob_id, true)
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("bob's join request never appeared");
+        };
+        let join = join_session(&mut bob, &key, Backlog::Recent, Some(10));
+        let (_a, joined) = tokio::join!(approve, join);
+        let joined = joined.unwrap();
+        assert!(
+            joined.contains("secret plan: ship friday"),
+            "the join resolved in one call and got the context:\n{joined}"
+        );
+        assert_eq!(bob.active_session, alice.active_session, "bob is now in the session");
+    }
+
+    #[tokio::test]
+    async fn join_session_wait_secs_returns_pending_if_host_never_decides() {
+        // The wait is bounded: if nobody approves within the window, it returns the "pending" message
+        // (one honest call), not an error and not a hang.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let mut bob = state(&hub, "bob").await;
+        let opened =
+            open_session(&mut alice, Some("hidden"), Some("plan".into()), None, None, true).await.unwrap();
+        let key = key_of(&opened);
+
+        let started = std::time::Instant::now();
+        let out = join_session(&mut bob, &key, Backlog::Recent, Some(1)).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1), "it held the call open for the window");
+        assert!(out.contains("waiting for the host"), "still pending after the window: {out}");
+        assert!(!out.contains("hidden"), "a pending joiner must not receive the context");
+        assert!(bob.active_session.is_none(), "not admitted");
     }
 
     #[tokio::test]
@@ -2059,7 +2382,7 @@ mod tests {
         let key = key_of(&opened);
 
         // Bob redeems → held pending; he is NOT caught up and must not see the context.
-        let pending = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let pending = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(pending.contains("waiting for the host"), "joiner is gated: {pending}");
         assert!(!pending.contains("secret plan"), "a pending joiner must not receive the context");
         assert!(bob.active_session.is_none(), "a pending joiner has no active session yet");
@@ -2079,7 +2402,7 @@ mod tests {
         assert!(approved.contains("approved"));
 
         // Now bob's join succeeds and he receives the context in the same call.
-        let joined = join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(joined.contains("secret plan: ship friday"), "an approved joiner gets the context: {joined}");
         assert_eq!(bob.active_session, alice.active_session, "both now share the session room");
     }
@@ -2092,7 +2415,7 @@ mod tests {
 
         let opened = open_session(&mut alice, Some("seed"), None, None, None, true).await.unwrap();
         let key = key_of(&opened);
-        join_session(&mut eve, &key, Backlog::Recent).await.unwrap(); // pending
+        join_session(&mut eve, &key, Backlog::Recent, None).await.unwrap(); // pending
 
         let denied = call_session_tool(&mut alice, "parler_deny_join", &json!({ "agent": eve.agent.id }))
             .await
@@ -2100,7 +2423,7 @@ mod tests {
         assert!(denied.contains("denied"));
 
         // The denial is terminal — eve's retry errors instead of letting her in.
-        assert!(join_session(&mut eve, &key, Backlog::Recent).await.is_err());
+        assert!(join_session(&mut eve, &key, Backlog::Recent, None).await.is_err());
     }
 
     #[tokio::test]
@@ -2140,7 +2463,7 @@ mod tests {
         let room = alice.active_session.clone().unwrap();
         let key = key_of(&opened);
         let mut bob = state(&hub, "bob").await;
-        join_session(&mut bob, &key, Backlog::Recent).await.unwrap();
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
 
         let plain = call_tool(&mut alice.agent, "parler_roster", &json!({ "room": room.clone() })).await.unwrap();
         assert!(plain.contains("alice"), "names present:\n{plain}");
@@ -2412,6 +2735,89 @@ mod tests {
             "Found references to parler_* tools/names that are not in the valid tools list: {:?}",
             invalid
         );
+    }
+
+    // ---- #99: one env/config precedence rule (explicit env > saved config > default) -------------
+
+    /// Build a config with the given saved hub/name/role (identity is a throwaway in-memory one).
+    fn saved(hub: &str, name: &str, role: Option<&str>) -> Config {
+        Config::create(hub.to_string(), name.to_string(), role.map(String::from)).unwrap()
+    }
+
+    #[test]
+    fn env_hub_overrides_saved_config() {
+        // An existing config.json + PARLER_HUB=ws://other ⇒ the resolved hub is ws://other, so
+        // launching `parler mcp` (or any CLI command) dials the env hub, not the saved one. The
+        // identity is untouched.
+        let cfg = saved("wss://parler-hub.fly.dev", "codex", None);
+        let saved_id = cfg.identity.id.clone();
+        let mut notes = Vec::new();
+        let out = apply_overrides(cfg, Some("ws://other:7070".into()), None, None, &mut |l| notes.push(l));
+        assert_eq!(out.hub_url, "ws://other:7070", "env PARLER_HUB must win over saved config");
+        assert_eq!(out.identity.id, saved_id, "identity (id/seed) is never rewritten by an env override");
+        assert_eq!(out.name, "codex", "name untouched when PARLER_NAME is unset");
+        assert!(notes.iter().any(|n| n.contains("PARLER_HUB overrides")), "override is announced once: {notes:?}");
+    }
+
+    #[test]
+    fn env_name_and_role_take_effect_over_saved_config() {
+        // PARLER_NAME / PARLER_ROLE env changes take effect (so re-wiring via `parler connect`,
+        // which rewrites the env block, genuinely renames/re-roles the agent on next launch).
+        let cfg = saved("ws://h:1", "old-name", Some("planner"));
+        let mut notes = Vec::new();
+        let out = apply_overrides(cfg, None, Some("new-name".into()), Some("reviewer".into()), &mut |l| notes.push(l));
+        assert_eq!(out.name, "new-name");
+        assert_eq!(out.role.as_deref(), Some("reviewer"));
+        assert_eq!(out.hub_url, "ws://h:1", "hub untouched when PARLER_HUB is unset");
+        assert_eq!(notes.len(), 2, "one note per changed field: {notes:?}");
+    }
+
+    #[test]
+    fn saved_config_wins_when_env_absent_and_matching_env_is_silent() {
+        // Absent env ⇒ the saved values stand (default precedence). And an env that merely *matches*
+        // the saved value is not announced (no spurious "override" line, no false state-change).
+        let cfg = saved("ws://h:1", "keep", Some("planner"));
+        let mut notes = Vec::new();
+        let out = apply_overrides(cfg, Some("ws://h:1".into()), Some("keep".into()), Some("planner".into()), &mut |l| notes.push(l));
+        assert_eq!(out.hub_url, "ws://h:1");
+        assert_eq!(out.name, "keep");
+        assert_eq!(out.role.as_deref(), Some("planner"));
+        assert!(notes.is_empty(), "matching env is not a state change: {notes:?}");
+    }
+
+    // ---- #102: MCP client retries a down hub instead of dying instantly --------------------------
+
+    #[test]
+    fn start_hub_hint_names_the_local_start_command() {
+        // A loopback hub that's down has one obvious fix — the exact command belongs in the hint the
+        // MCP retry logs and `parler doctor` echoes, so an agent-before-hub launch is never a silent
+        // dead server (issue #102).
+        assert!(start_hub_hint("ws://127.0.0.1:7070").contains("parler hub --local"));
+        assert!(start_hub_hint("ws://localhost:7070").contains("parler hub --local"));
+        // A remote hub isn't something we tell the user to `parler hub --local` — different guidance.
+        assert!(!start_hub_hint("wss://parler-hub.fly.dev").contains("parler hub --local"));
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_rides_out_a_hub_that_starts_late() {
+        // Agent launches BEFORE the hub is up: bind the listener but don't serve yet, so the first
+        // dials are refused; then start serving. `connect_with_retry` must ride the short window and
+        // succeed rather than die on the first refusal (the core #102 acceptance).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = format!("ws://{addr}");
+        // Start serving after a delay that spans a couple of retry intervals.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let store = parler_hub::Store::open(None).unwrap();
+            let state = Arc::new(parler_hub::HubState::new(
+                store, "parler://test".into(), "late hub".into(), parler_hub::HubMode::Private,
+            ));
+            let _ = parler_hub::serve(listener, state).await;
+        });
+        let cfg = Config::create(hub, "late-joiner".to_string(), None).unwrap();
+        let agent = connect_with_retry(&cfg).await;
+        assert!(agent.is_ok(), "must connect once the late hub comes up, not die on the first refusal");
     }
 }
 
