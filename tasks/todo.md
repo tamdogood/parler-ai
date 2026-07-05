@@ -1,61 +1,95 @@
-# Brand rename: "Parler" → "Parler Protocol" (surface only)
+# Task: Desktop app → 10/10 UX + CLI parity on the 3 key features
 
-Goal: rename the human-facing **brand name** everywhere a person reads it (docs, website,
-images, CLI/hub output, package metadata). Defer **code identifiers** per the advisor note.
+Goal: the macOS (Electron/React/Tailwind) app in `desktop/` reaches "10/10 UX with full CLI
+parity," staying clean/minimalist, focused on **(1) mid-chat connection, (2) monitoring agents &
+sessions, (3) set up a private hub.**
 
-## Rules
+## Findings (verified against the code)
 
-Replace the standalone capitalized word `\bParler\b` → `Parler Protocol`. This automatically:
-- MATCHES brand prose, "Parler hub", "Parler-aware" (fine).
-- SKIPS lowercase `parler`, `parler-*` crates, `parler_*` tools, `PARLER_*` env vars, `com.parler.*`
-  (all lowercase → a capital-P word match never hits them).
-- SKIPS compound identifiers `ParlerApi`, `appParlerHome`, `ParlerHub` (no word boundary after
-  "Parler" → no match).
-- No doubling: repo currently has ZERO existing "Parler Protocol"/"Parler protocol" strings.
+The app is already well-built (obsidian theme, one-click connect, hub supervisor, watch viewer). The
+gaps that matter map 1:1 onto the three named features:
 
-## Do NOT touch (deferred code identifiers)
-- Crate names / dirs `parler-hub|cli|connector|protocol|auth|bin`
-- MCP tool names `parler_*`; Env vars `PARLER_*`; Reverse-DNS `com.parler.*`
-- Binary invocation `parler`, and the `#[command(name="parler-hub")]` value
-- Domain `parlerprotocol.com` (already correct)
-- Asset filenames (e.g. `docs/assets/parler-banner.svg` — lowercase, not shown to users)
+1. **Mid-chat connection is broken in-app.** Sessions open with **approval required by default**, but
+   there is **no approve/deny UI** — `session requests/approve/deny` (CLI) has zero renderer surface
+   (grep confirms none). You open a session, an agent asks to join, and you must drop to a terminal to
+   admit it. The flagship flow can't be completed in the app.
+2. **Opened sessions aren't remembered.** `OpenedSession` is ephemeral screen state — navigate away
+   and the key/watch/room are gone. No list, no monitoring, no re-copy, no close.
+3. **Hub activity is invisible.** `/api/hub` already exposes `liveConnections / messagesTotal /
+   estimatedTokensTotal / pushesTotal`, but `HubSummary` omits `stats` and nothing renders it. No
+   live "monitoring" surface.
+4. **"Private hub" is buried** as a Settings sub-screen; the CLI's `--team` rung (LAN-reachable
+   private hub + join secret) isn't a first-class choice.
 
-## Steps
-- [ ] 1. Perl word-boundary replace across curated text-file set (md/tsx/ts/rs/toml/mmd/yml/html)
-- [ ] 2. Hand-edit the 6 SVGs (logo/banner/blog-card text) + check text width
-- [ ] 3. Verify the `server.rs` HTML-assert pair moved together; no other coupled asserts
-- [ ] 4. Tighten the 2-3 most prominent redundant taglines
-- [ ] 5. Review full `git diff` for over-replacement (identifiers, URLs, slugs)
-- [ ] 6. `CI_SKIP_WEB=1 make ci` (rust) + web build green
+## Plan (prioritized; each phase independently shippable)
 
-## Review
+### Phase 1 — Mid-chat connection: complete the session lifecycle  ← highest value
+- [ ] CLI: add `--json` to `session requests` (structured `{room, requests:[{agent,name,role}]}`) so
+      the app reads join requests robustly instead of scraping text. (approve/deny already exit 0/parse.)
+- [ ] main: `parler-cli.ts` → `sessionRequests(room)`, `approveJoin(room, agent)`, `denyJoin(room, agent)`.
+- [ ] IPC + preload + shared types: expose `session.requests/approve/deny`.
+- [ ] Persist opened sessions in `settings.ts` (new `sessions: OpenedSessionRecord[]`): room, key,
+      watch, topic, approval mode, createdAt. Add `session.list()/forget(room)`.
+- [ ] Renderer: rework `sessions.tsx` into **Open → Session list**. Each row: copy key, copy watch,
+      Watch here, **pending-join badge → Approve/Deny inline**, Close. Poll requests while running.
 
-Renamed the human-facing brand **Parler → Parler Protocol** across 114 files (+450/-453),
-leaving every code identifier intact. Method: case-sensitive word-boundary replace
-`\bParler\b → Parler Protocol` with a `(?!\.(app|dmg))` guard, over a curated list built from
-`git grep -lw Parler`. Because the match is capital-P and whole-word, it never touched
-`parler` / `parler-*` crates / `parler_*` tools / `PARLER_*` env vars / `com.parler.*` /
-compound `ParlerApi` (no word boundary). Post-sweep grep for leftover bare-brand `Parler`:
-**zero** — every remainder is a deliberately deferred artifact/identifier.
+### Phase 2 — Monitoring: make it live
+- [ ] `HubSummary.stats` type + `fetchHub` usage; small `useHubSummary(base)` poll hook.
+- [ ] A restrained **live activity strip** (connections · messages · ≈tokens · pushes) on the Hub
+      screen; a compact roll-up header on Agents (online/total). Keep it minimal — no chart junk.
+- [ ] Directory already good; add live counts + gentle "active now" pulse only.
 
-Hand-handled edge cases:
-- `packaging/homebrew/parler.rb` — kept `class Parler` (Ruby class bound to filename); renamed
-  only the header comment.
-- `desktop/electron-builder.yml` `productName: Parler` + all `Parler.app`/`Parler.dmg` literals
-  — DEFERRED (app-bundle artifact name, same bucket as the binary/Fly app).
-- `docs/assets/parler-banner.svg` — redesigned the wordmark lockup (font 56→46, recentred) so
-  "Parler Protocol" fits; verified by rasterizing with qlmanage.
-- 3 blog-card SVGs — footer captions only, layout-safe.
-- `server.rs` HTML string + its `assert!` moved together; hub instance names
-  (`PARLER_HUB_NAME` defaults + fly/compose) + their coupled test fixtures renamed in lockstep.
+### Phase 3 — Private hub as a first-class feature
+- [ ] Promote **Hub** to a sidebar item (Agents · Connect · Sessions · Hub · Settings).
+- [ ] Present the ladder the CLI uses — **Private / Team / Public** — with the join secret prominent
+      for Team, one-line teammate connect string. Reuse existing start/stop/logs/storage.
 
-Verified: web `npm run build` green (all routes prerendered); Rust `CI_SKIP_WEB=1 make ci`
-green (see below).
+### Phase 4 — Cross-cutting 10/10 polish
+- [ ] Lightweight global **toast** system (copy / connect / approve feedback) — no dependency.
+- [ ] Keyboard: ⌘1–5 nav, Esc closes drawers, ⌘C on token fields.
+- [ ] Consistent empty/loading/error states; motion via existing `slide-up-fade`.
 
-DEFERRED per advisor note (code identifiers, separate post-sprint job): crate names, `parler`
-binary, `parler_*` MCP tool names, `PARLER_*` env vars, `com.parler.*` wire ids, Fly app name,
-desktop `.app`/`.dmg` artifact name, Homebrew Ruby class.
+## Constraints / guardrails
+- Don't weaken the security model (approval gate, watch = read-only, seed never leaves device).
+- `parler-protocol` changes ripple to hub/connector/cli/web — the only CLI change here is an additive
+  `--json` on `session requests` (no wire/protocol change). Run `CI_SKIP_WEB=1 make ci` for it.
+- Never run `cargo fmt`. Hand-match style.
+- **Verification caveat:** this is a GUI Electron app; `node_modules`/bundled binaries aren't
+  installed here. I can `npm install` + `npm run typecheck`/`build` the renderer, and `make ci` the
+  Rust change, but true visual "10/10" needs a real run on the user's Mac.
 
-NOT changed (editorial, flagged to user): the SEO keyphrase "chat protocol for AI agents" in
-blog deks now reads "Parler Protocol … chat protocol" (mild redundancy) — left intact to avoid
-gutting search copy.
+## Review — shipped
+
+**Phase 1 — session lifecycle (the flagship gap): DONE.** `session requests` gained an additive
+`--json` (`{room, requests:[{agent,name,role,requestedAt}]}`; verified end-to-end against a scratch
+hub). New `session-store.ts` persists opened sessions to `userData/sessions.json` (kept out of
+preferences). `parler-cli.ts` drives `sessionRequests`/`resolveJoin`; IPC/preload/types expose
+`session.list/forget/requests/approve/deny`; the open handler now saves a record. `sessions.tsx` is
+reworked into Open → **Your sessions** list: each card shows both codes (copy), Watch, Close, and —
+for a live, approval-gated session — **polls pending joiners and approves/denies them inline**. You
+can now complete the whole handoff in-app.
+
+**Phase 2 — live monitoring: core DONE.** `HubSummary.stats` + `useHubSummary` poll `/api/hub`; the
+Hub screen shows a restrained **Live activity** strip (live connections · messages · ≈tokens ·
+pushes). *Deliberately skipped* a separate Agents roll-up — the directory already polls every 5s with
+status facet counts + per-card "active now", so more would be redundant, not cleaner.
+
+**Phase 3 — private hub, first-class: DONE + made honest.** Hub is now a top-level sidebar item (back
+button removed). The supervisor bound loopback-only, so a "Team" toggle would have been fake — added a
+`hubReachable` setting that binds `0.0.0.0` (still gated by the existing join secret; same posture as
+the CLI `--team`) and surfaced the **Private / Team / Public** ladder with a teammate connect
+one-liner built from the machine's LAN IP.
+
+**Phase 4 — polish: DONE (scoped).** ⌘1–5 screen nav; Esc already closed drawers. Added a
+**pending-join badge on the Sessions nav item** (App-level `usePendingJoinCount`) so an agent asking
+to join never hides on another screen — higher-value than the planned global toast system, which I
+*deliberately skipped* to stay minimalist (copy/approve already give inline feedback).
+
+**Verification.** `CI_SKIP_WEB=1 make ci` green (build · clippy -D warnings · test --locked · audit).
+Desktop `npm run typecheck` + `npm run build` green (main + preload + renderer). `session requests
+--json` verified live. **Not done here:** a real visual run of the Electron app (needs the user's Mac
++ `npm run build:binaries`); no screenshots taken.
+
+**Follow-ups (not blocking):** the Sessions screen and the sidebar badge both poll requests when
+you're on that screen (bounded double-poll, few sessions); could unify later. `agents` roll-up + a
+global toast remain available if wanted.
