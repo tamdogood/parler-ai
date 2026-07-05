@@ -302,6 +302,12 @@ pub enum ClientFrame {
         ttl_secs: Option<u64>,
     },
     /// Publish a message to a target.
+    ///
+    /// `client_id` is an optional idempotency key the sender generates once per logical send and
+    /// reuses on a transparent retry-after-reconnect: the hub enforces `(room, author, client_id)`
+    /// unique, so a retry whose first attempt already landed returns the original message's id/seq
+    /// instead of double-posting (Kafka idempotent-producer / NATS `Nats-Msg-Id` pattern). Absent ⇒
+    /// today's at-least-once behavior, byte-identical on the wire (older hubs ignore the field).
     Send {
         target: Target,
         parts: Vec<Part>,
@@ -309,6 +315,8 @@ pub enum ClientFrame {
         mentions: Option<Vec<String>>,
         #[serde(default, rename = "replyTo", skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        #[serde(default, rename = "clientId", skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     /// Pull messages for a room newer than the agent's stored cursor (which this advances), or newer
     /// than `since` (which does not advance the cursor — for re-reads).
@@ -950,12 +958,15 @@ mod tests {
             parts: vec![Part::text("hi")],
             mentions: None,
             reply_to: None,
+            client_id: None,
         };
         let j = serde_json::to_value(&f).unwrap();
         assert_eq!(j["op"], "send");
         assert_eq!(j["target"]["kind"], "dm");
         assert_eq!(j["target"]["agent"], "UABC");
         assert_eq!(j["parts"][0]["kind"], "text");
+        // Absent client_id must not appear on the wire (old-client byte-compatibility, #86).
+        assert!(j.get("clientId").is_none(), "unset client_id is omitted");
         let back: ClientFrame = serde_json::from_value(j).unwrap();
         assert_eq!(back, f);
     }

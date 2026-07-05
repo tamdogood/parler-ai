@@ -1808,7 +1808,7 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             Ok(ServerFrame::Joined { room, kind: RoomKind::Service })
         }
 
-        ClientFrame::Send { target, parts, mentions, reply_to } => {
+        ClientFrame::Send { target, parts, mentions, reply_to, client_id } => {
             if !state.rate_allows(&me.id, RateKind::Send, now_ms()) {
                 anyhow::bail!("rate limit: too many messages — slow down");
             }
@@ -1825,20 +1825,35 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             let mentions = mentions.as_deref().and_then(normalize_mentions);
             let from = EndpointRef { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
             let now = now_ms();
-            let (id, seq, tokens) =
-                store.append_message(&room, &from, &parts, mentions.as_deref(), reply_to.as_deref(), now)?;
-            state.metrics.messages_total.fetch_add(1, Ordering::Relaxed);
-            // Same estimate the row stored, so the hub-wide counter and the per-room totals agree.
-            state.metrics.tokens_total.fetch_add(tokens.max(0) as u64, Ordering::Relaxed);
-            // Best-effort live push to subscribed members (the durable cursor is still the source of
-            // truth, so this only lowers latency — it never replaces `Pull`). Built from the same
-            // fields just persisted, so a pushed message is byte-identical to the pulled one.
-            state.fanout(
-                &room,
-                &me.id,
-                StoredMessage { seq, id: id.clone(), room: room.clone(), from, parts, mentions, reply_to, ts: now },
-            );
-            Ok(ServerFrame::Sent { id, seq, room })
+            let out = store.append_message(
+                &room, &from, &parts, mentions.as_deref(), reply_to.as_deref(), client_id.as_deref(), now,
+            )?;
+            // A deduped send (idempotency-key replay, #86) is a no-op on state: the original row was
+            // already counted and fanned out, so re-counting or re-pushing would resurrect the very
+            // duplicate the key exists to prevent. Just echo the original message's id/seq back.
+            if !out.deduped {
+                state.metrics.messages_total.fetch_add(1, Ordering::Relaxed);
+                // Same estimate the row stored, so the hub-wide counter and per-room totals agree.
+                state.metrics.tokens_total.fetch_add(out.tokens.max(0) as u64, Ordering::Relaxed);
+                // Best-effort live push to subscribed members (the durable cursor is still the source
+                // of truth, so this only lowers latency — it never replaces `Pull`). Built from the
+                // same fields just persisted, so a pushed message is byte-identical to the pulled one.
+                state.fanout(
+                    &room,
+                    &me.id,
+                    StoredMessage {
+                        seq: out.seq,
+                        id: out.id.clone(),
+                        room: room.clone(),
+                        from,
+                        parts,
+                        mentions,
+                        reply_to,
+                        ts: now,
+                    },
+                );
+            }
+            Ok(ServerFrame::Sent { id: out.id, seq: out.seq, room })
         }
 
         // A `Pull` with `wait_secs` on an authed connection is intercepted upstream (`waited_pull`);
@@ -2375,7 +2390,7 @@ mod tests {
     /// `fanout`, which calls `notify_room`). A parked `store_waited_pull` wakes on the notify.
     fn append(state: &HubState, room: &str, author: &str, text: &str) {
         let from = EndpointRef { id: author.into(), name: author.into(), role: None };
-        state.store.append_message(room, &from, &[Part::text(text)], None, None, now_ms()).unwrap();
+        state.store.append_message(room, &from, &[Part::text(text)], None, None, None, now_ms()).unwrap();
         state.notify_room(room);
     }
 

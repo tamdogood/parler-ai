@@ -90,9 +90,15 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Estimated communication tokens this message carries (see `estimate_message_tokens`), stored at
   -- append time so per-room/per-agent totals are a cheap aggregate. An estimate, not a billed count.
   -- Also added to older DBs via `add_column_if_missing` (which backfills historical rows once).
-  tokens      INTEGER NOT NULL DEFAULT 0
+  tokens      INTEGER NOT NULL DEFAULT 0,
+  -- Optional sender-supplied idempotency key (#86). NULL for old clients / unkeyed sends. The partial
+  -- unique index below makes a retried send with the same key return the original row instead of
+  -- double-posting; NULLs are excluded from the index so unkeyed sends are never deduped.
+  client_id   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room, seq);
+-- The (room, author, client_id) idempotency index (#86) is created after startup migration, so a DB
+-- that predates the client_id column gets the column added first (see Store::open).
 -- Retention's age scan (`prune_messages`) filters `WHERE ts < cutoff`; without this it's a full table
 -- scan every janitor pass on a large log.
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
@@ -238,6 +244,17 @@ pub struct Store {
     inner: Arc<Inner>,
 }
 
+/// The result of [`Store::append_message`]. `deduped` is `true` when a `client_id` idempotency key
+/// matched an already-stored message (#86): the `id`/`seq` are the *original* row's, no new row was
+/// written, and `tokens` is 0 so the caller doesn't double-count metrics or re-fan-out.
+#[derive(Debug, Clone)]
+pub struct AppendOutcome {
+    pub id: String,
+    pub seq: i64,
+    pub tokens: i64,
+    pub deduped: bool,
+}
+
 struct Inner {
     writer: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
@@ -298,6 +315,13 @@ impl Store {
         if add_column_if_missing(&writer, "messages", "tokens", "INTEGER NOT NULL DEFAULT 0")? {
             backfill_message_tokens(&writer)?;
         }
+        // Idempotency key (#86) on older DBs. The partial unique index is created by MIGRATION above
+        // once the column exists; add the column first for a DB that predates it.
+        add_column_if_missing(&writer, "messages", "client_id", "TEXT")?;
+        writer.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id \
+             ON messages(room, author, client_id) WHERE client_id IS NOT NULL;",
+        )?;
 
         // Vector index for semantic recall (sqlite-vec, registered via auto_extension above).
         let vec_dim = VEC_DIMENSION;
@@ -513,8 +537,9 @@ impl Store {
         parts: &[Part],
         mentions: Option<&[String]>,
         reply_to: Option<&str>,
+        client_id: Option<&str>,
         ts: i64,
-    ) -> Result<(String, i64, i64)> {
+    ) -> Result<AppendOutcome> {
         let id = Uuid::now_v7().to_string();
         let parts_json = serde_json::to_string(parts)?;
         let mentions_json = match mentions {
@@ -525,12 +550,28 @@ impl Store {
         // aggregate later instead of a re-parse of every row on each viewer poll.
         let tokens = estimate_message_tokens(parts) as i64;
         let conn = self.w();
-        conn.execute(
-            "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts, tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts, tokens],
+        // Idempotent send (#86): with a client_id, a retried send whose first attempt already landed
+        // must return the ORIGINAL row, not insert a second. `INSERT … ON CONFLICT DO NOTHING` against
+        // the partial unique (room, author, client_id) index makes the insert a no-op on a replay;
+        // we then read back the existing row and report it as a (deduped) success. Unkeyed sends
+        // (client_id NULL) are excluded from the index and always insert, exactly as before.
+        let changed = conn.execute(
+            "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts, tokens, client_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(room, author, client_id) WHERE client_id IS NOT NULL DO NOTHING",
+            params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts, tokens, client_id],
         )?;
-        Ok((id, conn.last_insert_rowid(), tokens))
+        if changed == 1 {
+            return Ok(AppendOutcome { id, seq: conn.last_insert_rowid(), tokens, deduped: false });
+        }
+        // No row inserted ⇒ a client_id conflict: fetch the original message's id + seq and report it
+        // as the same success the first send returned. (Reachable only when client_id is Some.)
+        let (orig_id, orig_seq): (String, i64) = conn.query_row(
+            "SELECT id, seq FROM messages WHERE room = ?1 AND author = ?2 AND client_id = ?3",
+            params![room, from.id, client_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(AppendOutcome { id: orig_id, seq: orig_seq, tokens: 0, deduped: true })
     }
 
     /// `pull`'s cursor read shares the same already-held connection (see [`Store::pull`]); the
@@ -1771,7 +1812,7 @@ mod tests {
             s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
             s.add_member("team", "U_A", 1).unwrap();
             s.add_member("team", "U_B", 1).unwrap();
-            s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 20).unwrap();
+            s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, None, 20).unwrap();
             s.remember("U_A", &Fact { key: None, text: "deploy is blue-green".into(), room: Some("team".into()) }, 21, None, None).unwrap();
             s.register_card(&card("U_A", "alice", &["ops"], &["plan"]), Some("sig"), true, Visibility::Public, 12).unwrap();
             s.create_invite("CODE", "team", RoomKind::Channel, None, 1, 9_999_999_999_999, "U_A", false, 1).unwrap();
@@ -1858,8 +1899,8 @@ mod tests {
         s.add_member("team", "U_A", 1).unwrap();
         s.add_member("team", "U_B", 1).unwrap();
 
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("one")], None, None, 10).unwrap();
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("two")], None, None, 11).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("one")], None, None, None, 10).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("two")], None, None, None, 11).unwrap();
 
         // Bob pulls: sees both, cursor now at 2.
         let (msgs, cursor) = s.pull("team", "U_B", None, None).unwrap();
@@ -1982,7 +2023,7 @@ mod tests {
         let s = Store::open(None).unwrap();
         s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
         for i in 0..5 {
-            s.append_message("team", &eref("U_A", "a"), &[Part::text("m")], None, None, 100 + i).unwrap();
+            s.append_message("team", &eref("U_A", "a"), &[Part::text("m")], None, None, None, 100 + i).unwrap();
         }
         // now=10_000, retain 1s ⇒ all five (ts 100..104) are "expired", but keep the newest 2.
         assert_eq!(s.prune_messages(1_000, 2, 10_000).unwrap(), 3);
@@ -1991,7 +2032,7 @@ mod tests {
         // Idempotent: a second pass removes nothing (only the keep floor remains).
         assert_eq!(s.prune_messages(1_000, 2, 20_000).unwrap(), 0);
         // A recent message is never pruned, even with keep=0.
-        s.append_message("team", &eref("U_A", "a"), &[Part::text("fresh")], None, None, 19_900).unwrap();
+        s.append_message("team", &eref("U_A", "a"), &[Part::text("fresh")], None, None, None, 19_900).unwrap();
         assert_eq!(s.prune_messages(1_000, 0, 20_000).unwrap(), 2); // the two old survivors go
         let (after, _) = s.pull("team", "U_A", Some(0), None).unwrap();
         assert_eq!(after.len(), 1);
@@ -2163,8 +2204,8 @@ mod tests {
         let s = Store::open(None).unwrap();
         s.ensure_room("room.s", RoomKind::Channel, None, 1).unwrap();
         s.add_member("room.s", "U_A", 1).unwrap();
-        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("one")], None, None, 10).unwrap();
-        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("two")], None, None, 11).unwrap();
+        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("one")], None, None, None, 10).unwrap();
+        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("two")], None, None, None, 11).unwrap();
 
         let all = s.room_messages("room.s", 0, 100).unwrap();
         assert_eq!(all.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2]);
@@ -2181,9 +2222,9 @@ mod tests {
     fn room_stats_aggregates_tokens_messages_span_and_per_agent() {
         let s = Store::open(None).unwrap();
         // "hello world" = 11 chars → ceil(11/4) = 3 tokens; "hi" = 2 → 1; "bug report here" = 15 → 4.
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 10).unwrap();
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hi")], None, None, 20).unwrap();
-        s.append_message("team", &eref("U_B", "bob"), &[Part::text("bug report here")], None, None, 30).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, None, 10).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hi")], None, None, None, 20).unwrap();
+        s.append_message("team", &eref("U_B", "bob"), &[Part::text("bug report here")], None, None, None, 30).unwrap();
 
         let st = s.room_stats("team").unwrap();
         assert_eq!(st.messages, 3);
@@ -2200,6 +2241,40 @@ mod tests {
         // An unknown room is all-zeros with no span and no agents (not an error).
         let empty = s.room_stats("nope").unwrap();
         assert_eq!(empty, super::RoomStats::default());
+    }
+
+    #[test]
+    fn append_message_dedupes_on_client_id_replay() {
+        // #86: a retried send (same client_id) must return the ORIGINAL row, not insert a second.
+        let s = Store::open(None).unwrap();
+        let from = eref("U_A", "alice");
+        let first = s
+            .append_message("team", &from, &[Part::text("ship it")], None, None, Some("cid-1"), 10)
+            .unwrap();
+        assert!(!first.deduped, "the first send inserts");
+
+        // Replay with the same key: same id + seq, flagged deduped, tokens 0 (no double count).
+        let replay = s
+            .append_message("team", &from, &[Part::text("ship it")], None, None, Some("cid-1"), 99)
+            .unwrap();
+        assert!(replay.deduped, "the replay is recognized as a duplicate");
+        assert_eq!(replay.id, first.id, "same message id returned");
+        assert_eq!(replay.seq, first.seq, "same seq returned");
+        assert_eq!(replay.tokens, 0, "a dedup contributes no new tokens");
+
+        // Exactly one row exists.
+        let pulled = s.room_messages("team", 0, 1000).unwrap();
+        assert_eq!(pulled.len(), 1, "the retry did NOT double-post");
+
+        // A different key from the same author inserts a distinct row; and NULL keys never dedup.
+        let other = s
+            .append_message("team", &from, &[Part::text("again")], None, None, Some("cid-2"), 11)
+            .unwrap();
+        assert!(!other.deduped);
+        let unkeyed_a = s.append_message("team", &from, &[Part::text("x")], None, None, None, 12).unwrap();
+        let unkeyed_b = s.append_message("team", &from, &[Part::text("x")], None, None, None, 13).unwrap();
+        assert!(!unkeyed_a.deduped && !unkeyed_b.deduped, "unkeyed sends always insert");
+        assert_ne!(unkeyed_a.seq, unkeyed_b.seq);
     }
 
     // ---- vector / semantic recall ----

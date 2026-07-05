@@ -140,10 +140,10 @@ impl MeshAgent {
     /// lost (an idle-timeout drop, a network blip). Room membership and read cursors are durable on
     /// the hub, so the resumed connection is already in the same rooms — no re-join, no re-approval.
     /// Only attempted when we hold a local identity to re-authenticate with; an identity-less test
-    /// agent surfaces the error unchanged. (A retried `Send` could in theory re-post if the first
-    /// attempt reached the hub before the drop — but a disconnect means no reply came, and in the
-    /// common idle case the socket was already dead, so nothing landed. A duplicate line is a benign
-    /// worst case for a chat bus.)
+    /// agent surfaces the error unchanged. A retried `Send` no longer risks a double-post (#86): the
+    /// frame is cloned verbatim for the retry, so it carries the *same* `client_id` idempotency key,
+    /// and the hub's `(room, author, client_id)` unique index returns the original message on a
+    /// replay whose first attempt had already landed — at-least-once delivery, exactly-once effect.
     async fn request(&mut self, frame: ClientFrame) -> Result<ServerFrame> {
         match self.transport.request(frame.clone()).await {
             Err(e) if self.reconnectable(&e) => {
@@ -295,8 +295,13 @@ impl MeshAgent {
             let sig = parler_auth::sign(&identity.seed, &bytes)?;
             parts.push(MessageSig { sig, ts, uid, target: target.clone() }.to_part());
         }
+        // Idempotency key generated once per logical send. `request` clones the frame for its
+        // reconnect-and-retry-once path, so the *same* client_id rides the retry — if the first
+        // attempt already reached the hub before the drop, the hub returns that original message
+        // rather than posting a duplicate (#86).
+        let client_id = Some(uuid::Uuid::new_v4().to_string());
         match self
-            .request(ClientFrame::Send { target, parts, mentions, reply_to })
+            .request(ClientFrame::Send { target, parts, mentions, reply_to, client_id })
             .await?
         {
             ServerFrame::Sent { id, seq, room } => Ok((id, seq, room)),
@@ -809,5 +814,93 @@ mod tests {
     fn no_signature_part_is_unsigned() {
         let alice = parler_auth::new_identity().unwrap();
         assert_eq!(verify_message(&alice.id, &[Part::text("legacy")], None), SigStatus::Unsigned);
+    }
+
+    // ---- #86: idempotent Send across a reply-lost retry --------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    /// A transport that, once armed, **forwards** the frame to the hub (so it really lands) and then
+    /// returns a `Disconnected` error — exactly the "request reached the hub, reply was lost" race.
+    /// `MeshAgent::request` then reconnects (replacing this decorator with a fresh real client) and
+    /// retries the *same* frame, so the retry carries the same client_id.
+    struct ReplyLostOnce {
+        inner: Box<dyn crate::MeshTransport>,
+        armed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::MeshTransport for ReplyLostOnce {
+        async fn request(&mut self, frame: ClientFrame) -> Result<ServerFrame> {
+            if self.armed.swap(false, AtomicOrdering::SeqCst) {
+                let _ = self.inner.request(frame).await; // it reaches the hub…
+                return Err(anyhow::Error::new(crate::client::Disconnected)); // …but the reply is "lost"
+            }
+            self.inner.request(frame).await
+        }
+        async fn subscribe(&mut self) -> Result<bool> {
+            self.inner.subscribe().await
+        }
+        async fn next_delivery(&mut self, max_wait: std::time::Duration) -> Result<Option<StoredMessage>> {
+            self.inner.next_delivery(max_wait).await
+        }
+    }
+
+    async fn start_hub() -> String {
+        let store = parler_hub::Store::open(None).unwrap();
+        let state = Arc::new(parler_hub::HubState::new(
+            store,
+            "parler://test".into(),
+            "Test".into(),
+            parler_hub::HubMode::Private,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = parler_hub::serve(listener, state).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn retry_after_lost_reply_does_not_double_post() {
+        let hub = start_hub().await;
+
+        // Alice opens a channel and hands bob an invite; bob joins so both share a room.
+        let mut alice = MeshAgent::connect(&Config {
+            hub_url: hub.clone(),
+            identity: parler_auth::new_identity().unwrap(),
+            name: "alice".into(),
+            role: None,
+        })
+        .await
+        .unwrap();
+        let inv = alice.invite(parler_protocol::RoomKind::Channel, Some("plan".into()), None, None).await.unwrap();
+        let room = inv.room.clone();
+
+        // Bob dials in over a real client wrapped in the (disarmed) reply-lost decorator.
+        let bob_id = parler_auth::new_identity().unwrap();
+        let inner = crate::client::HubClient::connect(&hub, &bob_id, "bob", None).await.unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let flaky = ReplyLostOnce { inner: Box::new(inner), armed: armed.clone() };
+        let mut bob =
+            MeshAgent::with_transport_and_identity(Box::new(flaky), bob_id, "bob".into(), None, hub.clone());
+        bob.join(&inv.code).await.unwrap();
+
+        // Arm the drop, then send: the first attempt lands on the hub, the reply is lost, and the
+        // transparent retry re-sends the SAME frame (same client_id).
+        armed.store(true, AtomicOrdering::SeqCst);
+        let (id, _seq, sent_room) = bob.send_text(Target::Room { room: room.clone() }, "deploy now").await.unwrap();
+        assert_eq!(sent_room, room);
+
+        // Exactly one message exists despite the retry, and it's the id the caller got back.
+        let (msgs, _cursor) = alice.pull(&room, None, None).await.unwrap();
+        let deploys: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.parts.iter().any(|p| matches!(p, Part::Text(t) if t == "deploy now")))
+            .collect();
+        assert_eq!(deploys.len(), 1, "retry after a lost reply must not double-post");
+        assert_eq!(deploys[0].id, id, "the caller's success carries the original message id");
     }
 }
