@@ -90,9 +90,15 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Estimated communication tokens this message carries (see `estimate_message_tokens`), stored at
   -- append time so per-room/per-agent totals are a cheap aggregate. An estimate, not a billed count.
   -- Also added to older DBs via `add_column_if_missing` (which backfills historical rows once).
-  tokens      INTEGER NOT NULL DEFAULT 0
+  tokens      INTEGER NOT NULL DEFAULT 0,
+  -- Optional sender-supplied idempotency key (#86). NULL for old clients / unkeyed sends. The partial
+  -- unique index below makes a retried send with the same key return the original row instead of
+  -- double-posting; NULLs are excluded from the index so unkeyed sends are never deduped.
+  client_id   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room, seq);
+-- The (room, author, client_id) idempotency index (#86) is created after startup migration, so a DB
+-- that predates the client_id column gets the column added first (see Store::open).
 -- Retention's age scan (`prune_messages`) filters `WHERE ts < cutoff`; without this it's a full table
 -- scan every janitor pass on a large log.
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
@@ -238,6 +244,17 @@ pub struct Store {
     inner: Arc<Inner>,
 }
 
+/// The result of [`Store::append_message`]. `deduped` is `true` when a `client_id` idempotency key
+/// matched an already-stored message (#86): the `id`/`seq` are the *original* row's, no new row was
+/// written, and `tokens` is 0 so the caller doesn't double-count metrics or re-fan-out.
+#[derive(Debug, Clone)]
+pub struct AppendOutcome {
+    pub id: String,
+    pub seq: i64,
+    pub tokens: i64,
+    pub deduped: bool,
+}
+
 struct Inner {
     writer: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
@@ -298,6 +315,13 @@ impl Store {
         if add_column_if_missing(&writer, "messages", "tokens", "INTEGER NOT NULL DEFAULT 0")? {
             backfill_message_tokens(&writer)?;
         }
+        // Idempotency key (#86) on older DBs. The partial unique index is created by MIGRATION above
+        // once the column exists; add the column first for a DB that predates it.
+        add_column_if_missing(&writer, "messages", "client_id", "TEXT")?;
+        writer.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id \
+             ON messages(room, author, client_id) WHERE client_id IS NOT NULL;",
+        )?;
 
         // Vector index for semantic recall (sqlite-vec, registered via auto_extension above).
         let vec_dim = VEC_DIMENSION;
@@ -506,6 +530,7 @@ impl Store {
     /// Append a message and return `(id, seq, tokens)` — `tokens` is the stored estimate of this
     /// message's communication cost (see [`estimate_message_tokens`]), returned so the caller can also
     /// bump the hub's cumulative counter from the same computation.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_message(
         &self,
         room: &str,
@@ -513,8 +538,9 @@ impl Store {
         parts: &[Part],
         mentions: Option<&[String]>,
         reply_to: Option<&str>,
+        client_id: Option<&str>,
         ts: i64,
-    ) -> Result<(String, i64, i64)> {
+    ) -> Result<AppendOutcome> {
         let id = Uuid::now_v7().to_string();
         let parts_json = serde_json::to_string(parts)?;
         let mentions_json = match mentions {
@@ -525,12 +551,28 @@ impl Store {
         // aggregate later instead of a re-parse of every row on each viewer poll.
         let tokens = estimate_message_tokens(parts) as i64;
         let conn = self.w();
-        conn.execute(
-            "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts, tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts, tokens],
+        // Idempotent send (#86): with a client_id, a retried send whose first attempt already landed
+        // must return the ORIGINAL row, not insert a second. `INSERT … ON CONFLICT DO NOTHING` against
+        // the partial unique (room, author, client_id) index makes the insert a no-op on a replay;
+        // we then read back the existing row and report it as a (deduped) success. Unkeyed sends
+        // (client_id NULL) are excluded from the index and always insert, exactly as before.
+        let changed = conn.execute(
+            "INSERT INTO messages (id, room, author, author_name, author_role, parts, mentions, reply_to, ts, tokens, client_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(room, author, client_id) WHERE client_id IS NOT NULL DO NOTHING",
+            params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts, tokens, client_id],
         )?;
-        Ok((id, conn.last_insert_rowid(), tokens))
+        if changed == 1 {
+            return Ok(AppendOutcome { id, seq: conn.last_insert_rowid(), tokens, deduped: false });
+        }
+        // No row inserted ⇒ a client_id conflict: fetch the original message's id + seq and report it
+        // as the same success the first send returned. (Reachable only when client_id is Some.)
+        let (orig_id, orig_seq): (String, i64) = conn.query_row(
+            "SELECT id, seq FROM messages WHERE room = ?1 AND author = ?2 AND client_id = ?3",
+            params![room, from.id, client_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(AppendOutcome { id: orig_id, seq: orig_seq, tokens: 0, deduped: true })
     }
 
     /// `pull`'s cursor read shares the same already-held connection (see [`Store::pull`]); the
@@ -555,15 +597,36 @@ impl Store {
         agent: &str,
         since: Option<i64>,
         limit: Option<u32>,
+        ack: Option<i64>,
     ) -> Result<(Vec<StoredMessage>, i64)> {
         let lim = limit.unwrap_or(200).min(1000) as i64;
+        // Resolve the read floor. For a cursor read, apply a deferred ack first (#85): advance the
+        // stored cursor to `ack` (monotonic — never backward) *before* reading, so acknowledged
+        // messages are never re-read. When `ack` is present we then read from that floor but do NOT
+        // advance past the returned batch below (the next pull acks it), so a batch whose reply is
+        // lost on a drop is re-read on retry rather than skipped. A `since` re-read is a pure read.
+        let cur = match since {
+            Some(s) => s,
+            None => {
+                let stored = {
+                    let conn = self.r();
+                    Self::get_cursor(&conn, room, agent)?
+                };
+                match ack {
+                    Some(a) if a > stored => {
+                        self.w().execute(
+                            "UPDATE members SET cursor = ?1 WHERE room = ?2 AND agent = ?3",
+                            params![a, room, agent],
+                        )?;
+                        a
+                    }
+                    _ => stored,
+                }
+            }
+        };
         // Read the backlog on a pooled read-only connection (the hot, expensive part); the only write
         // is the tiny cursor advance below, which goes to the writer.
         let conn = self.r();
-        let cur = match since {
-            Some(s) => s,
-            None => Self::get_cursor(&conn, room, agent)?,
-        };
         let raws = {
             let mut stmt = conn.prepare(
                 "SELECT seq, id, room, author, author_name, author_role, parts, mentions, reply_to, ts
@@ -589,7 +652,9 @@ impl Store {
         };
         drop(conn); // release the read connection before taking the writer
         let new_cursor = raws.last().map(|r| r.seq).unwrap_or(cur);
-        if since.is_none() && new_cursor > cur {
+        // Advance-on-read ONLY for old (ack-less) clients. An ack-aware client (`ack` present) leaves
+        // the cursor at the ack floor — it commits this batch on its next pull's `ack` (#85).
+        if since.is_none() && ack.is_none() && new_cursor > cur {
             self.w().execute(
                 "UPDATE members SET cursor = ?1 WHERE room = ?2 AND agent = ?3",
                 params![new_cursor, room, agent],
@@ -1771,7 +1836,7 @@ mod tests {
             s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
             s.add_member("team", "U_A", 1).unwrap();
             s.add_member("team", "U_B", 1).unwrap();
-            s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 20).unwrap();
+            s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, None, 20).unwrap();
             s.remember("U_A", &Fact { key: None, text: "deploy is blue-green".into(), room: Some("team".into()) }, 21, None, None).unwrap();
             s.register_card(&card("U_A", "alice", &["ops"], &["plan"]), Some("sig"), true, Visibility::Public, 12).unwrap();
             s.create_invite("CODE", "team", RoomKind::Channel, None, 1, 9_999_999_999_999, "U_A", false, 1).unwrap();
@@ -1796,10 +1861,10 @@ mod tests {
             assert_eq!(s.find_dm_room("U_A", "U_B").unwrap(), None); // a channel, not a dm
 
             // `pull` reads on the pool but advances the cursor on the writer.
-            let (msgs, cur) = s.pull("team", "U_B", None, None).unwrap();
+            let (msgs, cur) = s.pull("team", "U_B", None, None, None).unwrap();
             assert_eq!(msgs.len(), 1);
             assert_eq!(cur, 1);
-            let (again, _) = s.pull("team", "U_B", None, None).unwrap();
+            let (again, _) = s.pull("team", "U_B", None, None, None).unwrap();
             assert!(again.is_empty(), "cursor advanced through the writer");
 
             // Read-then-write op, then confirm the new membership through the pool.
@@ -1858,19 +1923,67 @@ mod tests {
         s.add_member("team", "U_A", 1).unwrap();
         s.add_member("team", "U_B", 1).unwrap();
 
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("one")], None, None, 10).unwrap();
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("two")], None, None, 11).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("one")], None, None, None, 10).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("two")], None, None, None, 11).unwrap();
 
         // Bob pulls: sees both, cursor now at 2.
-        let (msgs, cursor) = s.pull("team", "U_B", None, None).unwrap();
+        let (msgs, cursor) = s.pull("team", "U_B", None, None, None).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(cursor, 2);
         // A second pull (cursor-based) is empty — no re-reading history.
-        let (msgs2, _) = s.pull("team", "U_B", None, None).unwrap();
+        let (msgs2, _) = s.pull("team", "U_B", None, None, None).unwrap();
         assert!(msgs2.is_empty());
         // An explicit `since` re-reads without moving the cursor.
-        let (again, _) = s.pull("team", "U_B", Some(0), None).unwrap();
+        let (again, _) = s.pull("team", "U_B", Some(0), None, None).unwrap();
         assert_eq!(again.len(), 2);
+    }
+
+    #[test]
+    fn ack_pull_defers_the_commit_and_closes_the_loss_window() {
+        // #85: an ack-aware pull reads the batch but does NOT commit past it — so a batch whose reply
+        // is lost on a drop is RE-READ on retry instead of silently skipped (the old advance-on-read
+        // loss window). Write the failing assertion first: the ack-less pull below proves the skip.
+        let s = Store::open(None).unwrap();
+        s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
+        s.upsert_agent("U_A", "alice", None, 1).unwrap();
+        s.upsert_agent("U_B", "bob", None, 1).unwrap();
+        s.add_member("team", "U_A", 1).unwrap();
+        s.add_member("team", "U_B", 1).unwrap();
+        for i in 1..=3 {
+            s.append_message("team", &eref("U_A", "alice"), &[Part::text("m")], None, None, None, i).unwrap();
+        }
+
+        // Ack-aware pull (ack floor 0): returns all three, cursor tail is 3, but the commit is deferred.
+        let (batch, cursor) = s.pull("team", "U_B", None, None, Some(0)).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(cursor, 3, "returned cursor is the batch tail");
+
+        // The reply was "lost" (bob never acked). A retry with the SAME ack re-delivers the batch —
+        // an advance-on-read pull would have skipped it. This is the loss-window fix.
+        let (redelivered, _c) = s.pull("team", "U_B", None, None, Some(0)).unwrap();
+        assert_eq!(redelivered.len(), 3, "un-acked batch is re-delivered, not skipped");
+
+        // Once bob acks up to 3, those messages are committed and never re-read.
+        let (after_ack, _c) = s.pull("team", "U_B", None, None, Some(3)).unwrap();
+        assert!(after_ack.is_empty(), "acked messages are committed");
+    }
+
+    #[test]
+    fn ack_less_pull_advances_on_read_exactly_as_before() {
+        // Old-client compatibility (#85): a Pull without ack commits on read, so a second pull is
+        // empty — byte-for-byte the prior behavior (and the loss window the ack path closes).
+        let s = Store::open(None).unwrap();
+        s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
+        s.upsert_agent("U_B", "bob", None, 1).unwrap();
+        s.add_member("team", "U_B", 1).unwrap();
+        s.append_message("team", &eref("U_B", "bob"), &[Part::text("m")], None, None, None, 1).unwrap();
+        s.append_message("team", &eref("U_B", "bob"), &[Part::text("m")], None, None, None, 2).unwrap();
+
+        let (b1, cur) = s.pull("team", "U_B", None, None, None).unwrap();
+        assert_eq!(b1.len(), 2);
+        assert_eq!(cur, 2);
+        let (b2, _c) = s.pull("team", "U_B", None, None, None).unwrap();
+        assert!(b2.is_empty(), "ack-less pull advances on read, as before");
     }
 
     #[test]
@@ -1982,18 +2095,18 @@ mod tests {
         let s = Store::open(None).unwrap();
         s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
         for i in 0..5 {
-            s.append_message("team", &eref("U_A", "a"), &[Part::text("m")], None, None, 100 + i).unwrap();
+            s.append_message("team", &eref("U_A", "a"), &[Part::text("m")], None, None, None, 100 + i).unwrap();
         }
         // now=10_000, retain 1s ⇒ all five (ts 100..104) are "expired", but keep the newest 2.
         assert_eq!(s.prune_messages(1_000, 2, 10_000).unwrap(), 3);
-        let (msgs, _) = s.pull("team", "U_A", Some(0), None).unwrap();
+        let (msgs, _) = s.pull("team", "U_A", Some(0), None, None).unwrap();
         assert_eq!(msgs.len(), 2);
         // Idempotent: a second pass removes nothing (only the keep floor remains).
         assert_eq!(s.prune_messages(1_000, 2, 20_000).unwrap(), 0);
         // A recent message is never pruned, even with keep=0.
-        s.append_message("team", &eref("U_A", "a"), &[Part::text("fresh")], None, None, 19_900).unwrap();
+        s.append_message("team", &eref("U_A", "a"), &[Part::text("fresh")], None, None, None, 19_900).unwrap();
         assert_eq!(s.prune_messages(1_000, 0, 20_000).unwrap(), 2); // the two old survivors go
-        let (after, _) = s.pull("team", "U_A", Some(0), None).unwrap();
+        let (after, _) = s.pull("team", "U_A", Some(0), None, None).unwrap();
         assert_eq!(after.len(), 1);
     }
 
@@ -2163,8 +2276,8 @@ mod tests {
         let s = Store::open(None).unwrap();
         s.ensure_room("room.s", RoomKind::Channel, None, 1).unwrap();
         s.add_member("room.s", "U_A", 1).unwrap();
-        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("one")], None, None, 10).unwrap();
-        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("two")], None, None, 11).unwrap();
+        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("one")], None, None, None, 10).unwrap();
+        s.append_message("room.s", &eref("U_A", "alice"), &[Part::text("two")], None, None, None, 11).unwrap();
 
         let all = s.room_messages("room.s", 0, 100).unwrap();
         assert_eq!(all.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2]);
@@ -2173,7 +2286,7 @@ mod tests {
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].seq, 2);
         // The viewer is not a member, so its read must leave the member's pull cursor untouched.
-        let (pulled, _cursor) = s.pull("room.s", "U_A", None, None).unwrap();
+        let (pulled, _cursor) = s.pull("room.s", "U_A", None, None, None).unwrap();
         assert_eq!(pulled.len(), 2, "member still sees the full backlog — room_messages didn't advance it");
     }
 
@@ -2181,9 +2294,9 @@ mod tests {
     fn room_stats_aggregates_tokens_messages_span_and_per_agent() {
         let s = Store::open(None).unwrap();
         // "hello world" = 11 chars → ceil(11/4) = 3 tokens; "hi" = 2 → 1; "bug report here" = 15 → 4.
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, 10).unwrap();
-        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hi")], None, None, 20).unwrap();
-        s.append_message("team", &eref("U_B", "bob"), &[Part::text("bug report here")], None, None, 30).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hello world")], None, None, None, 10).unwrap();
+        s.append_message("team", &eref("U_A", "alice"), &[Part::text("hi")], None, None, None, 20).unwrap();
+        s.append_message("team", &eref("U_B", "bob"), &[Part::text("bug report here")], None, None, None, 30).unwrap();
 
         let st = s.room_stats("team").unwrap();
         assert_eq!(st.messages, 3);
@@ -2200,6 +2313,40 @@ mod tests {
         // An unknown room is all-zeros with no span and no agents (not an error).
         let empty = s.room_stats("nope").unwrap();
         assert_eq!(empty, super::RoomStats::default());
+    }
+
+    #[test]
+    fn append_message_dedupes_on_client_id_replay() {
+        // #86: a retried send (same client_id) must return the ORIGINAL row, not insert a second.
+        let s = Store::open(None).unwrap();
+        let from = eref("U_A", "alice");
+        let first = s
+            .append_message("team", &from, &[Part::text("ship it")], None, None, Some("cid-1"), 10)
+            .unwrap();
+        assert!(!first.deduped, "the first send inserts");
+
+        // Replay with the same key: same id + seq, flagged deduped, tokens 0 (no double count).
+        let replay = s
+            .append_message("team", &from, &[Part::text("ship it")], None, None, Some("cid-1"), 99)
+            .unwrap();
+        assert!(replay.deduped, "the replay is recognized as a duplicate");
+        assert_eq!(replay.id, first.id, "same message id returned");
+        assert_eq!(replay.seq, first.seq, "same seq returned");
+        assert_eq!(replay.tokens, 0, "a dedup contributes no new tokens");
+
+        // Exactly one row exists.
+        let pulled = s.room_messages("team", 0, 1000).unwrap();
+        assert_eq!(pulled.len(), 1, "the retry did NOT double-post");
+
+        // A different key from the same author inserts a distinct row; and NULL keys never dedup.
+        let other = s
+            .append_message("team", &from, &[Part::text("again")], None, None, Some("cid-2"), 11)
+            .unwrap();
+        assert!(!other.deduped);
+        let unkeyed_a = s.append_message("team", &from, &[Part::text("x")], None, None, None, 12).unwrap();
+        let unkeyed_b = s.append_message("team", &from, &[Part::text("x")], None, None, None, 13).unwrap();
+        assert!(!unkeyed_a.deduped && !unkeyed_b.deduped, "unkeyed sends always insert");
+        assert_ne!(unkeyed_a.seq, unkeyed_b.seq);
     }
 
     // ---- vector / semantic recall ----

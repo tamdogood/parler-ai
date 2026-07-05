@@ -1330,11 +1330,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<HubState>) {
                             // lands in the room or the bounded timer fires. Any other frame — including
                             // a `Pull` without `wait_secs` — takes the synchronous `dispatch` path
                             // unchanged, so old clients are byte-for-byte unaffected.
-                            Ok(ClientFrame::Pull { room, since, limit, wait_secs: Some(secs) })
+                            Ok(ClientFrame::Pull { room, since, limit, wait_secs: Some(secs), ack })
                                 if conn.authed.is_some() =>
                             {
                                 let authed = conn.authed.clone().expect("guarded by is_some");
-                                waited_pull(&state, &authed, room, since, limit, secs).await
+                                waited_pull(&state, &authed, room, since, limit, ack, secs).await
                             }
                             Ok(frame) => dispatch(&state, &mut conn, frame),
                             Err(e) => Reply::Frame(ServerFrame::Error {
@@ -1486,9 +1486,10 @@ async fn waited_pull(
     room: String,
     since: Option<i64>,
     limit: Option<u32>,
+    ack: Option<i64>,
     wait_secs: u64,
 ) -> Reply {
-    match store_waited_pull(state, me, &room, since, limit, wait_secs).await {
+    match store_waited_pull(state, me, &room, since, limit, ack, wait_secs).await {
         Ok((messages, cursor)) => Reply::Frame(ServerFrame::Pulled { room, messages, cursor }),
         Err(e) => Reply::Frame(ServerFrame::Error { message: e.to_string() }),
     }
@@ -1501,6 +1502,7 @@ async fn store_waited_pull(
     room: &str,
     since: Option<i64>,
     limit: Option<u32>,
+    ack: Option<i64>,
     wait_secs: u64,
 ) -> anyhow::Result<(Vec<StoredMessage>, i64)> {
     let store = &state.store;
@@ -1508,8 +1510,10 @@ async fn store_waited_pull(
         anyhow::bail!("not a member of '{room}'");
     }
     // A history re-read (`since` set) is a full-detail range read, not a live tail — never wait on it
-    // (it also must not advance the cursor). Serve it immediately, exactly like a plain pull.
-    let first = store.pull(room, &me.id, since, limit)?;
+    // (it also must not advance the cursor). Serve it immediately, exactly like a plain pull. The
+    // deferred `ack` (#85) is threaded to every pull in the loop: advancing the cursor to it is
+    // idempotent (monotonic max), and passing it keeps the ack-aware no-advance-on-read behavior.
+    let first = store.pull(room, &me.id, since, limit, ack)?;
     if since.is_some() || !first.0.is_empty() {
         return Ok(first);
     }
@@ -1519,7 +1523,7 @@ async fn store_waited_pull(
         // Register interest *before* re-checking the store, so a `Send` that lands between the pull
         // and the await can't be lost — the already-armed `notified()` future fires immediately.
         let notified = notify.notified();
-        let (messages, cursor) = store.pull(room, &me.id, None, limit)?;
+        let (messages, cursor) = store.pull(room, &me.id, None, limit, ack)?;
         if !messages.is_empty() {
             return Ok((messages, cursor));
         }
@@ -1808,7 +1812,7 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             Ok(ServerFrame::Joined { room, kind: RoomKind::Service })
         }
 
-        ClientFrame::Send { target, parts, mentions, reply_to } => {
+        ClientFrame::Send { target, parts, mentions, reply_to, client_id } => {
             if !state.rate_allows(&me.id, RateKind::Send, now_ms()) {
                 anyhow::bail!("rate limit: too many messages — slow down");
             }
@@ -1825,30 +1829,45 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             let mentions = mentions.as_deref().and_then(normalize_mentions);
             let from = EndpointRef { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
             let now = now_ms();
-            let (id, seq, tokens) =
-                store.append_message(&room, &from, &parts, mentions.as_deref(), reply_to.as_deref(), now)?;
-            state.metrics.messages_total.fetch_add(1, Ordering::Relaxed);
-            // Same estimate the row stored, so the hub-wide counter and the per-room totals agree.
-            state.metrics.tokens_total.fetch_add(tokens.max(0) as u64, Ordering::Relaxed);
-            // Best-effort live push to subscribed members (the durable cursor is still the source of
-            // truth, so this only lowers latency — it never replaces `Pull`). Built from the same
-            // fields just persisted, so a pushed message is byte-identical to the pulled one.
-            state.fanout(
-                &room,
-                &me.id,
-                StoredMessage { seq, id: id.clone(), room: room.clone(), from, parts, mentions, reply_to, ts: now },
-            );
-            Ok(ServerFrame::Sent { id, seq, room })
+            let out = store.append_message(
+                &room, &from, &parts, mentions.as_deref(), reply_to.as_deref(), client_id.as_deref(), now,
+            )?;
+            // A deduped send (idempotency-key replay, #86) is a no-op on state: the original row was
+            // already counted and fanned out, so re-counting or re-pushing would resurrect the very
+            // duplicate the key exists to prevent. Just echo the original message's id/seq back.
+            if !out.deduped {
+                state.metrics.messages_total.fetch_add(1, Ordering::Relaxed);
+                // Same estimate the row stored, so the hub-wide counter and per-room totals agree.
+                state.metrics.tokens_total.fetch_add(out.tokens.max(0) as u64, Ordering::Relaxed);
+                // Best-effort live push to subscribed members (the durable cursor is still the source
+                // of truth, so this only lowers latency — it never replaces `Pull`). Built from the
+                // same fields just persisted, so a pushed message is byte-identical to the pulled one.
+                state.fanout(
+                    &room,
+                    &me.id,
+                    StoredMessage {
+                        seq: out.seq,
+                        id: out.id.clone(),
+                        room: room.clone(),
+                        from,
+                        parts,
+                        mentions,
+                        reply_to,
+                        ts: now,
+                    },
+                );
+            }
+            Ok(ServerFrame::Sent { id: out.id, seq: out.seq, room })
         }
 
         // A `Pull` with `wait_secs` on an authed connection is intercepted upstream (`waited_pull`);
         // reaching here means no wait was requested (or an edge that can't park), so serve it as an
         // immediate pull. `wait_secs` is deliberately ignored on this synchronous path.
-        ClientFrame::Pull { room, since, limit, wait_secs: _ } => {
+        ClientFrame::Pull { room, since, limit, wait_secs: _, ack } => {
             if !store.is_member(&room, &me.id)? {
                 anyhow::bail!("not a member of '{room}'");
             }
-            let (messages, cursor) = store.pull(&room, &me.id, since, limit)?;
+            let (messages, cursor) = store.pull(&room, &me.id, since, limit, ack)?;
             Ok(ServerFrame::Pulled { room, messages, cursor })
         }
 
@@ -2375,7 +2394,7 @@ mod tests {
     /// `fanout`, which calls `notify_room`). A parked `store_waited_pull` wakes on the notify.
     fn append(state: &HubState, room: &str, author: &str, text: &str) {
         let from = EndpointRef { id: author.into(), name: author.into(), role: None };
-        state.store.append_message(room, &from, &[Part::text(text)], None, None, now_ms()).unwrap();
+        state.store.append_message(room, &from, &[Part::text(text)], None, None, None, now_ms()).unwrap();
         state.notify_room(room);
     }
 
@@ -2387,7 +2406,7 @@ mod tests {
         let state = wait_test_state("r", &me.id);
         append(&state, "r", "UPEER", "already here");
         let started = tokio::time::Instant::now();
-        let (msgs, _cursor) = store_waited_pull(&state, &me, "r", None, None, 30).await.unwrap();
+        let (msgs, _cursor) = store_waited_pull(&state, &me, "r", None, None, None, 30).await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert!(started.elapsed() < Duration::from_millis(500), "no parking when backlog is non-empty");
     }
@@ -2406,7 +2425,7 @@ mod tests {
             })
         };
         let started = tokio::time::Instant::now();
-        let (msgs, _c) = store_waited_pull(&state, &me, "r", None, None, 30).await.unwrap();
+        let (msgs, _c) = store_waited_pull(&state, &me, "r", None, None, None, 30).await.unwrap();
         writer.await.unwrap();
         assert_eq!(msgs.len(), 1, "the parked pull returned the just-landed message");
         assert!(started.elapsed() < Duration::from_secs(5), "woke on the message, not the timeout");
@@ -2419,12 +2438,12 @@ mod tests {
         let me = Authed { id: "UME".into(), name: "me".into(), role: None };
         let state = wait_test_state("r", &me.id);
         let started = tokio::time::Instant::now();
-        let (msgs, _c) = store_waited_pull(&state, &me, "r", None, None, 1).await.unwrap();
+        let (msgs, _c) = store_waited_pull(&state, &me, "r", None, None, None, 1).await.unwrap();
         assert!(msgs.is_empty());
         assert!(started.elapsed() >= Duration::from_secs(1), "waited out the window");
         // Cursor untouched: a plain pull now sees a subsequently-sent message.
         append(&state, "r", "UPEER", "after");
-        let (after, _c) = state.store.pull("r", &me.id, None, None).unwrap();
+        let (after, _c) = state.store.pull("r", &me.id, None, None, None).unwrap();
         assert_eq!(after.len(), 1, "the empty wait left the cursor in place");
     }
 
@@ -2433,7 +2452,7 @@ mod tests {
         // Authorization is unchanged: a non-member's waited pull errors immediately (no parking).
         let me = Authed { id: "UME".into(), name: "me".into(), role: None };
         let state = wait_test_state("r", "USOMEONE_ELSE"); // `me` is not added
-        assert!(store_waited_pull(&state, &me, "r", None, None, 30).await.is_err());
+        assert!(store_waited_pull(&state, &me, "r", None, None, None, 30).await.is_err());
     }
 
     #[tokio::test]
@@ -2443,7 +2462,7 @@ mod tests {
         let me = Authed { id: "UME".into(), name: "me".into(), role: None };
         let state = wait_test_state("r", &me.id);
         let started = tokio::time::Instant::now();
-        let (msgs, _c) = store_waited_pull(&state, &me, "r", Some(0), None, 30).await.unwrap();
+        let (msgs, _c) = store_waited_pull(&state, &me, "r", Some(0), None, None, 30).await.unwrap();
         assert!(msgs.is_empty());
         assert!(started.elapsed() < Duration::from_millis(500), "a since re-read never waits");
     }
