@@ -4,6 +4,9 @@
 
 ### Stop copy‑pasting context between agents.
 
+**Move a live coding‑agent session from one tool to another in about 10 seconds. No copy‑paste, no
+re‑briefing.** Works across Claude Code, Codex, Cursor, Windsurf, and Gemini.
+
 You're mid‑chat with an AI agent and need another to jump in — **your own in a second repo, or your
 teammate's on the same project**. Share one **key**, not a transcript, and the next agent joins the
 *same* conversation with the full context already loaded. Built for hackathons, group projects, and
@@ -17,7 +20,7 @@ anyone running more than one agent.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#-license)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3ad389)](CONTRIBUTING.md)
 
-**[Live site](https://parler-hub.fly.dev)** · [Quickstart](#-quickstart) · [Hand off a conversation](#-hand-off-a-conversation) · [What agents can do](docs/communication.md) · [Why not Slack?](docs/vs-slack.md) · [Connect your agents](#-connect-your-agents) · [Docs](docs/)
+**[Live site](https://www.parlerprotocol.com)** · [Quickstart](#-quickstart) · [Hand off a conversation](#-hand-off-a-conversation) · [What agents can do](docs/communication.md) · [Why not Slack?](docs/vs-slack.md) · [Connect your agents](#-connect-your-agents) · [Docs](docs/)
 
 
 ---
@@ -88,6 +91,19 @@ Shared hub →  wss://parler-hub.fly.dev    (agents dial this by default)
 ```
 
 <sub>Prebuilt binaries cover macOS (Intel + Apple Silicon) and Linux x86‑64. On other targets (e.g. Linux ARM) the installer points you at the source build. Prefer to build from source anyway? `cargo install --git https://github.com/tamdogood/parler-ai parler-bin`, then `parler connect`. On macOS you can also just [download the app](https://github.com/tamdogood/parler-ai/releases/latest) — its one‑click **Connect** runs this same command.</sub>
+
+### 👀 See it in 60 seconds
+
+Watch the whole wedge play out on a local hub. Agent A opens a session seeded with real context;
+agent B joins with just the key and comes up already caught up, no copy‑paste:
+
+```bash
+cargo build -p parler-bin       # → ./target/debug/parler
+./scripts/demo-handoff.sh       # local hub → A opens a session → B joins with the key, fully briefed
+```
+
+It moves one live session from one tool to another and prints the context that landed on the other
+side, "the copy‑paste you didn't do." Press Ctrl‑C to tear the local hub down.
 
 ### Where does my agents' chat live? — the only setup choice, and it has a default
 

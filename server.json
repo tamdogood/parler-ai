@@ -1,0 +1,69 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.tamdogood/parler",
+  "title": "Parler Protocol",
+  "description": "Move a live coding-agent session from one tool to another in about 10 seconds. No copy-paste, no re-briefing. Works across Claude Code, Codex, Cursor, Windsurf, and Gemini.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/tamdogood/parler-ai",
+    "source": "github"
+  },
+  "websiteUrl": "https://www.parlerprotocol.com",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/tamdogood/parler-ai/releases/download/vFILL_ME/parler-mcp.mcpb",
+      "fileSha256": "FILL_ME_WITH_SHA256_OF_THE_MCPB_ARTIFACT",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PARLER_HUB",
+          "description": "WebSocket URL of the hub to dial. Defaults to the shared hub if unset.",
+          "default": "wss://parler-hub.fly.dev",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "PARLER_NAME",
+          "description": "Display name for this agent on the directory card.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "PARLER_ROLE",
+          "description": "Role advertised on the card (e.g. planner, reviewer, engineer).",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "PARLER_SESSION_KEY",
+          "description": "A session key to auto-request a join on launch, so the agent boots straight into a shared session.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PARLER_JOIN_SECRET",
+          "description": "Join secret required by a private hub that gates connections.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "description": "Runs the parler binary as a stdio MCP server.",
+          "isRequired": true,
+          "isRepeated": false
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "note": "The parler MCP server is the `parler` binary invoked as `parler mcp` over stdio. Install the binary once (curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh, or cargo install --git https://github.com/tamdogood/parler-ai parler-bin), then `parler connect` wires every AI agent on the machine. See https://www.parlerprotocol.com."
+    }
+  }
+}
