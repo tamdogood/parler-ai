@@ -1,6 +1,10 @@
 import { ArrowRight, KeyRound } from "lucide-react";
 import { buttonVariants } from "@/components/ui/button";
+import { CopyButton } from "@/components/copy-button";
 import { ParticleField } from "@/components/particle-field";
+
+// The one-command install, above the fold — the same two lines from the README Quickstart.
+const INSTALL = "curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh\nparler connect";
 
 export function Hero() {
   return (
@@ -24,13 +28,35 @@ export function Hero() {
         </h1>
 
         <p className="mx-auto mt-5 max-w-2xl animate-[slide-up-fade_0.6s_ease_both] text-[17px] leading-[1.6] text-fog">
-          You&apos;re mid‑conversation with an AI agent and need another to jump in — yours in another
-          repo, or your teammate&apos;s across the table. Skip the ⌘C / ⌘V: publish the session, share a
-          key, and the next agent — Claude, Codex, Hermes — joins the <em>same</em> conversation with
-          the full context already loaded, in one line.
+          Move a live coding‑agent session from one tool to another in about 10 seconds. No
+          copy‑paste, no re‑briefing: the next agent joins the <em>same</em> conversation with the
+          full context already loaded. Works across Claude Code, Codex, Cursor, Windsurf, and Gemini.
         </p>
 
-        <div className="mt-8 flex animate-[slide-up-fade_0.7s_ease_both] flex-wrap items-center justify-center gap-3">
+        {/* The one-command install, right above the fold, copyable in place. */}
+        <div className="mx-auto mt-8 max-w-xl animate-[slide-up-fade_0.7s_ease_both] overflow-hidden rounded-[12px] border border-graphite-rail bg-void-black text-left">
+          <div className="flex items-center gap-2 border-b border-graphite-rail px-4 py-2">
+            <span className="size-2.5 rounded-full bg-graphite-rail" />
+            <span className="size-2.5 rounded-full bg-graphite-rail" />
+            <span className="size-2.5 rounded-full bg-graphite-rail" />
+            <span className="ml-2 font-mono text-[12px] text-electric-blue">install.sh</span>
+            <CopyButton value={INSTALL} className="ml-auto" />
+          </div>
+          <pre className="overflow-x-auto px-4 py-3 font-mono text-[12.5px] leading-[1.7]">
+            <code>
+              <span className="text-steel">$ </span>
+              <span className="text-frost">
+                curl -fsSL https://raw.githubusercontent.com/tamdogood/parler-ai/main/scripts/install.sh | sh
+              </span>
+              {"\n"}
+              <span className="text-steel">$ </span>
+              <span className="text-resend-violet">parler</span>
+              <span className="text-frost"> connect</span>
+            </code>
+          </pre>
+        </div>
+
+        <div className="mt-6 flex animate-[slide-up-fade_0.8s_ease_both] flex-wrap items-center justify-center gap-3">
           {/* macOS download temporarily hidden while the desktop app is stabilized. Restore the
               CTA below (and the copy line) once the app is stable. */}
           <a href="#sessions" className={buttonVariants({ variant: "cta", size: "lg" })}>
@@ -42,7 +68,7 @@ export function Hero() {
           </a>
         </div>
 
-        <p className="mt-3 animate-[slide-up-fade_0.8s_ease_both] text-[12.5px] text-steel">
+        <p className="mt-3 animate-[slide-up-fade_0.9s_ease_both] text-[12.5px] text-steel">
           Runs a private hub locally · connects your agents, or your whole team, in one line
         </p>
       </div>

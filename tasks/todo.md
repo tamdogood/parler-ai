@@ -160,3 +160,40 @@ viewer — and **lifted the Wrapped modal to the `SessionViewer` root** so the c
 and the paste-card button share one modal (`wrapped` state `= { view, token, messages? }`). There is
 no persisted session list to hang a row off of: watch tokens are memory-only by design (never
 localStorage), which is the correct security posture, so the pre-viewer entry lives on the code entry.
+
+## 2026-07-05 — Adoption sprint: ship the launch plan's code-shaped pre-flight assets (branch kolkata)
+
+**Audit conclusion:** the binding constraint is adoption, not engineering (per
+`docs/research/parler-market-viability-audit.md` + `parler-launch-plan.md`). Of the launch plan's
+pre-flight assets, #82 (activity metric) already shipped; still missing in code: the owned email
+list, wedge-first copy on both front doors (site + README), Track C registry artifacts, a
+rehearsable demo for the 90s video, and the #103 first-run trust killer (everyone on the shared hub
+is named `claude-code`; `--verify` can confirm a stranger). Deliberately deferred: #104 (needs a
+multiplexing design decision), #108/#111 (lower adoption leverage), any rename (human decision).
+
+**Plan — 4 parallel Opus implementation agents, disjoint file scopes, reviewed then gated:**
+- [x] **A. waitlist-hub** (`crates/parler-hub`): additive `POST /api/waitlist` — `waitlist` table
+      (self-migrating), INSERT OR IGNORE dedupe, 200-either-way (no membership leak), dedicated
+      10/min per-IP window on top of the 600/min front door (janitor-pruned), CORS-open for the
+      site's cross-origin POST; 4 smoke round-trips + unit tests; deploy/README export note.
+- [x] **B. unique-names** (`crates/parler-cli`): #103 — found AC1 (unique default names) + AC3
+      code already at HEAD; fixed the live AC2 hole: `--verify` now matches the wired identity's
+      **id** (read from `<PARLER_HOME>/config.json`), never the name, so a same-named stranger
+      can't be confirmed; added the AC2/AC3 e2e tests. README guidance already existed (line ~323).
+- [x] **C. wedge-web** (`web/`): hero states the 10-second wedge + copyable 2-line install above
+      the fold; new `EmailCapture` (a11y'd, idle/submitting/success/error) under the sessions
+      payoff, posting to `/api/waitlist`. `next build` green (47/47). Em dash in new copy → colon.
+- [x] **D. front-door**: README wedge one-liner + Live-site link → www.parlerprotocol.com + "See
+      it in 60 seconds" block; `scripts/demo-handoff.sh` (ran e2e twice, shellcheck clean,
+      scratch dir gitignored); `server.json` (mcpb path, FILL_ME publish fields flagged for a
+      human); `docs/launch/registry-listings.md` Track C checklist with verified steps.
+- [x] **Review**: my own diff review per track (fixes: hero em dash, deploy doc wrap, .gitignore)
+      + `code-reviewer` agent on the whole diff — **approved, zero findings** (verified: no wire
+      change, no membership/id leak, no lock across await, form↔endpoint contract interlocks).
+- [x] **Gate**: full `make ci` green (build · clippy -D warnings · test --locked · doc · web ·
+      audit) on the integrated tree; committed on `kolkata` as 4 focused commits.
+
+**Handed to the human (the parts code can't do):** record the 90s video with
+`scripts/demo-handoff.sh` as the rig; publish one MCP artifact + fill `server.json`'s two FILL_ME
+fields and run `mcp-publisher publish`; work through `docs/launch/registry-listings.md` in one
+sitting; deploy the hub so `/api/waitlist` goes live before the site form ships.
