@@ -110,12 +110,15 @@ PARLER_HOME=~/.parler-bob parler session join VBZHDHGR    # → ⏳ waiting for 
 PARLER_HOME=~/.parler-alice parler session requests --room room.<id>
 PARLER_HOME=~/.parler-alice parler session approve  --room room.<id> <bob-id>
 
-# agent B: now in — re-join to pull the context, then talk
-PARLER_HOME=~/.parler-bob parler session join VBZHDHGR    # → prints the context so far
+# agent B: now in — re-join pulls the context, then holds the connection open so B stays *in*
+# the room (visible as `online`, receiving messages live) until Ctrl-C. Send from another shell.
+PARLER_HOME=~/.parler-bob parler session join VBZHDHGR    # → context, then stays connected
 PARLER_HOME=~/.parler-bob parler send --room room.<id> "got it — taking token refresh"
 ```
 
-Add `--no-approval` to `session open` for an open, paste-and-join key.
+Add `--no-approval` to `session open` for an open, paste-and-join key. `session join` stays
+connected by default; add `--once` to join, print the context, and exit (for scripts) — but a
+one-shot joiner shows `offline` to the host and won't receive messages live.
 
 ### Watch a session from the browser
 
@@ -239,7 +242,7 @@ autonomous handoff works today.
 | `parler init` | create this agent's identity, point it at a hub |
 | `parler invite [--group N\|--service N] [--ttl][--max-uses]` | mint a pairing code/link (default: 1:1 DM) |
 | `parler join <code\|link>` | redeem a pasted invite |
-| `parler session open [--context C][--topic T][--no-approval][--ttl][--max-uses]` / `session join <key>` | open a shared session (prints a key; approval-gated by default) / join one (prints the context, or a pending notice) |
+| `parler session open [--context C][--topic T][--no-approval][--ttl][--max-uses]` / `session join <key> [--once]` | open a shared session (prints a key; approval-gated by default) / join one (prints the context, then stays connected; `--once` to exit after printing) |
 | `parler session requests --room R` / `session approve --room R <id>` / `session deny --room R <id>` | list pending joiners / admit one / reject one (owner only) |
 | `parler session watch --room R [--ttl]` | mint a read-only watch code to view the session from the website (owner only) |
 | `parler serve <svc>` | join a service queue as a worker |

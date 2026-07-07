@@ -1,52 +1,48 @@
-# SEO audit + update: rank for "chat protocol for agents" / "agent file transfers"
+# Fix: "join" should mean "you're in the room"
 
-## Audit findings
-1. **CRITICAL — canonical host is wrong.** `web/lib/seo.ts` set `SITE_URL =
-   https://parler-hub.fly.dev` (the *hub server*), but the marketing site lives at
-   `https://www.parlerprotocol.com`. That misdirected every canonical tag, the sitemap,
-   robots.txt (host + sitemap), OpenGraph/Twitter `url`, and all JSON-LD `url` to a host that
-   serves a different app and 404s on `/blog/*`. Fixing the one constant fixes them all.
-2. **HIGH — the home (money) page never targeted "chat protocol for AI agents".** Its `<title>`
-   and H1 lead with "share context"; the tagline phrase lived only in metadata, not visible copy.
-3. **HIGH — "agent file transfers" had ZERO on-site coverage** despite the shipped
-   `com.parler.file` feature (`parler send-file` / `parler fetch`). No keyword, section, example,
-   FAQ, or post.
-4. **MEDIUM — KEYWORDS list** missing both target phrases.
+The reported failure: two agents in a room, but the host's roster shows 1 and can't find the
+other. Root cause = `parler session join` joins, prints, and **exits** — so the joiner looks
+present for a blink, then leaves. Secondary wart: a first-run bootstrap that can't reach the hub
+still persists an identity, so a network-blocked join announces "initialized new agent …" and then
+errors — a confusing half-success.
 
-## Changes (on-page, honest — the features are real)
-- [x] `lib/seo.ts`: `SITE_URL` → `https://www.parlerprotocol.com`; add file-transfer to the
-      site description; prepend target keywords.
-- [x] `app/page.tsx`: home `<title>` + description lead with "the chat protocol for AI agents"
-      and mention file/code transfer; broaden the Hardening "transfers" card to name file transfer.
-- [x] `components/hero.tsx`: open the supporting copy with "Parler is the chat protocol for AI
-      agents" so the exact phrase is visible above the fold (and the hero finally says what it *is*).
-- [x] `components/examples.tsx`: add a "Send a file" tab with the real `send-file`/`fetch` commands.
-- [x] `components/faq.tsx`: fold "chat protocol for AI agents" + file/code transfer into the first
-      answer; add a dedicated "Can agents send each other files?" Q&A (feeds FAQPage schema).
+## Plan
 
-## Verify — DONE
-- [x] `npm ci` + `next build` → 50/50 pages, no type/lint errors.
-- [x] Generated `robots.txt`, `sitemap.xml`, home `<title>`, `<link canonical>`, `og:url`, and all
-      JSON-LD `url` now point at `https://www.parlerprotocol.com` (verified in `.next/` output).
-- [x] "chat protocol for AI agents" renders in the home `<title>` + hero body; "Send a file" tab +
-      `parler send-file` + the file-transfer FAQ render on the home page and in FAQPage JSON-LD.
-- [x] The only remaining `parler-hub.fly.dev` refs are `wss://parler-hub.fly.dev` (the live hub
-      endpoint agents dial) — correct, left untouched.
+- [ ] **#1 — `session join` stays in the room by default.** After a successful join, hold the
+      connection open: set presence `online`, subscribe, and follow the room (print new messages,
+      heartbeat presence) until Ctrl-C. This makes the joiner show `online` in the host's roster and
+      receive messages live — matching everyone's mental model of "join."
+  - [ ] Add `--once` flag to `SessionCmd::Join` for the old fire-and-exit behavior (scripts/CI).
+  - [ ] Add a `follow_session` helper (presence heartbeat + subscribe/pull loop). Leave `cmd_recv`
+        untouched (minimal impact).
+- [ ] **#2 — Don't leave an orphaned identity when the first connect fails.** In `connect()`'s
+      fresh-bootstrap branch, if the very first connect fails, roll back the just-minted
+      `config.json` so the next attempt (after `parler doctor` fixes the network) starts clean.
+      Existing identities are never touched.
+  - [ ] Add `Config::remove()` to parler-connector (next to `save`/`exists`).
 
-## Follow-up — DONE: dedicated blog post for "agent file transfers"
-- Shipped `how-ai-agents-send-each-other-files` via /write-blog. Angle: "a file is bytes, and
-  base64-in-chat taxes size + context tokens; put bytes on the content-addressed blob path." Owns
-  the "agent file transfer" cluster; links to (and is reciprocally linked from) the code-handoff
-  post so they don't cannibalize.
-- Wired: `docs/blog/*.md` source, `web/components/blog/*.tsx` body (prose primitives only),
-  `web/lib/blog.ts` POSTS entry, BODIES map + import in `app/blog/[slug]/page.tsx`, on-brand SVG
-  cover, repo-to-post backlink from `docs/file-transfer.md`.
-- Verified: `next build` green (52 pages); post `<title>`/description(=dek)/canonical(apex)/
-  og:image/twitter:image/BlogPosting JSON-LD all emit; slug in sitemap + /blog index card + cover
-  200. Scanner clean except the verbatim `parler recv` line (📎 + the em dash the CLI itself
-  prints), matching the shipped code-handoff precedent.
+## Gate
 
-## Distribution (still open — outward-facing, needs your go)
-- `/x-tweet` thread teaching the base64-tax insight, linking the post (not the homepage).
-- Answer the real question where it's asked (HN / r/rust / r/LocalLLaMA) with the post as the
-  fuller answer. Not done autonomously.
+- [ ] `CI_SKIP_WEB=1 make ci` green (clippy -D warnings is hard). No `cargo fmt`.
+- [ ] Wire protocol untouched — CLI behavior + identity-persistence ordering only.
+
+## Review
+
+Done. All items landed; `CI_SKIP_WEB=1 make ci` exits 0 (clippy -D warnings clean, all tests pass).
+
+- **#1** — `SessionCmd::Join` gained `--once`. Default path now calls a new `follow_session()`
+  helper: sets presence `online`, subscribes, and loops (heartbeat presence every 120s < the 5-min
+  `PRESENCE_STALE_MS` window; prints new messages) until Ctrl-C. So a joiner is now genuinely *in*
+  the room — `online` in the host's roster, receiving live — instead of fire-and-exit. `--once`
+  preserves the old scripted behavior. `cmd_recv` untouched.
+- **#2** — Added `Config::remove()` (idempotent) + a unit test. `connect()`'s fresh-bootstrap
+  branch now rolls the just-minted `config.json` back if the *first* connect fails, so a
+  network-blocked first run (e.g. sandboxed DNS) no longer strands an identity. Existing identities
+  are never touched.
+- Docs: `docs/agent-mesh.md` updated to describe the stay-connected default + `--once`.
+- Wire protocol untouched — CLI behavior + identity-persistence ordering only.
+
+### Follow-ups (not done — out of scope of the reported bug)
+- The MCP `parler_join_session` tool is inherently "join + return"; the live-in-room story there is
+  the long-lived MCP server itself. Worth a docs pass steering agents to MCP over the CLI one-shot.
+- Approval-*pending* join still returns early (re-run to check). Could auto-poll then follow.

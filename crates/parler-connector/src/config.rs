@@ -117,6 +117,17 @@ impl Config {
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
+
+    /// Delete `$PARLER_HOME/config.json` if present — used to roll back a freshly-minted identity
+    /// that could never reach its hub, so a first-run network failure doesn't strand an identity on
+    /// disk that never registered anywhere. A missing file is not an error (idempotent).
+    pub fn remove() -> Result<()> {
+        match std::fs::remove_file(config_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", config_path().display())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -133,5 +144,30 @@ mod tests {
         assert_eq!(expand_tilde_with("~alice/x", home.clone()), PathBuf::from("~alice/x"));
         // No HOME → leave the literal (don't fabricate a path).
         assert_eq!(expand_tilde_with("~/x", None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn remove_deletes_config_and_is_idempotent() {
+        // std-only temp dir (parler-connector has no tempfile dev-dep) — unique per run.
+        let dir = std::env::temp_dir().join(format!("parler-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("PARLER_HOME").ok();
+        std::env::set_var("PARLER_HOME", &dir);
+
+        // Removing when nothing is there is a no-op, not an error.
+        assert!(Config::remove().is_ok());
+
+        Config::create("ws://h", "bob", None).unwrap().save().unwrap();
+        assert!(Config::exists());
+        assert!(Config::remove().is_ok());
+        assert!(!Config::exists(), "remove() should delete the on-disk identity");
+        // Second removal is still fine (idempotent).
+        assert!(Config::remove().is_ok());
+
+        match prev {
+            Some(p) => std::env::set_var("PARLER_HOME", p),
+            None => std::env::remove_var("PARLER_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

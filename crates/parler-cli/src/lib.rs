@@ -223,10 +223,16 @@ enum SessionCmd {
         #[arg(long)]
         max_uses: Option<u32>,
     },
-    /// Join a shared session with a key and print the context so far (or a pending-approval notice).
+    /// Join a shared session with a key, print the context so far, then STAY in the room —
+    /// visible as `online` to the host and receiving messages live — until Ctrl-C.
     Join {
         /// The session key (or full link) you were given.
         key: String,
+        /// Join, print the context, and exit immediately instead of holding the connection open.
+        /// Use this for scripts/CI; a live agent should stay connected (the default) or use the MCP
+        /// server so the host actually sees it in the room.
+        #[arg(long)]
+        once: bool,
     },
     /// List the agents waiting for your approval to join a session you opened.
     Requests {
@@ -544,7 +550,15 @@ async fn connect() -> Result<MeshAgent> {
                     parler_connector::home_dir().display(),
                     cfg.hub_url
                 );
-                cfg
+                // A first-run identity that can't even reach its hub is a confusing half-success
+                // (the "initialized new agent …" line followed by a connect error, as when a
+                // sandbox blocks DNS). Roll the just-minted identity back so the next attempt —
+                // after `parler doctor` fixes the network — starts clean instead of adopting a
+                // stranded identity. Only this freshly-bootstrapped branch is rolled back.
+                return MeshAgent::connect(&cfg).await.map_err(|err| {
+                    let _ = Config::remove();
+                    anyhow::anyhow!("{err} (run `parler doctor` to troubleshoot)")
+                });
             } else {
                 return Err(e);
             }
@@ -968,7 +982,7 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
             println!();
             println!("Watch it live in your browser:  parler session watch --room {}", inv.room);
         }
-        SessionCmd::Join { key } => {
+        SessionCmd::Join { key, once } => {
             // An approval-gated session holds us as a pending request until the host admits us.
             let room = match ag.redeem(&key).await? {
                 parler_connector::JoinOutcome::Joined { room, .. } => room,
@@ -992,7 +1006,16 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
                 }
                 println!("--- end context ---");
             }
-            println!("send with:  parler send --room {room} \"…\"    receive with:  parler recv --room {room}");
+            if once {
+                // Fire-and-exit: membership persists, but the joiner leaves the connection — it will
+                // show `offline` to the host and won't receive messages live. Intended for scripts.
+                println!("send with:  parler send --room {room} \"…\"    receive with:  parler recv --room {room}");
+                return Ok(());
+            }
+            // Default: hold the connection open so "join" actually means "in the room" — the host
+            // sees us `online` and messages arrive live, instead of a fire-and-exit that made a
+            // joiner look present for a blink and then vanish (the "2 agents, roster says 1" bug).
+            follow_session(&mut ag, &room).await?;
         }
         SessionCmd::Requests { room, json } => {
             let room = session_room(room)?;
@@ -1040,6 +1063,41 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Hold the connection open after joining a session so the agent is actually *in* the room:
+/// visible as `online` in the host's roster and receiving messages as they land. Without this the
+/// CLI `session join` was fire-and-exit — the joiner registered membership, then dropped the
+/// connection, so the host saw one member and "couldn't find the other agent." Blocks until Ctrl-C.
+async fn follow_session(ag: &mut MeshAgent, room: &str) -> Result<()> {
+    let activity = || Some(format!("in session '{room}'"));
+    // Announce presence up front so the host's roster flips us to `online` immediately.
+    ag.presence("online", activity()).await?;
+    let pushing = ag.subscribe().await.unwrap_or(false);
+    eprintln!(
+        "🟢 in '{room}' — the host now sees you online ({}). Ctrl-C to leave.",
+        if pushing { "live push" } else { "polling every 2s" }
+    );
+    eprintln!("   Send from another shell:  parler send --room {room} \"…\"");
+    // Presence decays to `offline` after PRESENCE_STALE_MS (5 min) without a heartbeat, so re-assert
+    // it on a slower cadence than the wake loop rather than on every 2s poll.
+    let mut last_beat = std::time::Instant::now();
+    loop {
+        if pushing {
+            // Wake on a push for any of our rooms, or fall through every 25s to re-pull + heartbeat.
+            let _ = ag.next_delivery(Duration::from_secs(25)).await?;
+        } else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if last_beat.elapsed() >= Duration::from_secs(120) {
+            ag.presence("online", activity()).await?;
+            last_beat = std::time::Instant::now();
+        }
+        let (new, _cur) = ag.pull(room, None, None).await?;
+        for m in &new {
+            println!("{}", render_message(m));
+        }
+    }
 }
 
 /// Resolve an optional `--room` for the session subcommands: explicit wins, else the active
