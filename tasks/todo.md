@@ -1,52 +1,46 @@
-# SEO audit + update: rank for "chat protocol for agents" / "agent file transfers"
+# Task: Extensive Parler Protocol documentation on the website
 
-## Audit findings
-1. **CRITICAL — canonical host is wrong.** `web/lib/seo.ts` set `SITE_URL =
-   https://parler-hub.fly.dev` (the *hub server*), but the marketing site lives at
-   `https://www.parlerprotocol.com`. That misdirected every canonical tag, the sitemap,
-   robots.txt (host + sitemap), OpenGraph/Twitter `url`, and all JSON-LD `url` to a host that
-   serves a different app and 404s on `/blog/*`. Fixing the one constant fixes them all.
-2. **HIGH — the home (money) page never targeted "chat protocol for AI agents".** Its `<title>`
-   and H1 lead with "share context"; the tagline phrase lived only in metadata, not visible copy.
-3. **HIGH — "agent file transfers" had ZERO on-site coverage** despite the shipped
-   `com.parler.file` feature (`parler send-file` / `parler fetch`). No keyword, section, example,
-   FAQ, or post.
-4. **MEDIUM — KEYWORDS list** missing both target phrases.
+The repo has rich docs in `docs/*.md` and a great README, but nothing user-facing on
+the site explains *how to use* Parler. Add a proper `/docs` section to `web/`.
 
-## Changes (on-page, honest — the features are real)
-- [x] `lib/seo.ts`: `SITE_URL` → `https://www.parlerprotocol.com`; add file-transfer to the
-      site description; prepend target keywords.
-- [x] `app/page.tsx`: home `<title>` + description lead with "the chat protocol for AI agents"
-      and mention file/code transfer; broaden the Hardening "transfers" card to name file transfer.
-- [x] `components/hero.tsx`: open the supporting copy with "Parler is the chat protocol for AI
-      agents" so the exact phrase is visible above the fold (and the hero finally says what it *is*).
-- [x] `components/examples.tsx`: add a "Send a file" tab with the real `send-file`/`fetch` commands.
-- [x] `components/faq.tsx`: fold "chat protocol for AI agents" + file/code transfer into the first
-      answer; add a dedicated "Can agents send each other files?" Q&A (feeds FAQPage schema).
+## Plan
 
-## Verify — DONE
-- [x] `npm ci` + `next build` → 50/50 pages, no type/lint errors.
-- [x] Generated `robots.txt`, `sitemap.xml`, home `<title>`, `<link canonical>`, `og:url`, and all
-      JSON-LD `url` now point at `https://www.parlerprotocol.com` (verified in `.next/` output).
-- [x] "chat protocol for AI agents" renders in the home `<title>` + hero body; "Send a file" tab +
-      `parler send-file` + the file-transfer FAQ render on the home page and in FAQPage JSON-LD.
-- [x] The only remaining `parler-hub.fly.dev` refs are `wss://parler-hub.fly.dev` (the live hub
-      endpoint agents dial) — correct, left untouched.
+- [ ] `web/lib/docs.ts` — page registry (slug, title, description, group, order) + prev/next helpers
+- [ ] `web/components/docs/sidebar.tsx` — client sidebar, active-page highlight (usePathname)
+- [ ] `web/app/docs/layout.tsx` — NavBar + sidebar + content + Footer shell
+- [ ] `web/app/docs/page.tsx` — docs landing/overview (grouped cards)
+- [ ] `web/app/docs/[slug]/page.tsx` — per-page header + body + prev/next, SEO + JSON-LD
+- [ ] `web/components/docs/*.tsx` — content bodies:
+  - introduction, quickstart, core-concepts
+  - sessions, messaging, memory, file-and-code-handoff
+  - reference (CLI + MCP tools + env vars)
+  - self-hosting, security, troubleshooting
+- [ ] Wire "Docs" into nav-bar + footer
+- [ ] Add docs routes to sitemap.ts
+- [ ] `cd web && npm run build` green
 
-## Follow-up — DONE: dedicated blog post for "agent file transfers"
-- Shipped `how-ai-agents-send-each-other-files` via /write-blog. Angle: "a file is bytes, and
-  base64-in-chat taxes size + context tokens; put bytes on the content-addressed blob path." Owns
-  the "agent file transfer" cluster; links to (and is reciprocally linked from) the code-handoff
-  post so they don't cannibalize.
-- Wired: `docs/blog/*.md` source, `web/components/blog/*.tsx` body (prose primitives only),
-  `web/lib/blog.ts` POSTS entry, BODIES map + import in `app/blog/[slug]/page.tsx`, on-brand SVG
-  cover, repo-to-post backlink from `docs/file-transfer.md`.
-- Verified: `next build` green (52 pages); post `<title>`/description(=dek)/canonical(apex)/
-  og:image/twitter:image/BlogPosting JSON-LD all emit; slug in sitemap + /blog index card + cover
-  200. Scanner clean except the verbatim `parler recv` line (📎 + the em dash the CLI itself
-  prints), matching the shipped code-handoff precedent.
+## Review — DONE
 
-## Distribution (still open — outward-facing, needs your go)
-- `/x-tweet` thread teaching the base64-tax insight, linking the post (not the homepage).
-- Answer the real question where it's asked (HN / r/rust / r/LocalLLaMA) with the post as the
-  fuller answer. Not done autonomously.
+Added a full `/docs` section to `web/`, mirroring the blog infra (registry + BODIES map +
+shared prose primitives) so it matches house style and stays maintainable.
+
+- `lib/docs.ts` — 11-page registry, grouped, with prev/next helpers.
+- `components/docs/sidebar.tsx` — client sidebar, active-page highlight (usePathname),
+  collapses to a horizontal scroller on mobile.
+- `app/docs/layout.tsx` — NavBar + sidebar + Footer shell (chrome can't drift between pages).
+- `app/docs/page.tsx` — overview with grouped cards + ItemList/Breadcrumb JSON-LD.
+- `app/docs/[slug]/page.tsx` — header + body + prev/next, per-page canonical/OG/TechArticle +
+  Breadcrumb JSON-LD, generateStaticParams.
+- 11 content bodies: introduction, quickstart, core-concepts, sessions, messaging, memory,
+  file-and-code-handoff, reference (CLI + MCP + env), self-hosting, security, troubleshooting.
+- Wired "Docs" into nav-bar + footer; added all 12 routes to sitemap.ts.
+
+Content is drawn from README.md + docs/communication.md (authoritative), so commands/flags/env
+vars/tool names are accurate.
+
+Verified: `npm ci && npm run build` green — 65 pages, all 11 doc pages prerendered, no
+type/lint errors. Sitemap emits all 12 /docs URLs; rendered HTML contains the expected copy;
+nav Docs link present.
+
+Not committed/pushed (no request to). Suggested follow-up: add a "Docs" CTA on the landing
+hero, and OG images per doc page (blog has them; docs currently inherit the site default).
