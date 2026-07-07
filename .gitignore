@@ -12,10 +12,11 @@ __pycache__/
 *.creds
 *.seed
 
-# Demo runtime (seed-demo.sh / hackathon-demo.sh / demo-handoff.sh) + website build artifacts
+# Demo runtime (seed-demo.sh / hackathon-demo.sh / demo-handoff.sh / dogfood.sh) + website build artifacts
 /.demo/
 /.hackathon-demo/
 /.demo-handoff/
+/.dogfood/
 /web/node_modules/
 /web/.next/
 /web/out/
