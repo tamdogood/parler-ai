@@ -116,6 +116,9 @@ where
         writer.write_all(s.as_bytes()).await?;
         writer.flush().await?;
     }
+    // Clean shutdown (stdin EOF): best-effort commit any deferred acks left by auto-pull-on-send, so
+    // the next MCP start doesn't re-deliver a batch we already returned to the host (#85).
+    state.agent.flush_acks().await;
     Ok(())
 }
 
@@ -1034,10 +1037,13 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             let (_id, seq, room) = state.agent.send_text(target, &text).await?;
             // Auto-pull right after sending so an already-waiting reply shows up without a separate
             // parler_recv (read-after-write); for a reply that hasn't landed yet, use parler_recv with
-            // wait_secs to long-poll. Our own just-sent message is filtered out; the pull advances our
-            // cursor so these aren't re-delivered later. The pull is capped (AUTOPULL_LIMIT) so a
-            // reply flood can't balloon the send result — the remainder stays unread for the next
-            // parler_recv (a limited pull only advances the cursor through what it returned).
+            // wait_secs to long-poll. Our own just-sent message is filtered out; the pull records an
+            // ack so this batch is committed by the next pull and not re-delivered later in the
+            // session. The pull is capped (AUTOPULL_LIMIT) so a reply flood can't balloon the send
+            // result — the remainder stays unread for the next parler_recv (a limited pull only
+            // advances the cursor through what it returned). We deliberately do NOT commit_reads here:
+            // one extra round trip per send isn't worth it; the ack (#85) rides the next real pull, and
+            // a batch seen only via auto-pull before an MCP restart is re-read after — at-least-once.
             let mut out = format!("sent to '{room}' (seq {seq})");
             let auto_limit = if verbose_render() { None } else { Some(AUTOPULL_LIMIT) };
             if let Ok((msgs, _cursor)) = state.agent.pull(&room, None, auto_limit).await {
@@ -1141,6 +1147,12 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
                     None => format!("{body}\n— cursor at {cursor} —{more}"),
                 }
             };
+            // A one-shot MCP recv does a single pull, so the deferred ack (#85) would die with the
+            // process — commit the cursor-mode batch now it's rendered, so the next recv (even a cold
+            // start after an MCP restart) returns only newer messages. A `since` re-read never commits.
+            if !msgs.is_empty() && since.is_none() {
+                state.agent.commit_reads(&room).await?;
+            }
             // Surface any pending join requests so a host sees the accept/reject choice inline, even
             // when there are no new messages.
             if let Some(notice) = pending_join_notice(state, &room).await {
@@ -1468,10 +1480,12 @@ async fn join_session(
 /// `parler_join_session` and `parler_join` (#109) so a session key does the same thing through either
 /// door — active session set, backlog digested, arrival announced.
 async fn enter_session(state: &mut McpState, room: String, backlog: Backlog) -> Result<String> {
-    // since=None advances our fresh cursor to the live edge (this full pull is load-bearing), so a
-    // later parler_recv only returns genuinely new messages rather than re-delivering this backlog.
-    // We render a *digest* of what we pulled — the cursor still advanced past all of it.
+    // Pull the whole backlog (since=None) to seed the catch-up digest; the cursor advance is deferred
+    // to an ack (#85), so commit_reads flushes it right after — otherwise a one-shot join exits with
+    // the ack in memory and a later parler_recv re-delivers this whole backlog. We render a *digest*
+    // of what we pulled — the committed cursor sits past all of it.
     let (msgs, _cursor) = state.agent.pull(&room, None, None).await?;
+    state.agent.commit_reads(&room).await?;
     state.active_session = Some(room.clone());
     let _ = crate::save_active_session(&room);
     let _ = state
@@ -2283,6 +2297,72 @@ mod tests {
         // The second call cleared the backlog — a third recv is empty.
         let third = call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
         assert!(third.contains("no new messages"), "backlog fully drained:\n{third}");
+    }
+
+    #[tokio::test]
+    async fn mcp_recv_commits_cursor_across_a_restart() {
+        // An MCP `parler_recv` does one pull per call; the deferred ack (#85) must commit durably, or
+        // a cold start (the MCP server restarting) re-renders a batch the host already saw. The
+        // "restart" is a fresh MeshAgent (empty in-memory pending_ack) for the SAME identity.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+
+        // A stable identity we reconnect with (one Config reused across two connects).
+        let bob_cfg = Config::create(hub.clone(), "bob".to_string(), None).unwrap();
+        let mut bob = McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: None };
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
+        // Drain bob's own "joined" announce (it sits past his cursor) so his inbox starts clean.
+        call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+
+        alice.agent.send_text(Target::Room { room: room.clone() }, "only-once").await.unwrap();
+        let first = call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
+        assert!(first.contains("only-once"), "first recv renders the message:\n{first}");
+
+        // Restart: a fresh agent for the same identity must resume from the committed cursor.
+        let mut bob2 =
+            McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: Some(room.clone()) };
+        let second = call_session_tool(&mut bob2, "parler_recv", &json!({})).await.unwrap();
+        assert!(second.contains("no new messages"), "restart resumes from the committed cursor:\n{second}");
+        assert!(!second.contains("only-once"), "the first recv's batch is not re-read after a restart:\n{second}");
+    }
+
+    #[tokio::test]
+    async fn mcp_run_loop_flushes_deferred_acks_on_exit() {
+        // auto-pull-on-send advances the ack but deliberately doesn't commit it (one RTT saved per
+        // send). The run loop's clean-exit `flush_acks` commits it, so a restart doesn't re-read the
+        // auto-pulled batch. Drive a real `parler_send` through the run loop (stdin EOF ends it →
+        // flush), then restart the same identity and prove the auto-pulled reply isn't re-rendered.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let opened = open_session(&mut alice, Some("seed"), None, None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let key = key_of(&opened);
+
+        let bob_cfg = Config::create(hub.clone(), "bob".to_string(), None).unwrap();
+        let mut bob = McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: None };
+        join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap(); // sets bob.active_session
+
+        // Alice leaves a reply waiting so bob's auto-pull-on-send pulls it (advancing the ack) without
+        // committing it — exactly the leftover the exit flush is for.
+        alice.agent.send_text(Target::Room { room: room.clone() }, "reply-waiting").await.unwrap();
+
+        // One parler_send driven through the run loop; the stdin EOF ends the loop → flush_acks runs.
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"parler_send\",\"arguments\":{\"text\":\"hi\"}}}\n";
+        let mut output: Vec<u8> = Vec::new();
+        run(&mut bob, BufReader::new(input.as_bytes()), &mut output).await.unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("reply-waiting"), "auto-pull surfaced the waiting reply:\n{out}");
+
+        // Restart: a fresh agent for the same identity must not re-render the auto-pulled reply — the
+        // exit flush committed it.
+        let mut bob2 =
+            McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: Some(room.clone()) };
+        let after = call_session_tool(&mut bob2, "parler_recv", &json!({})).await.unwrap();
+        assert!(after.contains("no new messages"), "exit flush committed the auto-pulled batch:\n{after}");
+        assert!(!after.contains("reply-waiting"), "the auto-pulled reply is not re-read after a restart:\n{after}");
     }
 
     #[tokio::test]
