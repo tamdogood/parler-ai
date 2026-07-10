@@ -232,3 +232,20 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   `start_hub_hint` made each deterministic and dodged the `too_many_arguments` clippy gate (group the
   inputs in a struct once you pass ~7). The thin env-reading wrapper stays untested-but-trivial.
   (2026-07-04.)
+
+- **A commit deferred to "the next call" strands every caller that never makes a next call:** the #85
+  deferred-ack model (pull → ack rides the *next* pull) kept `members.cursor` at 0 for every one-shot
+  process — each `parler recv`/`session join` CLI invocation and every MCP cold start does exactly one
+  pull and exits with the ack in an in-memory map, so recv re-read the whole history forever and unread
+  counts lied. The e2e suite masked it because `reconnect_resumes_from_durable_cursor` pulls twice
+  before dropping the connection. Fix idiom: an ack-only `Pull { since: None, limit: Some(0), ack }` is
+  a pure cursor commit (store applies `ack` before the read); call `commit_reads` at every consumption
+  boundary (batch rendered / returned to the host) and audit **all** pull call sites for one-shot-ness
+  (long-lived loops self-ack; `--since`/`--all` re-reads stay pure). When testing durability, model the
+  real process shape — one pull, then process exit — not a convenient two-pull session. (2026-07-09
+  E2E audit; the HIGH finding.)
+
+- **`scripts/verify.sh --rust-only` does not run `cargo doc`; `make ci` does:** a public item's doc
+  comment intra-doc-linking a private method (`[`commit_reads`]` → private `request`) passes verify.sh
+  but fails `make ci`'s `cargo doc -D warnings` gate. Run `CI_SKIP_WEB=1 make ci` before calling a task
+  done even when verify.sh is green, and don't bracket-link private items from public docs. (2026-07-09.)

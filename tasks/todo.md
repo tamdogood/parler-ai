@@ -1,3 +1,65 @@
+# E2E functional audit — durable-cursor fix (2026-07-09, branch nairobi)
+
+## Audit verdict (live run, real binaries: hub + 4 CLI agents + MCP stdio)
+
+**GREEN** — invite/join/roster, 3-agent room fan-out, real-time push (`recv --watch` live),
+file transfer (blob id == sha256, byte-exact both peers, dedup on re-send, non-member fetch/recv
+denied), session open→key→approval-gate→context catch-up, memory remember/recall, MCP stdio path
+(send/recv/auto-pull), 30 concurrent sends (seq 1–38, no loss/gaps), hub restart durability
+(roster/memory/blobs survive), DB efficiency (WAL + NORMAL sync per conn, capped shared cache,
+blobs off the SQLite path, `idx_messages_room_seq`/`idx_members_agent`, incremental autovacuum).
+
+**RED — one HIGH functional bug:**
+
+### The durable cursor never commits on any one-shot pull path
+- Deferred-ack (#85): `store.pull` with `ack` present does **not** advance the cursor past the
+  returned batch — the client commits it via `ack` on its *next* pull. `MeshAgent.pending_ack`
+  is an in-memory HashMap, so the ack **dies with the process**.
+- `parler recv` = one pull per process ⇒ the ack never flushes ⇒ `members.cursor` stays 0 forever
+  (verified in SQLite after 4 pulls), every recv re-reads the whole history, "— cursor at N —" is
+  a lie, `parler rooms` unread counts are wrong, `session join`'s "advances the fresh cursor"
+  comment (lib.rs:1101) is durably false, and an MCP cold start re-pulls everything the CLI ever
+  "read" (all reproduced live).
+- The existing e2e test masks it: `reconnect_resumes_from_durable_cursor` pulls **twice** in the
+  first connection to flush the ack before dropping.
+
+## Fix plan (assigned to Opus subagent; reviewed by main agent after)
+
+1. **connector**: add `MeshAgent::commit_reads(&mut self, room)` — one `Pull { room, since: None,
+   limit: Some(0), wait_secs: None, ack: pending }` round trip = pure ack commit (store already
+   applies `ack` before the read; LIMIT 0 reads nothing; `ack.is_some()` ⇒ no advance-on-read).
+   Plus best-effort `flush_acks(&mut self)` over all rooms with a pending ack. No new frames, no
+   schema change — reuses the additive #85 field (no `deny_unknown_fields` in the protocol).
+2. **CLI one-shot call sites**: flush after render in `cmd_recv` (non-watch; and once after the
+   initial backlog in watch mode) and `session join` (lib.rs:1101). `--since/--all`/`Some(0)`
+   reads stay pure. Long-lived loops (watch iterations, hook watch at lib.rs:1200) self-ack.
+3. **MCP**: flush after `parler_recv` / `parler_join_session` render + best-effort `flush_acks`
+   when the stdio run loop exits.
+4. **Tests (red first)**: e2e "single-pull process → reconnect sees only newer" (fails today);
+   MCP-layer recv-then-restart test; store-level ack-only-pull (limit 0) commit test if missing.
+5. **Docs**: re-grep cursor/ack language (`docs/communication.md`, `agent-mesh.md`,
+   `storage-and-memory.md`) — behavior returns to documented ("never re-read"), so mostly verify.
+6. **Gates**: `scripts/verify.sh --rust-only` then `CI_SKIP_WEB=1 make ci`. Live re-run of the
+   audit repro (recv twice from two processes; second must be empty; `members.cursor` > 0).
+
+- [x] Audit (this section)
+- [x] Fix implemented (Opus subagent) — `commit_reads`/`flush_acks` on the connector; wired into
+      `cmd_recv`/`session join` (CLI) and `parler_recv`/`enter_session`/run-loop-exit (MCP). No wire
+      change (reuses the additive #85 `ack` field).
+- [x] Regression tests red→green — e2e `single_pull_process_commits_cursor_via_commit_reads` +
+      `commit_reads_is_idempotent_and_safe_on_empty`; store `ack_only_limit_zero_pull_commits_cursor_without_reading`;
+      MCP `mcp_recv_commits_cursor_across_a_restart` + `mcp_run_loop_flushes_deferred_acks_on_exit`.
+      All three behavioral tests verified red against the pre-fix code, then green.
+- [x] Review passed (parler-review contract) — full-context read of every changed function, all
+      candidate findings verified-then-dropped (raw-vs-filtered commit guard confirmed raw; all
+      other pull paths audited: follow_session/watch self-ack, consolidate/--all pure, hook
+      send-only); gates re-run independently; live repro re-run against a PRE-fix hub binary
+      (old-hub compat proven). Verdict: approve.
+- [x] `make ci` green + live repro green — `CI_SKIP_WEB=1 make ci` all gates pass; live: bob's
+      second `recv` prints "(no new messages)", `members.cursor` = max seq read, `rooms` 0 unread.
+
+---
+
 # UX redesign: the wire, not the window (v2 — post-audit)
 
 Goal: make Parler feel as simple as Darren Bounds' one-line `codex exec` hack for the solo case,

@@ -2071,6 +2071,37 @@ mod tests {
     }
 
     #[test]
+    fn ack_only_limit_zero_pull_commits_cursor_without_reading() {
+        // The exact store path the connector's `commit_reads` relies on: a `LIMIT 0` pull carrying an
+        // `ack` advances the durable cursor to the ack floor *before* the (empty) read, so a one-shot
+        // client flushes its deferred ack in a single round trip. A `LIMIT 0` pull WITHOUT an ack
+        // commits nothing — there is no floor to advance to.
+        let s = Store::open(None).unwrap();
+        s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
+        s.upsert_agent("U_B", "bob", None, 1).unwrap();
+        s.add_member("team", "U_B", 1).unwrap();
+        for i in 1..=3 {
+            s.append_message("team", &eref("U_B", "bob"), &[Part::text("m")], None, None, None, i).unwrap();
+        }
+
+        // LIMIT 0, no ack: reads nothing and commits nothing — a later cursor read still sees the lot.
+        let (empty, cur) = s.pull("team", "U_B", None, Some(0), None).unwrap();
+        assert!(empty.is_empty(), "limit 0 returns no rows");
+        assert_eq!(cur, 0, "no ack floor ⇒ cursor unchanged");
+        let (still_all, _) = s.pull("team", "U_B", Some(0), None, None).unwrap(); // pure re-read
+        assert_eq!(still_all.len(), 3, "ack-less limit-0 pull left the cursor at 0");
+
+        // LIMIT 0 with ack=2: commits the cursor to 2 without reading; the next cursor read starts
+        // after 2, so only seq 3 remains.
+        let (empty2, cur2) = s.pull("team", "U_B", None, Some(0), Some(2)).unwrap();
+        assert!(empty2.is_empty(), "ack-only commit returns no rows");
+        assert_eq!(cur2, 2, "returned cursor is the committed ack floor");
+        let (tail, tail_cur) = s.pull("team", "U_B", None, None, None).unwrap();
+        assert_eq!(tail.len(), 1, "only seq 3 remains after committing the cursor to 2");
+        assert_eq!(tail_cur, 3);
+    }
+
+    #[test]
     fn remember_recall_and_key_upsert() {
         let s = Store::open(None).unwrap();
         s.remember("U_A", &Fact { key: None, text: "deploy plan is blue-green".into(), room: None }, 1, None, None).unwrap();

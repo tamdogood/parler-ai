@@ -94,6 +94,11 @@ pub struct MeshAgent {
     /// durably received it. Persists across a transparent reconnect (it's client state), so a resumed
     /// connection acks correctly; a fresh process starts empty and re-reads at most the last batch.
     pending_ack: std::collections::HashMap<String, i64>,
+    /// Per-room high-water that [`MeshAgent::commit_reads`] has already flushed to the hub, so a
+    /// repeat commit (or a `flush_acks` over a room a recv already committed) skips a redundant round
+    /// trip. Only ever set to a `pending_ack` value we durably committed, so `committed >= pending`
+    /// can only mean the hub's monotonic cursor is already at least there — never a lost commit.
+    committed_ack: std::collections::HashMap<String, i64>,
 }
 
 impl MeshAgent {
@@ -110,6 +115,7 @@ impl MeshAgent {
             identity: Some(cfg.identity.clone()),
             subscribed: false,
             pending_ack: std::collections::HashMap::new(),
+            committed_ack: std::collections::HashMap::new(),
         })
     }
 
@@ -122,7 +128,7 @@ impl MeshAgent {
         role: Option<String>,
         hub_url: String,
     ) -> MeshAgent {
-        MeshAgent { transport, id, name, role, hub_url, identity: None, subscribed: false, pending_ack: std::collections::HashMap::new() }
+        MeshAgent { transport, id, name, role, hub_url, identity: None, subscribed: false, pending_ack: std::collections::HashMap::new(), committed_ack: std::collections::HashMap::new() }
     }
 
     /// Like [`MeshAgent::with_transport`], but carries a real `identity` + `hub_url`, so the
@@ -146,6 +152,7 @@ impl MeshAgent {
             identity: Some(identity),
             subscribed: false,
             pending_ack: std::collections::HashMap::new(),
+            committed_ack: std::collections::HashMap::new(),
         }
     }
 
@@ -472,6 +479,55 @@ impl MeshAgent {
     /// the hub echoes the same cursor, so this is a no-op then.
     fn record_ack(&mut self, room: &str, cursor: i64) {
         self.pending_ack.insert(room.to_string(), cursor);
+    }
+
+    /// Commit the deferred read cursor for `room` (#85): flush the pending ack in one ack-only pull so
+    /// the hub durably advances `members.cursor` past the batch we've already received.
+    ///
+    /// The invariant is that **a cursor may only advance past a batch the client has already
+    /// received**. [`MeshAgent::pull`] defers that commit to the *next* pull's `ack` — correct for a
+    /// long-lived client, but a one-shot process (a `parler` CLI invocation, an MCP cold start) does
+    /// its single pull and exits with the ack stranded in memory, leaving the hub's cursor stuck and
+    /// the whole history re-read next time. Call this at a **consumption boundary** — a batch rendered
+    /// to a terminal, or returned to an MCP host — to commit it durably.
+    ///
+    /// A pure ack commit: `Pull { since: None, limit: Some(0), ack: Some(pending) }` makes the store
+    /// apply the ack *before* the read, so `LIMIT 0` reads nothing and `ack.is_some()` suppresses
+    /// advance-on-read. Routed through the reconnecting `request` path so a dropped connection heals
+    /// and retries. A no-op `Ok(())` when nothing new has been received or this high-water is already
+    /// committed.
+    pub async fn commit_reads(&mut self, room: &str) -> Result<()> {
+        let pending = self.pending_ack.get(room).copied().unwrap_or(0);
+        if pending == 0 || self.committed_ack.get(room).copied().unwrap_or(0) >= pending {
+            return Ok(());
+        }
+        match self
+            .request(ClientFrame::Pull {
+                room: room.to_string(),
+                since: None,
+                limit: Some(0),
+                wait_secs: None,
+                ack: Some(pending),
+            })
+            .await?
+        {
+            ServerFrame::Pulled { .. } => {
+                self.committed_ack.insert(room.to_string(), pending);
+                Ok(())
+            }
+            other => Err(crate::unexpected_reply("commit reads", &other)),
+        }
+    }
+
+    /// Best-effort [`MeshAgent::commit_reads`] for every room with a pending ack — call on an exit path
+    /// (the MCP stdio run loop shutting down) so a cursor advanced by auto-pull-on-send isn't lost with
+    /// the process. Errors are swallowed: a missed commit just re-reads the last batch on the next
+    /// start, the documented at-least-once behavior.
+    pub async fn flush_acks(&mut self) {
+        let rooms: Vec<String> = self.pending_ack.keys().cloned().collect();
+        for room in rooms {
+            let _ = self.commit_reads(&room).await;
+        }
     }
 
     /// **Long-poll** for new messages in `room`: like [`MeshAgent::pull`], but if the backlog is empty

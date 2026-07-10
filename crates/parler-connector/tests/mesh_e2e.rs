@@ -225,6 +225,63 @@ async fn reconnect_resumes_from_durable_cursor() {
 }
 
 #[tokio::test]
+async fn single_pull_process_commits_cursor_via_commit_reads() {
+    // A one-shot process (a `parler` CLI invocation, an MCP cold start) does exactly ONE pull and
+    // exits — the deferred ack (#85) would die with it, so `commit_reads` must flush the cursor
+    // durably. Without that flush the fresh connection below re-reads the whole history
+    // ["first","second"]; with it, only ["second"]. (Remove the `commit_reads` call to see it go red.)
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let bob_cfg = cfg(&hub, "bob", None); // a stable identity we reconnect with
+
+    let inv = alice.invite(RoomKind::Channel, Some("team".into()), None, None).await.unwrap();
+    let room = inv.room.clone();
+
+    {
+        let mut bob = MeshAgent::connect(&bob_cfg).await.unwrap();
+        bob.join(&inv.code).await.unwrap();
+        alice.send_text(Target::Room { room: room.clone() }, "first").await.unwrap();
+        // ONE pull — as a fresh CLI process does — then commit at the render boundary and drop the
+        // connection WITHOUT a second pull (which is what would otherwise carry the ack).
+        let (m, _) = bob.pull(&room, None, None).await.unwrap();
+        assert_eq!(texts(&m), vec!["first"]);
+        bob.commit_reads(&room).await.unwrap();
+    } // bob's process exits after its single pull
+
+    alice.send_text(Target::Room { room: room.clone() }, "second").await.unwrap();
+
+    // A fresh process for the same identity resumes from the durably-committed cursor: only "second".
+    let mut bob2 = MeshAgent::connect(&bob_cfg).await.unwrap();
+    let (m2, _) = bob2.pull(&room, None, None).await.unwrap();
+    assert_eq!(texts(&m2), vec!["second"], "single-pull cursor committed; history is not re-read");
+}
+
+#[tokio::test]
+async fn commit_reads_is_idempotent_and_safe_on_empty() {
+    let hub = start_hub().await;
+    let mut alice = agent(&hub, "alice", None).await;
+    let mut bob = agent(&hub, "bob", None).await;
+    let inv = alice.invite(RoomKind::Channel, Some("team".into()), None, None).await.unwrap();
+    let room = inv.room.clone();
+    bob.join(&inv.code).await.unwrap();
+
+    // Nothing pulled yet — committing is a safe no-op (no pending ack to flush).
+    bob.commit_reads(&room).await.unwrap();
+
+    alice.send_text(Target::Room { room: room.clone() }, "first").await.unwrap();
+    let (m, _) = bob.pull(&room, None, None).await.unwrap();
+    assert_eq!(texts(&m), vec!["first"]);
+    // Commit, then commit again: idempotent — the second call is a no-op, not a re-read or an error.
+    bob.commit_reads(&room).await.unwrap();
+    bob.commit_reads(&room).await.unwrap();
+
+    // A following pull still returns only genuinely new messages, not the already-committed batch.
+    alice.send_text(Target::Room { room: room.clone() }, "second").await.unwrap();
+    let (m2, _) = bob.pull(&room, None, None).await.unwrap();
+    assert_eq!(texts(&m2), vec!["second"]);
+}
+
+#[tokio::test]
 async fn code_handoff_push_recv_fetch_round_trips() {
     let hub = start_hub().await;
     let mut alice = agent(&hub, "alice", None).await;

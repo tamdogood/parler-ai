@@ -1097,7 +1097,9 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
                     return Ok(());
                 }
             };
-            // since=None advances the fresh cursor to the live edge after backfilling the context.
+            // Backfill the whole context (since=None); the cursor advance is deferred to an ack (#85),
+            // so commit_reads below flushes it — otherwise this one-shot join process exits with the
+            // ack in memory and a later recv re-delivers the entire backlog.
             let (msgs, _cursor) = ag.pull(&room, None, None).await?;
             save_active_session(&room)?;
             println!("✓ joined session — room '{room}'");
@@ -1110,6 +1112,7 @@ async fn cmd_session(c: SessionCmd) -> Result<()> {
                 }
                 println!("--- end context ---");
             }
+            ag.commit_reads(&room).await?;
             if once {
                 // Fire-and-exit: membership persists, but the joiner leaves the connection — it will
                 // show `offline` to the host and won't receive messages live. Intended for scripts.
@@ -1475,6 +1478,13 @@ async fn cmd_recv(a: RecvArgs) -> Result<()> {
             println!("{}", render_message(m));
         }
         println!("— cursor at {cursor} —");
+        // A one-shot `parler recv` does a single pull, so the deferred ack (#85) would die with the
+        // process — commit it now the batch is rendered, so the next recv sees only newer messages
+        // (not the whole history). A `--since`/`--all` re-read is a pure read and never commits. In
+        // watch mode this flushes the initial backlog once; the loop below self-acks each later pull.
+        if since.is_none() {
+            ag.commit_reads(&room).await?;
+        }
     }
     if !a.watch {
         return Ok(());
@@ -1497,6 +1507,9 @@ async fn cmd_recv(a: RecvArgs) -> Result<()> {
         } else {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        // Each pull self-acks the previous batch (its `ack` commits what the last pull returned), so
+        // the durable cursor tracks the loop. At-least-once: a Ctrl-C between a pull and the next
+        // loses at most that last batch's commit — it's re-read on the next recv, never dropped.
         let (new, cur) = ag.pull(&room, None, a.limit).await?;
         if !new.is_empty() {
             for m in &new {
