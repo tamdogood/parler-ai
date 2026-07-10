@@ -19,10 +19,19 @@ export function CopyButton({ value, className }: { value: string; className?: st
           /* clipboard blocked */
         }
       }}
-      className={cn("text-steel transition-colors hover:text-frost", className)}
+      className={cn("press text-steel transition-[transform,color] hover:text-frost", className)}
       aria-label="Copy"
     >
-      {copied ? <Check className="size-3.5 text-delivered-green" /> : <Copy className="size-3.5" />}
+      {/* Key the icon so React swaps the node — the fresh element scales in, so the confirming
+          check doesn't just blink in place. */}
+      {copied ? (
+        <Check
+          key="check"
+          className="size-3.5 text-delivered-green animate-[scale-up-fade_0.15s_var(--ease-out)]"
+        />
+      ) : (
+        <Copy key="copy" className="size-3.5" />
+      )}
     </button>
   );
 }

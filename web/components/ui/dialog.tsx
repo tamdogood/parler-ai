@@ -16,7 +16,7 @@ function DialogOverlay({
   return (
     <DialogPrimitive.Overlay
       className={cn(
-        "fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-[scale-up-fade_0.2s_ease]",
+        "fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-[fade-in_0.2s_var(--ease-out)] data-[state=closed]:animate-[fade-out_0.15s_var(--ease-out)]",
         className,
       )}
       {...props}
@@ -35,13 +35,15 @@ function DialogContent({
       <DialogOverlay />
       <DialogPrimitive.Content
         className={cn(
-          "fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col gap-6 overflow-y-auto border-l border-graphite-rail bg-void-black p-8 outline-none data-[state=open]:animate-[slide-in-right_0.25s_ease]",
+          // A right-side drawer: enter on the iOS drawer curve, exit faster on ease-out
+          // (asymmetric — deliberate in, snappy out, so dismissal never feels laggy).
+          "fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col gap-6 overflow-y-auto border-l border-graphite-rail bg-void-black p-8 outline-none data-[state=open]:animate-[slide-in-right_0.3s_var(--ease-drawer)] data-[state=closed]:animate-[slide-out-right_0.2s_var(--ease-out)]",
           className,
         )}
         {...props}
       >
         {children}
-        <DialogPrimitive.Close className="absolute right-5 top-5 rounded-[6px] p-1 text-steel transition-colors hover:text-frost focus:outline-none">
+        <DialogPrimitive.Close className="press absolute right-5 top-5 rounded-[6px] p-1 text-steel transition-[transform,color] hover:text-frost focus:outline-none">
           <X className="size-4" />
           <span className="sr-only">Close</span>
         </DialogPrimitive.Close>
@@ -61,13 +63,15 @@ function DialogModalContent({
       <DialogOverlay />
       <DialogPrimitive.Content
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-[16px] border border-graphite-rail bg-void-black p-8 outline-none data-[state=open]:animate-[scale-up-fade_0.2s_ease]",
+          // A centered modal — it isn't anchored to a trigger, so it scales from center (the one
+          // case where `transform-origin: center` is correct). Exit is faster than enter.
+          "fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-[16px] border border-graphite-rail bg-void-black p-8 outline-none data-[state=open]:animate-[modal-in_0.2s_var(--ease-out)] data-[state=closed]:animate-[modal-out_0.15s_var(--ease-out)]",
           className,
         )}
         {...props}
       >
         {children}
-        <DialogPrimitive.Close className="absolute right-5 top-5 rounded-[6px] p-1 text-steel transition-colors hover:text-frost focus:outline-none">
+        <DialogPrimitive.Close className="press absolute right-5 top-5 rounded-[6px] p-1 text-steel transition-[transform,color] hover:text-frost focus:outline-none">
           <X className="size-4" />
           <span className="sr-only">Close</span>
         </DialogPrimitive.Close>
