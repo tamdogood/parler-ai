@@ -48,9 +48,20 @@
   --radius-2xl: 16px;
   --radius-3xl: 24px;
 
-  /* Motion — functional, fast, `ease` (snappy on the way in) */
-  --animate-slide-up-fade: slide-up-fade 0.4s ease both;
-  --animate-scale-up-fade: scale-up-fade 0.2s ease both;
+  /* Motion — Emil Kowalski's design-engineering curves (animations.dev). The built-in CSS
+   * easings are too weak; these custom curves give entrances the punch that makes motion feel
+   * intentional. Defining them in the `--ease-*` theme namespace overrides Tailwind's default
+   * `ease-out` / `ease-in-out` utilities, so every existing usage inherits the stronger curve.
+   * `ease-in` is deliberately never used on UI — it starts slow, exactly when the user is
+   * watching most closely, and makes the interface feel sluggish. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Entrances use ease-out and stay under ~300ms for UI; the hero runs slightly longer since
+   * it's a first-view, once-per-visit moment where a touch of choreography earns its keep. */
+  --animate-slide-up-fade: slide-up-fade 0.5s var(--ease-out) both;
+  --animate-scale-up-fade: scale-up-fade 0.2s var(--ease-out) both;
 
   @keyframes slide-up-fade {
     from {
@@ -62,6 +73,7 @@
       transform: translateY(0);
     }
   }
+  /* Enter: never from scale(0) — nothing in the real world appears from nothing. */
   @keyframes scale-up-fade {
     from {
       opacity: 0;
@@ -72,6 +84,44 @@
       transform: scale(1);
     }
   }
+  /* Centered-modal enter/exit. These bake the `-50%,-50%` centering into the transform so the
+   * animated `scale` doesn't clobber it and snap the modal off-center for a frame. */
+  @keyframes modal-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+  }
+  @keyframes modal-out {
+    from {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    to {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.97);
+    }
+  }
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes fade-out {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0;
+    }
+  }
   @keyframes slide-in-right {
     from {
       opacity: 0;
@@ -80,6 +130,16 @@
     to {
       opacity: 1;
       transform: translateX(0);
+    }
+  }
+  @keyframes slide-out-right {
+    from {
+      opacity: 1;
+      transform: translateX(0);
+    }
+    to {
+      opacity: 0;
+      transform: translateX(24px);
     }
   }
 }
@@ -133,24 +193,42 @@
   background-image: linear-gradient(rgba(27, 27, 27, 0.6), rgba(3, 3, 3, 0));
 }
 
-/* Scroll-into-view reveal — used via the <Reveal> component. */
+/* Scroll-into-view reveal — used via the <Reveal> component. Content is visible by default so
+ * it can never get stranded at opacity:0 behind a decorative animation (no-JS, a failed/never-
+ * firing observer, or a screenshot tool that doesn't scroll). <Reveal> opts an element into the
+ * hidden start state (`data-reveal="pending"`) only when it's genuinely below the fold, then
+ * clears it as the element scrolls in. ease-out so it feels responsive the instant it crosses. */
 .reveal {
+  transition:
+    opacity 0.5s var(--ease-out),
+    transform 0.5s var(--ease-out);
+}
+.reveal[data-reveal="pending"] {
   opacity: 0;
   transform: translateY(16px);
-  transition:
-    opacity 0.6s ease,
-    transform 0.6s ease;
-  will-change: opacity, transform;
 }
-.reveal.is-visible {
-  opacity: 1;
-  transform: none;
+
+/* Press feedback — any pressable element scales subtly on :active so the interface feels like
+ * it's truly listening to the tap. Kept subtle (0.97) and fast (160ms) per the design-eng
+ * contract; :active fires on touch too, so it needs no hover gate. */
+.press {
+  transition: transform 160ms var(--ease-out);
 }
+.press:active {
+  transform: scale(0.97);
+}
+
+/* Reduced motion means gentler, not none: keep opacity/color transitions that aid comprehension,
+ * drop position and scale movement that can cause motion sickness. */
 @media (prefers-reduced-motion: reduce) {
-  .reveal {
+  .reveal,
+  .reveal[data-reveal="pending"] {
     opacity: 1;
     transform: none;
     transition: none;
+  }
+  .press:active {
+    transform: none;
   }
 }
 
