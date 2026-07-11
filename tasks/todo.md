@@ -4,17 +4,17 @@
 `parler_fetch` requires a 64-char blob id, so the agent can't act without a human pasting it.
 
 ## Plan
-- [ ] `parler_fetch`: make `id` optional; add `name` + `room` params.
-- [ ] Route `parler_fetch` through `call_session_tool` so it can default to the active session.
-- [ ] Add `looks_like_blob_id` (64 lowercase-hex) to tell a real id from a filename hint.
-- [ ] Add `resolve_recent_blob(agent, room, name_hint)` — page the room history (pure `since`
+- [x] `parler_fetch`: make `id` optional; add `name` + `room` params.
+- [x] Route `parler_fetch` through `call_session_tool` so it can default to the active session.
+- [x] Add `looks_like_blob_id` (64 lowercase-hex) to tell a real id from a filename hint.
+- [x] Add `resolve_recent_blob(agent, room, name_hint)` — page the room history (pure `since`
       re-reads, no cursor move), collect `FileRef`/`BundleRef` parts, return the newest match
       (name-filtered when a hint is given), plus a suggested output filename.
-- [ ] Default `out` to the resolved filename when `-o`/`out` is absent.
-- [ ] Update the tool schema/description + `parler_send_file` hint.
-- [ ] Docs: `docs/file-transfer.md`, `README.md`.
-- [ ] Tests: MCP fetch-by-nothing and fetch-by-name; keep the explicit-id path green.
-- [ ] `make ci` green.
+- [x] Default `out` to the resolved filename when `-o`/`out` is absent.
+- [x] Update the tool schema/description + `parler_send_file` hint.
+- [x] Docs: `docs/file-transfer.md`.
+- [x] Tests: MCP fetch-by-nothing and fetch-by-name; keep the explicit-id path green.
+- [x] `make ci` green.
 
 ## Review
 
