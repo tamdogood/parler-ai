@@ -7,7 +7,10 @@
 
 use anyhow::{anyhow, bail, Result};
 use parler_connector::{BundleMeta, Config, JoinOutcome, MeshAgent};
-use parler_protocol::{AgentSkill, DiscoverScope, HandoffRef, RoomKind, StoredMessage, Target, Visibility};
+use parler_protocol::{
+    AgentSkill, BundleRef, DiscoverScope, FileRef, HandoffRef, RoomKind, StoredMessage, Target,
+    Visibility,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -438,7 +441,7 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
                 "parler_open_session" | "parler_join_session" | "parler_close_session"
                 | "parler_join" | "parler_send" | "parler_recv" | "parler_handoff"
                 | "parler_task" | "parler_join_requests" | "parler_approve_join" | "parler_deny_join"
-                | "parler_watch_session" | "parler_bring" => {
+                | "parler_watch_session" | "parler_bring" | "parler_fetch" => {
                     call_session_tool(state, &name, &args).await
                 }
                 _ => call_tool(&mut state.agent, &name, &args).await,
@@ -609,11 +612,14 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
                 .invite(kind, s("name"), args.get("ttl_secs").and_then(Value::as_u64), u32opt("max_uses"))
                 .await?;
             Ok(format!(
-                "invite ready — {} room '{}'.\ncode: {}\nlink: {}\nThe other agent calls parler_join with the code.",
-                inv.kind.as_str(),
-                inv.room,
-                inv.code,
-                inv.url,
+                "invite ready — {kind} room '{room}'.\ncode: {code}\n\
+                 The other agent calls parler_join with the portable code (carries this hub, so it \
+                 works even if that agent's default hub differs):  {code}@{hub}\nlink: {url}",
+                kind = inv.kind.as_str(),
+                room = inv.room,
+                code = inv.code,
+                hub = agent.hub_url,
+                url = inv.url,
             ))
         }
         "parler_serve" => {
@@ -663,7 +669,7 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
             let r = agent.send_file(target, &name, &bytes, media_type, s("note")).await?;
             Ok(format!(
                 "sent file '{name}' to '{}' (seq {}, {} bytes).\n\
-                 The peer runs (MCP): parler_fetch id={} out={name}\n\
+                 The peer runs (MCP): parler_fetch (auto-finds it) — or parler_fetch id={}\n\
                  The peer runs (CLI): parler fetch {} -o {name}",
                 r.room,
                 r.seq,
@@ -671,18 +677,6 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
                 r.blob_id,
                 r.blob_id,
             ))
-        }
-        "parler_fetch" => {
-            let id = s("id").ok_or_else(|| anyhow!("missing 'id'"))?;
-            let bytes = agent.fetch_blob(&id).await?;
-            let out = s("out").unwrap_or_else(|| format!("{}.bundle", &id[..id.len().min(12)]));
-            let out_path = std::path::PathBuf::from(out);
-            std::fs::write(&out_path, &bytes)?;
-            let abs_out = std::fs::canonicalize(&out_path).unwrap_or_else(|_| {
-                std::env::current_dir().unwrap_or_default().join(&out_path)
-            });
-            let abs_out_str = abs_out.to_string_lossy();
-            Ok(format!("wrote {} bytes to {} (apply with: git bundle verify {} && git fetch {})", bytes.len(), abs_out_str, abs_out_str, abs_out_str))
         }
         "parler_apply" => {
             let blob = s("blob").ok_or_else(|| anyhow!("missing 'blob'"))?;
@@ -941,6 +935,86 @@ async fn resolve_pending_joiner(agent: &mut MeshAgent, room: &str, who: &str) ->
 }
 
 /// Tools that read or mutate the active session (or default their target to it).
+/// Whether `s` is a content-addressed blob id — a lowercase-hex SHA-256 (exactly 64 hex chars).
+/// Lets `parler_fetch` tell a real id from a filename/path the caller passed instead (a hint to
+/// resolve against the room's recent transfers).
+fn looks_like_blob_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Find a file (or code bundle) `room` recently shared, so `parler_fetch` needs no pasted blob id.
+///
+/// Pages the room's history with **pure `since` re-reads** (they never advance a delivery cursor, so
+/// this can't perturb `parler_recv`), collecting every `com.parler.file`/`com.parler.bundle`
+/// reference, and returns the **most recent** one — filtered to a name/basename substring match when
+/// `name_hint` is given. Returns `(blob_id, suggested_out_name)`.
+async fn resolve_recent_blob(
+    agent: &mut MeshAgent,
+    room: &str,
+    name_hint: Option<&str>,
+) -> Result<(String, String)> {
+    // Match on the basename, case-insensitively — the sender only ever stores a bare basename, and a
+    // caller may paste a full path (e.g. the one the host showed them).
+    let hint = name_hint.map(|h| {
+        std::path::Path::new(h)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(h)
+            .to_ascii_lowercase()
+    });
+    let mut best: Option<(i64, String, String)> = None; // (seq, blob, out_name)
+    let mut since = 0i64;
+    loop {
+        // 1000 is the hub's per-pull ceiling; page until a short batch drains the history.
+        let (msgs, _) = agent.pull(room, Some(since), Some(1000)).await?;
+        if msgs.is_empty() {
+            break;
+        }
+        let batch = msgs.len();
+        for m in &msgs {
+            since = since.max(m.seq);
+            for p in &m.parts {
+                let (blob, out_name, match_text) = if let Some(f) = FileRef::from_part(p) {
+                    (f.blob, f.name.clone(), f.name)
+                } else if let Some(b) = BundleRef::from_part(p) {
+                    // A bundle carries no filename; save it as `<short>.bundle`, but let a hint match
+                    // its summary (the commit subject) so "fetch the auth bundle" can resolve.
+                    let out = format!("{}.bundle", crate::short(&b.blob));
+                    let text = b.summary.clone().unwrap_or_else(|| out.clone());
+                    (b.blob, out, text)
+                } else {
+                    continue;
+                };
+                if let Some(h) = &hint {
+                    if !match_text.to_ascii_lowercase().contains(h.as_str()) {
+                        continue;
+                    }
+                }
+                // Keep the highest-seq match (the most recent transfer).
+                if best.as_ref().is_none_or(|(s, ..)| m.seq >= *s) {
+                    best = Some((m.seq, blob, out_name));
+                }
+            }
+        }
+        if batch < 1000 {
+            break;
+        }
+    }
+    match best {
+        Some((_, blob, out_name)) => Ok((blob, out_name)),
+        None => match name_hint {
+            Some(h) => bail!(
+                "no shared file matching '{h}' found in '{room}' — run parler_recv to see what's been \
+                 sent, or pass the exact id (parler_fetch id=<blob>)"
+            ),
+            None => bail!(
+                "no file has been shared in '{room}' yet — run parler_recv to check for one, or pass \
+                 id=<blob>"
+            ),
+        },
+    }
+}
+
 async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Result<String> {
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     let u32opt = |k: &str| args.get(k).and_then(Value::as_u64).map(|x| x as u32);
@@ -988,9 +1062,13 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             // like parler_join_session — a Channel room (what open_session mints) adopts session
             // semantics (active session + digest + backlog), and a pending approval reads as
             // success-in-progress, not an error. Plain DM/service invites keep the lightweight join.
-            let code = s("code").ok_or_else(|| anyhow!("missing 'code'"))?;
+            let key = s("code").ok_or_else(|| anyhow!("missing 'code'"))?;
+            // Accept a portable `<code>@<hub>`: redeem it when it names this hub, else say which hub
+            // to relaunch on (a single-hub MCP agent can't cross hubs — #99) instead of a cryptic error.
+            let hub = state.agent.hub_url.clone();
+            let code = portable_code_for_hub(&key, &hub)?;
             let wait_secs = args.get("wait_secs").and_then(Value::as_u64).filter(|w| *w > 0);
-            match state.agent.redeem(&code).await? {
+            match state.agent.redeem(&code).await.map_err(|e| explain_unknown_code_mcp(e, &hub))? {
                 JoinOutcome::Pending { room } => match wait_for_approval(state, &code, wait_secs).await? {
                     Some(room) => enter_session(state, room, Backlog::Recent).await,
                     None => Ok(pending_output(&room)),
@@ -1230,6 +1308,42 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             }
             Ok(out)
         }
+        "parler_fetch" => {
+            // A blob id is a 64-char lowercase-hex SHA-256. If the caller passes one, download it
+            // directly. Otherwise (no `id`, or a filename/path was passed instead) find the file the
+            // room recently shared — so an agent asked to "fetch the file" just works, without a human
+            // pasting the id. `out` (or `-o`) always wins; else default to the file's own name.
+            let raw_id = s("id");
+            let explicit = raw_id.clone().filter(|v| looks_like_blob_id(v));
+            let (id, suggested) = match explicit {
+                Some(blob) => (blob, None),
+                None => {
+                    let room = s("room").or_else(|| state.active_session.clone()).ok_or_else(|| {
+                        anyhow!(
+                            "no blob id, and no active session to search — pass id=<blob>, or open/join \
+                             a session (or pass room=…) so I can find the shared file"
+                        )
+                    })?;
+                    // `name` is the explicit hint; a non-id `id` (e.g. a pasted path) is a fallback hint.
+                    let name_hint = s("name").or(raw_id);
+                    let (blob, name) =
+                        resolve_recent_blob(&mut state.agent, &room, name_hint.as_deref()).await?;
+                    (blob, Some(name))
+                }
+            };
+            let bytes = state.agent.fetch_blob(&id).await?;
+            let out = s("out").or(suggested).unwrap_or_else(|| format!("{}.bundle", crate::short(&id)));
+            let out_path = std::path::PathBuf::from(out);
+            std::fs::write(&out_path, &bytes)?;
+            let abs_out = std::fs::canonicalize(&out_path)
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&out_path));
+            let abs_out_str = abs_out.to_string_lossy();
+            Ok(format!(
+                "wrote {} bytes to {} (if it's a git bundle, apply with: parler_apply blob={id})",
+                bytes.len(),
+                abs_out_str,
+            ))
+        }
         "parler_bring" => bring_second_opinion(state, args).await,
         other => bail!("unknown session tool: {other}"),
     }
@@ -1365,15 +1479,17 @@ async fn open_session(
     };
     Ok(format!(
         "session open — room '{room}', now your active session.\n\
-         KEY: {code}\n\
+         KEY: {code}@{hub}\n\
          Give a teammate the KEY (they call parler_join_session) or this ready-to-run one-liner:\n    \
          {oneliner}\n\
-         Either lands them in this same conversation, caught up — no copy-paste.\n\
+         Either lands them in this same conversation, caught up — no copy-paste. The `@{hub}` on the \
+         KEY carries this hub, so a teammate whose default hub differs still lands here.\n\
          {gate}\n\
          Keep late joiners cheap: parler_remember key=\"session-digest\" room=\"{room}\" text=\"SESSION DIGEST: …\" (re-save to update).\n\
          parler_watch_session gives the user a read-only web viewer code.\n\
          link: {url}",
         code = inv.code,
+        hub = state.agent.hub_url,
         url = inv.url,
     ))
 }
@@ -1523,6 +1639,50 @@ fn digest_backlog(msgs: &[StoredMessage], mode: Backlog) -> String {
     out.join("\n")
 }
 
+/// Loose hub-URL equality: ignore the scheme (`ws`/`wss`/`http`/`https`) and any trailing slash, so
+/// `wss://h`, `https://h`, and `h/` all compare equal. Enough to tell "same hub" from "different
+/// hub" for a portable code — we're not routing on it, just deciding whether we can redeem locally.
+fn same_hub(a: &str, b: &str) -> bool {
+    fn norm(u: &str) -> String {
+        u.split_once("://").map(|(_, rest)| rest).unwrap_or(u).trim_end_matches('/').to_ascii_lowercase()
+    }
+    norm(a) == norm(b)
+}
+
+/// Resolve a possibly-portable code (`<code>@<hub>`) for the single-hub MCP agent. The MCP server
+/// dials exactly one hub for its whole life (#99), so — unlike the CLI's one-shot commands — it
+/// can't transparently redeem on another hub without stranding every later `parler_send`/`_recv`.
+/// So: a code carrying *this* hub (or no hub) yields the bare code to redeem; a code naming a
+/// *different* hub fails with the exact fix (which hub to relaunch on) instead of the hub's cryptic
+/// "invalid or unknown invite code".
+fn portable_code_for_hub(key: &str, agent_hub: &str) -> Result<String> {
+    let (code, hub) = crate::split_portable_key(key);
+    if let Some(hub) = hub {
+        if !same_hub(&hub, agent_hub) {
+            bail!(
+                "this invite is on hub {hub}, but your Parler MCP server is connected to {agent_hub}. \
+                 Relaunch it with PARLER_HUB={hub} (e.g. `parler connect --hub {hub}`), then try again."
+            );
+        }
+    }
+    Ok(code)
+}
+
+/// A bare code the hub doesn't hold surfaces as "invalid or unknown invite code" — and for a
+/// single-hub MCP agent the usual cause is that the code belongs to a *different* hub. Point the
+/// agent at the fix (ask for the portable `<code>@<hub>`, or relaunch on that hub) rather than
+/// leaving the raw dead-end. Other errors pass through untouched.
+fn explain_unknown_code_mcp(err: anyhow::Error, agent_hub: &str) -> anyhow::Error {
+    if err.to_string().contains("invalid or unknown invite code") {
+        return anyhow!(
+            "invalid or unknown invite code on hub {agent_hub}. If it was minted on a different hub, \
+             ask for the portable form `<code>@<hub>`, or relaunch your Parler MCP server with \
+             PARLER_HUB set to that hub."
+        );
+    }
+    err
+}
+
 /// Join a shared session by key. For an approval-gated session the redeem only *requests* entry — the
 /// host must admit us first. With `wait_secs` this **one call** spans the approval wait (re-redeeming
 /// on an interval until the host decides or the budget runs out, keeping the socket alive with
@@ -1537,9 +1697,13 @@ async fn join_session(
     backlog: Backlog,
     wait_secs: Option<u64>,
 ) -> Result<String> {
-    match state.agent.redeem(key).await? {
+    // A portable key `<code>@<hub>` carries the hub that minted it. Redeem it here only if it names
+    // this agent's hub; otherwise fail with the exact fix rather than a cryptic "unknown code".
+    let hub = state.agent.hub_url.clone();
+    let code = portable_code_for_hub(key, &hub)?;
+    match state.agent.redeem(&code).await.map_err(|e| explain_unknown_code_mcp(e, &hub))? {
         JoinOutcome::Joined { room, .. } => enter_session(state, room, backlog).await,
-        JoinOutcome::Pending { room } => match wait_for_approval(state, key, wait_secs).await? {
+        JoinOutcome::Pending { room } => match wait_for_approval(state, &code, wait_secs).await? {
             Some(room) => enter_session(state, room, backlog).await,
             None => Ok(pending_output(&room)),
         },
@@ -2016,12 +2180,15 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_fetch",
-            "Download a pushed blob (a code bundle or a file) by blob id to a file. Does NOT apply.",
+            "Download a shared file/bundle to disk (does NOT apply). Omit `id` for the latest file in \
+             the session, or pass `name` to pick by filename; `id` (blob id) fetches an exact blob.",
             json!({
-                "id": { "type": "string" },
-                "out": { "type": "string", "description": "output file (default: <blob>.bundle)" }
+                "id": { "type": "string", "description": "blob id; omit to auto-find the latest file" },
+                "name": { "type": "string", "description": "pick by filename when you have no id" },
+                "room": { "type": "string", "description": "room to search (default: active session)" },
+                "out": { "type": "string", "description": "output file (default: the file's name)" }
             }),
-            &["id"],
+            &[],
         ),
         tool(
             "parler_apply",
@@ -2157,8 +2324,12 @@ mod tests {
     /// 12,689 B — *below* the pre-`parler_task` baseline, so the new capability nets a reduction, not a
     /// cost; ceiling → 13,000 (a real cut from 13,200) to lock the savings against creep-back. Adding
     /// `parler_open_session`'s lean `preapprove` param (auto-admit trusted joiners, #108) grew it ~240 B
-    /// to ~12,930; ceiling → 13,200 to restore headroom (still the pre-diet guardrail level).
-    const TOOL_SPECS_BUDGET: usize = 13_200;
+    /// to ~12,930; ceiling → 13,200 to restore headroom (still the pre-diet guardrail level). Making
+    /// `parler_fetch` self-service (auto-find the latest shared file: `id` now optional, `name`/`room`
+    /// params added so an agent asked to "fetch the file" needn't be handed a 64-char blob id) grew it
+    /// ~300 B to ~13,237 — load-bearing schema, not description bloat (descriptions stayed under their
+    /// own ceiling); ceiling → 13,500 to restore headroom.
+    const TOOL_SPECS_BUDGET: usize = 13_500;
     /// Just the human-readable descriptions (the part the diet targets; schema scaffolding is
     /// load-bearing). Pre-diet 5,261 B → post-diet (P0.2) 4,304 B; P1.2 adds ~230 B of cheap-path
     /// steering (name-based `to`/`card`, compact discover/roster, `detail`) that earns its bytes.
@@ -2615,6 +2786,31 @@ mod tests {
         assert_eq!(s, name_suffix("UABCDXYZ1234"), "deterministic");
         assert_eq!(s, "1234");
         assert!(s.chars().all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn same_hub_ignores_scheme_and_trailing_slash() {
+        assert!(same_hub("wss://parler-hub.fly.dev", "https://parler-hub.fly.dev"));
+        assert!(same_hub("wss://parler-hub.fly.dev/", "wss://parler-hub.fly.dev"));
+        assert!(same_hub("ws://127.0.0.1:7070", "http://127.0.0.1:7070"));
+        assert!(!same_hub("wss://parler-hub.fly.dev", "ws://127.0.0.1:7070"));
+    }
+
+    #[test]
+    fn portable_code_redeems_on_this_hub_and_signposts_a_different_one() {
+        // No embedded hub → bare code, redeemed against the agent's own hub.
+        assert_eq!(portable_code_for_hub("ZX6Y2QPX", "wss://parler-hub.fly.dev").unwrap(), "ZX6Y2QPX");
+        // Embedded hub == this hub (scheme aside) → strip it and redeem the bare code locally.
+        assert_eq!(
+            portable_code_for_hub("ZX6Y2QPX@https://parler-hub.fly.dev", "wss://parler-hub.fly.dev").unwrap(),
+            "ZX6Y2QPX"
+        );
+        // Embedded hub != this hub → refuse with the exact fix instead of a cryptic "unknown code".
+        let err = portable_code_for_hub("ZX6Y2QPX@ws://127.0.0.1:7071", "wss://parler-hub.fly.dev")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ws://127.0.0.1:7071"), "names the invite's hub: {err}");
+        assert!(err.contains("PARLER_HUB=ws://127.0.0.1:7071"), "shows the relaunch fix: {err}");
     }
 
     #[test]
@@ -3453,7 +3649,7 @@ mod tests {
             "id": blob_id,
             "out": bundle_out.to_str().unwrap(),
         });
-        let fetch_res = call_tool(&mut bob.agent, "parler_fetch", &fetch_args).await.unwrap();
+        let fetch_res = call_session_tool(&mut bob, "parler_fetch", &fetch_args).await.unwrap();
         assert!(fetch_res.contains("wrote"));
         assert!(bundle_out.exists());
 
@@ -3506,12 +3702,42 @@ mod tests {
         assert!(rendered.contains("📎 report.txt"), "recv should show the file: {rendered}");
         assert!(rendered.contains("here's the report"), "recv should show the note: {rendered}");
 
-        // Bob downloads the exact bytes via parler_fetch.
+        // Bob downloads the exact bytes via parler_fetch (explicit blob id).
         let out = dir.path().join("got.txt");
         let fetch_args = json!({ "id": blob_id, "out": out.to_str().unwrap() });
-        let fetch_res = call_tool(&mut bob.agent, "parler_fetch", &fetch_args).await.unwrap();
+        let fetch_res = call_session_tool(&mut bob, "parler_fetch", &fetch_args).await.unwrap();
         assert!(fetch_res.contains("wrote"), "{fetch_res}");
         assert_eq!(std::fs::read(&out).unwrap(), body.to_vec());
+
+        // Bob fetches with NO id — it auto-finds the file the room just shared. This is the "just
+        // fetch the file" flow (explicit `out` here only so the test doesn't write to the cwd).
+        let auto_out = out.with_file_name("auto.txt");
+        let auto = call_session_tool(
+            &mut bob,
+            "parler_fetch",
+            &json!({ "room": inv.room, "out": auto_out.to_str().unwrap() }),
+        )
+        .await
+        .unwrap();
+        assert!(auto.contains("wrote"), "{auto}");
+        assert_eq!(std::fs::read(&auto_out).unwrap(), body.to_vec(), "auto-find resolved the blob");
+
+        // Bob fetches by filename (no id), resolving the same blob.
+        let by_name = out.with_file_name("byname.txt");
+        let named = call_session_tool(
+            &mut bob,
+            "parler_fetch",
+            &json!({ "room": inv.room, "name": "report.txt", "out": by_name.to_str().unwrap() }),
+        )
+        .await
+        .unwrap();
+        assert!(named.contains("wrote"), "{named}");
+        assert_eq!(std::fs::read(&by_name).unwrap(), body.to_vec());
+
+        // A name that matches nothing is a clear error, not a silent wrong file.
+        let miss = call_session_tool(&mut bob, "parler_fetch", &json!({ "room": inv.room, "name": "nope.zip" }))
+            .await;
+        assert!(miss.is_err(), "unknown name should error");
     }
 
     /// The authoritative set of real `parler_*` MCP tools: everything `tool_specs()` advertises,
