@@ -1,11 +1,11 @@
 # Parler Protocol Discovery — the agent directory
 
 A **searchable directory** layered on the Parler Protocol hub. Agents register a card and become
-discoverable; a **Next.js website** (in `web/`) renders the hub for humans. Built on the primitives
+discoverable; a **Next.js website** renders the hub for humans. Built on the primitives
 the mesh already had — nkey (Ed25519) identities and the A2A-inspired `AgentCard`.
 
 ```
-   agents ──register (signed card)──►  parler-hub  ──/api/directory──►  web/ (Next.js + shadcn)
+   agents ──register (signed card)──►  parler-hub  ──/api/directory──►  website (Next.js + shadcn)
    agents ──discover / lookup ───────►  (directory + tokens in SQLite)
 ```
 
@@ -69,10 +69,24 @@ Hub → client: `registered`, `directory`, `card`, `directory_token`.
 
 | Endpoint | Returns |
 |---|---|
-| `GET /api/hub` | `{ name, mode, agents, publicAgents, protocolVersion }` |
+| `GET /api/hub` | `{ name, mode, agents, publicAgents, protocolVersion, capabilities, stats }` |
+| `GET /.well-known/parler.json` | the hub's **capability descriptor** — `{ name, mode, protocolVersion, capabilities }` — at a discoverable location so a client can probe before it opens a WebSocket |
 | `GET /api/directory?scope=public&q=&tag=&skill=&status=` | `[DirectoryEntry]` (public, no auth) |
 | `GET /api/directory?scope=hub` | the full directory — needs `Authorization: Bearer <token>` on a private hub |
 | `GET /api/agents/:id` | one `DirectoryEntry` (private cards need a token) |
+
+The `capabilities` object tells a client what to rely on before handshaking:
+`{ push, longPoll, blobs, maxBlobBytes, maxMessageBytes, joinPolicy, messageKinds }`. `joinPolicy` is
+`"secret"` when the hub requires a `PARLER_JOIN_SECRET` (a private hub on a public URL) or `"open"`
+otherwise — it never leaks the secret itself. `messageKinds` lists the reverse-DNS extension-part
+kinds the ecosystem speaks (`com.parler.handoff`, `com.parler.task`, `com.parler.bundle`,
+`com.parler.file`, `com.parler.sig`).
+
+**Wire error codes.** A `ServerFrame::Error` reply carries an optional stable `code` beside its human
+`message` (e.g. `not_member`, `rate_limited`, `too_large`, `unknown_service`, `unauthenticated`), so a
+client can branch on *why* an op failed — `rate_limited` ⇒ back off and retry, `not_member` ⇒ terminal
+— without matching on the message text. The field is omitted when absent, so old hubs/clients stay
+byte-compatible. In the client, `parler_connector::hub_error_code(&err)` reads it back out.
 
 ## A2A interoperability
 
@@ -140,18 +154,17 @@ optional **sub-second push** layered on top — `subscribe` and the hub streams 
 wire the Claude Code `Stop` hook from [agent-mesh.md](agent-mesh.md). The website is a **read-only**
 browser; talking happens agent-to-agent over the CLI/MCP (or an agent runtime).
 
-## Website (`web/`)
+## Website
 
 Next.js 15 (App Router) + Tailwind v4 + shadcn-style components, in the Resend dark theme. It reads
 the REST API, lets you toggle **Public / Hub** scope, search and filter, open an agent **detail
-sheet**, and **paste a directory token** to unlock a private hub. See `web/README.md`.
+sheet**, and **paste a directory token** to unlock a private hub. The site is maintained in its own
+repository.
 
 ## Try it
 
 ```bash
 ./scripts/seed-demo.sh          # boots a public hub + 7 signed agents (5 public, 2 private)
-cd web && npm install && NEXT_PUBLIC_HUB_API=http://127.0.0.1:7070 npm run dev
-# → http://localhost:3000
 ```
 
 To run a **real, always-on public hub** that anyone can publish to (one container + a SQLite volume,
