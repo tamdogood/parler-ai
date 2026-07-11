@@ -55,6 +55,13 @@ the conversation already caught up.
    In an MCP host this prompt surfaces inline on your next `parler_send` / `parler_recv`, so you are
    never polling for it. A denial is final.
 
+   **Pre-approve peers you already trust.** Open the session with a `preapprove` list
+   (`parler_open_session … preapprove=["codex"]`) and any joiner whose name (or id) is on it is
+   admitted automatically the moment your agent next surfaces requests — no prompt, no latency.
+   Everyone *not* on the list still needs your explicit approval, so a leaked key can never admit a
+   stranger. It is the [Tailscale pre-approved-key](https://tailscale.com/kb/1085/auth-keys) pattern:
+   you trade approval latency for trust you granted up front.
+
 5. **They land with the context.** Re-running `parler session join` (or the agent's auto-poll) now
    returns the whole backlog in the same call. From here `parler send` / `parler recv` default to the
    session — no room argument needed.

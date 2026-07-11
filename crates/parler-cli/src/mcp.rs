@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Result};
 use parler_connector::{BundleMeta, Config, JoinOutcome, MeshAgent};
 use parler_protocol::{AgentSkill, DiscoverScope, HandoffRef, RoomKind, StoredMessage, Target, Visibility};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -24,6 +25,19 @@ pub(crate) const DEFAULT_PUBLIC_HUB: &str = "wss://parler-hub.fly.dev";
 struct McpState {
     agent: MeshAgent,
     active_session: Option<String>,
+    /// Per-room pre-approval allowlists (room → joiner names/ids the owner opted to auto-admit). A
+    /// pending joiner matching its room's list is approved automatically the moment the owner's agent
+    /// next surfaces requests (recv notice or `parler_join_requests`) — the Tailscale
+    /// pre-approved-key pattern (#108), trading approval latency for the owner's explicit up-front
+    /// trust. In-memory only: after an MCP restart the list is gone and listed joiners fall back to
+    /// manual approval — a safe degradation that never over-admits.
+    preapprovals: HashMap<String, Vec<String>>,
+}
+
+impl McpState {
+    fn new(agent: MeshAgent) -> Self {
+        McpState { agent, active_session: None, preapprovals: HashMap::new() }
+    }
 }
 
 /// Connect to the hub, then serve the MCP JSON-RPC loop on stdin/stdout until EOF.
@@ -56,7 +70,7 @@ pub async fn serve_stdio() -> Result<()> {
     // `parler_register` first — "connected" should mean "discoverable". Private by default
     // (same-hub only); opt into the public directory or enrich the card via env. Best-effort.
     auto_register(&mut agent).await;
-    let mut state = McpState { agent, active_session: None };
+    let mut state = McpState::new(agent);
 
     // Spin-up convenience: if a session key was handed in via the environment, join it now so a
     // freshly launched agent is already in the shared conversation (with its context) before the
@@ -937,7 +951,8 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             // Approval defaults ON: a session is a live conversation, so the host vets each joiner
             // before they can read it. Pass approval=false to revert to open (paste-and-join) keys.
             let approval = args.get("approval").and_then(Value::as_bool).unwrap_or(true);
-            open_session(
+            let preapprove = parse_name_list(args.get("preapprove"));
+            let mut out = open_session(
                 state,
                 context.as_deref(),
                 s("topic"),
@@ -945,7 +960,23 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
                 u32opt("max_uses"),
                 approval,
             )
-            .await
+            .await?;
+            // Record the owner's pre-approval allowlist for the room just opened, so a listed joiner
+            // is auto-admitted on the owner's next poll (see auto_approve_preapproved). Only meaningful
+            // with the gate on — an open key already admits everyone. The signature of open_session is
+            // left untouched; the tool layer owns this wiring end to end.
+            let listed: Vec<String> =
+                preapprove.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+            if approval && !listed.is_empty() {
+                if let Some(room) = state.active_session.clone() {
+                    out.push_str(&format!(
+                        "\nPre-approved (auto-admitted, no prompt): {}. Anyone else still needs your approval.",
+                        listed.join(", ")
+                    ));
+                    state.preapprovals.insert(room, listed);
+                }
+            }
+            Ok(out)
         }
         "parler_join_session" => {
             let key = s("key").ok_or_else(|| anyhow!("missing 'key'"))?;
@@ -975,21 +1006,35 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             let room = s("room")
                 .or_else(|| state.active_session.clone())
                 .ok_or_else(|| anyhow!("missing 'room' (open a session, or pass room)"))?;
+            // Admit pre-approved joiners first, then list whoever still needs a manual decision.
+            let admitted = auto_approve_preapproved(state, &room).await;
+            let auto_line = if admitted.is_empty() {
+                String::new()
+            } else {
+                format!("✓ auto-admitted pre-approved: {}\n", admitted.join(", "))
+            };
             let reqs = state.agent.join_requests(&room).await?;
             if reqs.is_empty() {
-                return Ok(format!("(no agents waiting to join '{room}')"));
+                return Ok(if admitted.is_empty() {
+                    format!("(no agents waiting to join '{room}')")
+                } else {
+                    format!("{}(no other agents waiting to join '{room}')", auto_line)
+                });
             }
-            Ok(reqs
-                .iter()
-                .map(|r| {
-                    let role = r.role.as_deref().map(|x| format!(" ({x})")).unwrap_or_default();
-                    format!(
-                        "• {}{role} [{}] — approve: parler_approve_join agent={} | reject: parler_deny_join agent={}",
-                        r.name, r.agent, r.agent, r.agent
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(format!(
+                "{}{}",
+                auto_line,
+                reqs.iter()
+                    .map(|r| {
+                        let role = r.role.as_deref().map(|x| format!(" ({x})")).unwrap_or_default();
+                        format!(
+                            "• {}{role} [{}] — approve: parler_approve_join agent={} | reject: parler_deny_join agent={}",
+                            r.name, r.agent, r.agent, r.agent
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
         }
         "parler_approve_join" | "parler_deny_join" => {
             let room = s("room")
@@ -1620,14 +1665,67 @@ async fn wait_for_approval(
     }
 }
 
+/// Parse a name-list tool argument an LLM may send either as a JSON array (`["bob","codex"]`) or a
+/// single delimited string (`"bob, codex"`). Absent/empty entries are dropped.
+fn parse_name_list(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(s)) => s
+            .split([',', ' ', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Auto-admit any pending joiner the owner pre-approved for `room` (#108), returning the display
+/// names admitted so the caller can tell the host it happened. A no-op — and zero hub round-trips —
+/// when the room has no pre-approval list. Matching is by joiner name (case-insensitive) or exact id:
+/// the owner names trusted peers up front (e.g. `"codex"`), and a full id also works. Security: this
+/// only fires for names the owner explicitly listed at open time, so a leaked key still can't admit
+/// anyone off the list; approval for everyone else is unchanged.
+async fn auto_approve_preapproved(state: &mut McpState, room: &str) -> Vec<String> {
+    let Some(allow) = state.preapprovals.get(room).cloned() else {
+        return Vec::new();
+    };
+    // join_requests is owner-only; a refusal (non-owner) just yields nothing to admit.
+    let Ok(reqs) = state.agent.join_requests(room).await else {
+        return Vec::new();
+    };
+    let mut admitted = Vec::new();
+    for r in reqs {
+        let listed = allow.iter().any(|a| a.eq_ignore_ascii_case(&r.name) || a == &r.agent);
+        if listed && state.agent.resolve_join(room, &r.agent, true).await.unwrap_or(false) {
+            admitted.push(r.name);
+        }
+    }
+    admitted
+}
+
 /// If the caller owns `room` and agents are waiting to join it, render an approval prompt to append
 /// to a `parler_send`/`parler_recv` result — this is how the host is *shown* the accept/reject option
 /// inline, instead of having to poll for it. Returns `None` for a non-owner (the `join_requests` call
 /// is refused) or when nothing is pending.
 async fn pending_join_notice(state: &mut McpState, room: &str) -> Option<String> {
+    // First, silently admit anyone the owner pre-approved for this room (no-op when none is listed).
+    let admitted = auto_approve_preapproved(state, room).await;
+    let auto_line = if admitted.is_empty() {
+        String::new()
+    } else {
+        format!("✓ auto-admitted pre-approved: {}\n", admitted.join(", "))
+    };
     let reqs = state.agent.join_requests(room).await.ok()?;
     if reqs.is_empty() {
-        return None;
+        // Nothing left to prompt on, but surface the auto-admit so it isn't silent.
+        return (!admitted.is_empty()).then(|| format!("\n\n{}", auto_line.trim_end()));
     }
     let lines = reqs
         .iter()
@@ -1638,7 +1736,7 @@ async fn pending_join_notice(state: &mut McpState, room: &str) -> Option<String>
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "\n\n⏳ {n} agent(s) asking to JOIN this session — your approval is required before they can \
+        "\n\n{auto_line}⏳ {n} agent(s) asking to JOIN this session — your approval is required before they can \
          see the conversation:\n{lines}\n\
          Ask the user, then approve with parler_approve_join (agent=<id>) or reject with \
          parler_deny_join (agent=<id>).",
@@ -1689,6 +1787,9 @@ async fn close_session(state: &mut McpState) -> Result<String> {
     let Some(room) = state.active_session.take() else {
         return Ok("no active session to close".into());
     };
+    // Drop any pre-approval allowlist for this room — a later session reusing the same room id must
+    // not inherit a stale auto-admit list.
+    state.preapprovals.remove(&room);
     let _ = crate::clear_active_session();
     let _ = state
         .agent
@@ -1722,6 +1823,7 @@ fn tool_specs() -> Vec<Value> {
                 "context": { "type": "string", "description": "recap of the conversation/state to catch up joiners" },
                 "topic": { "type": "string", "description": "short session name" },
                 "approval": { "type": "boolean", "description": "require approval before a joiner is admitted (default true; false = open paste-and-join)" },
+                "preapprove": { "type": "array", "items": { "type": "string" }, "description": "trusted names/ids to auto-admit with no prompt (e.g. [\"codex\"]); others still need approval, so a leaked key can't admit off-list" },
                 "ttl_secs": { "type": "integer", "description": "key validity (default 24h)" },
                 "max_uses": { "type": "integer", "description": "max joiners (default 50)" }
             }),
@@ -2013,7 +2115,7 @@ mod tests {
         // Subscribe for the push latency optimization (best-effort). Long-poll no longer depends on
         // it — server-side wait works without push — so a failed subscribe here doesn't degrade recv.
         let _ = agent.subscribe().await;
-        McpState { agent, active_session: None }
+        McpState::new(agent)
     }
 
     /// Like [`state`], but does **not** subscribe — exercises the long-poll path on a connection that
@@ -2021,7 +2123,7 @@ mod tests {
     async fn state_no_push(hub: &str, name: &str) -> McpState {
         let cfg = Config::create(hub.to_string(), name.to_string(), None).unwrap();
         let agent = MeshAgent::connect(&cfg).await.unwrap();
-        McpState { agent, active_session: None }
+        McpState::new(agent)
     }
 
     /// Pull the `KEY: <code>` line out of an `open_session` result.
@@ -2053,8 +2155,10 @@ mod tests {
     /// `parler_task` tool (task-lifecycle status/receipts, the ACP borrow) grew it ~750 B to ~13,946;
     /// ceiling → 14,200. A **description diet** (2026-07-10 audit) then re-tightened all 27 tools to
     /// 12,689 B — *below* the pre-`parler_task` baseline, so the new capability nets a reduction, not a
-    /// cost; ceiling → 13,000 (a real cut from 13,200) to lock the savings against creep-back.
-    const TOOL_SPECS_BUDGET: usize = 13_000;
+    /// cost; ceiling → 13,000 (a real cut from 13,200) to lock the savings against creep-back. Adding
+    /// `parler_open_session`'s lean `preapprove` param (auto-admit trusted joiners, #108) grew it ~240 B
+    /// to ~12,930; ceiling → 13,200 to restore headroom (still the pre-diet guardrail level).
+    const TOOL_SPECS_BUDGET: usize = 13_200;
     /// Just the human-readable descriptions (the part the diet targets; schema scaffolding is
     /// load-bearing). Pre-diet 5,261 B → post-diet (P0.2) 4,304 B; P1.2 adds ~230 B of cheap-path
     /// steering (name-based `to`/`card`, compact discover/roster, `detail`) that earns its bytes.
@@ -2401,7 +2505,7 @@ mod tests {
 
         // A stable identity we reconnect with (one Config reused across two connects).
         let bob_cfg = Config::create(hub.clone(), "bob".to_string(), None).unwrap();
-        let mut bob = McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: None };
+        let mut bob = McpState::new(MeshAgent::connect(&bob_cfg).await.unwrap());
         join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         // Drain bob's own "joined" announce (it sits past his cursor) so his inbox starts clean.
         call_session_tool(&mut bob, "parler_recv", &json!({})).await.unwrap();
@@ -2412,7 +2516,7 @@ mod tests {
 
         // Restart: a fresh agent for the same identity must resume from the committed cursor.
         let mut bob2 =
-            McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: Some(room.clone()) };
+            McpState { active_session: Some(room.clone()), ..McpState::new(MeshAgent::connect(&bob_cfg).await.unwrap()) };
         let second = call_session_tool(&mut bob2, "parler_recv", &json!({})).await.unwrap();
         assert!(second.contains("no new messages"), "restart resumes from the committed cursor:\n{second}");
         assert!(!second.contains("only-once"), "the first recv's batch is not re-read after a restart:\n{second}");
@@ -2431,7 +2535,7 @@ mod tests {
         let key = key_of(&opened);
 
         let bob_cfg = Config::create(hub.clone(), "bob".to_string(), None).unwrap();
-        let mut bob = McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: None };
+        let mut bob = McpState::new(MeshAgent::connect(&bob_cfg).await.unwrap());
         join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap(); // sets bob.active_session
 
         // Alice leaves a reply waiting so bob's auto-pull-on-send pulls it (advancing the ack) without
@@ -2448,7 +2552,7 @@ mod tests {
         // Restart: a fresh agent for the same identity must not re-render the auto-pulled reply — the
         // exit flush committed it.
         let mut bob2 =
-            McpState { agent: MeshAgent::connect(&bob_cfg).await.unwrap(), active_session: Some(room.clone()) };
+            McpState { active_session: Some(room.clone()), ..McpState::new(MeshAgent::connect(&bob_cfg).await.unwrap()) };
         let after = call_session_tool(&mut bob2, "parler_recv", &json!({})).await.unwrap();
         assert!(after.contains("no new messages"), "exit flush committed the auto-pulled batch:\n{after}");
         assert!(!after.contains("reply-waiting"), "the auto-pulled reply is not re-read after a restart:\n{after}");
@@ -2919,6 +3023,80 @@ mod tests {
         let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
         assert!(joined.contains("secret plan: ship friday"), "an approved joiner gets the context: {joined}");
         assert_eq!(bob.active_session, alice.active_session, "both now share the session room");
+    }
+
+    #[tokio::test]
+    async fn preapproved_joiner_is_auto_admitted_without_a_manual_approve() {
+        // The Tailscale pre-approved-key pattern (#108): a joiner the owner listed at open time is
+        // admitted the moment the owner's agent next surfaces requests — no parler_approve_join call.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let mut bob = state(&hub, "bob").await;
+
+        // Alice opens a gated session but pre-approves "bob" (goes through the real tool path).
+        let opened = call_session_tool(
+            &mut alice,
+            "parler_open_session",
+            &json!({ "context": "secret plan: ship friday", "topic": "plan", "preapprove": ["bob"] }),
+        )
+        .await
+        .unwrap();
+        assert!(opened.to_lowercase().contains("pre-approved"), "the host is told bob is pre-approved: {opened}");
+        let key = key_of(&opened);
+
+        // Bob redeems → still pending: the auto-admit only fires once the owner's agent polls.
+        let pending = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
+        assert!(pending.contains("waiting for the host"), "pending until the owner surfaces requests: {pending}");
+        assert!(!pending.contains("secret plan"), "a pending joiner must not receive the context");
+
+        // Alice merely lists requests — bob is auto-admitted, no explicit approval.
+        let reqs = call_session_tool(&mut alice, "parler_join_requests", &json!({})).await.unwrap();
+        assert!(reqs.to_lowercase().contains("auto-admitted"), "bob was auto-admitted: {reqs}");
+        assert!(reqs.contains("bob"), "the auto-admit names the joiner: {reqs}");
+
+        // Bob's next join now succeeds and catches him up — no manual approve_join ever ran.
+        let joined = join_session(&mut bob, &key, Backlog::Recent, None).await.unwrap();
+        assert!(joined.contains("secret plan: ship friday"), "auto-admitted joiner gets the context: {joined}");
+        assert_eq!(bob.active_session, alice.active_session, "both now share the session room");
+    }
+
+    #[tokio::test]
+    async fn preapproval_does_not_admit_an_unlisted_joiner() {
+        // Pre-approving "bob" must not weaken the gate for anyone else — eve still needs approval.
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+        let mut eve = state(&hub, "eve").await;
+
+        let opened = call_session_tool(
+            &mut alice,
+            "parler_open_session",
+            &json!({ "context": "secret plan", "topic": "plan", "preapprove": ["bob"] }),
+        )
+        .await
+        .unwrap();
+        let key = key_of(&opened);
+
+        let pending = join_session(&mut eve, &key, Backlog::Recent, None).await.unwrap();
+        assert!(pending.contains("waiting for the host"), "unlisted joiner is gated: {pending}");
+
+        // Alice lists: eve is NOT auto-admitted, still shown as needing a manual decision.
+        let reqs = call_session_tool(&mut alice, "parler_join_requests", &json!({})).await.unwrap();
+        assert!(reqs.contains(&eve.agent.id), "eve still needs manual approval: {reqs}");
+        assert!(!reqs.to_lowercase().contains("auto-admitted"), "nothing was auto-admitted: {reqs}");
+
+        // And eve still can't get in on her own.
+        let still = join_session(&mut eve, &key, Backlog::Recent, None).await.unwrap();
+        assert!(still.contains("waiting for the host"), "unlisted joiner stays gated: {still}");
+        assert!(eve.active_session.is_none(), "eve is not admitted");
+    }
+
+    #[test]
+    fn parse_name_list_accepts_array_or_delimited_string() {
+        assert_eq!(parse_name_list(Some(&json!(["bob", " codex "]))), vec!["bob", "codex"]);
+        assert_eq!(parse_name_list(Some(&json!("bob, codex"))), vec!["bob", "codex"]);
+        assert_eq!(parse_name_list(Some(&json!("bob codex"))), vec!["bob", "codex"]);
+        assert!(parse_name_list(Some(&json!(""))).is_empty());
+        assert!(parse_name_list(None).is_empty());
     }
 
     #[test]

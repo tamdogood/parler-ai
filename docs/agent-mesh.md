@@ -92,6 +92,11 @@ approves it. A leaked or over-shared key therefore can't quietly pull your conte
 - The joiner's `parler_join_session` reports "⏳ waiting for the host to approve"; once approved, a
   re-call (or the brief built-in poll) returns the context and admits it. Same for the zero-touch
   `PARLER_SESSION_KEY` path — it requests on startup and is caught up once the host approves.
+- **Pre-approval** cuts the latency for peers you already trust: `parler_open_session preapprove=["codex"]`
+  auto-admits any joiner whose name or id is on the list the moment the host next surfaces requests —
+  no prompt. Everyone off the list still needs explicit approval, so a leaked key can't admit a
+  stranger. (The Tailscale pre-approved-key pattern; the allowlist lives in the host's MCP process, so
+  after an MCP restart a listed joiner falls back to manual approval rather than being admitted blind.)
 
 Pass `approval: false` to `parler_open_session` (or `parler session open --no-approval`) for the old
 open paste-and-join behavior.
