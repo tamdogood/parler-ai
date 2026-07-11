@@ -31,6 +31,14 @@ for context but no longer describes the current defaults.*
      `(author, room)`, and blobs untouched for 14 days are GC'd, all via an hourly background janitor.
      An operator opts out of any one knob with an explicit `0` (or a negative `--keep-facts`) — see
      §3.4 and the flags in `crates/parler-hub/src/main.rs`.
+  3. *Fairness (multi-tenant noisy neighbor)* — because every room shares that **one writer** and the
+     **one blob disk budget**, resource isolation between rooms is enforced with **per-room quotas** on
+     top of the per-agent ones: an aggregate send ceiling per room (default 1200/min,
+     `--max-room-sends-per-min`) so a single busy/abusive room can't monopolize the writer and stall
+     the others, and an aggregate blob-upload ceiling per room (default 600/hr,
+     `--max-room-blobs-per-hour`) so one room can't drain the shared disk. In-memory fixed windows,
+     `0` disables. Data isolation is already strong (every room op is membership-gated); this closes the
+     *resource* side. No per-room sandbox is needed — agent code runs client-side, never on the hub.
 * **Big code transfers: architected right, two efficiency ceilings.** Code rides **content-addressed
   blobs on disk** (git bundles), not the message log — exactly correct. But uploads are **fully
   buffered in RAM** (no streaming/resume), and blob GC (see above) bounds idle growth but not a burst
@@ -150,8 +158,9 @@ path** — code does **not** go through the message log:
 * **I/O is off the async runtime**: hashing + file write (`finish_blob_upload`) and the download read
   both run on `spawn_blocking`, so a 25 MiB transfer never stalls a tokio worker.
 * **Text is capped at 1 MiB** (`max_message_bytes`) precisely to force code onto the blob path. Defense
-  is in place: 25 MiB/blob cap, 1 GiB total disk budget, 120 blobs/hour rate limit, sha256 + size
-  verified on receipt.
+  is in place: 25 MiB/blob cap, 1 GiB total disk budget, a **per-agent** 120 blobs/hour and a
+  **per-room** 600 blobs/hour ceiling (`--max-room-blobs-per-hour`, so one room can't drain the shared
+  disk budget for everyone), sha256 + size verified on receipt.
 
 Architecturally this is the right call (keep big BLOBs out of SQLite; let git pack the delta). The
 efficiency ceilings are in §2.3.

@@ -70,6 +70,18 @@ pub const DEFAULT_MAX_HTTP_PER_MIN: u32 = 600;
 /// addresses. In-memory, resets on restart. Same fixed-window shape as the other rate guards.
 pub const WAITLIST_MAX_PER_MIN: u32 = 10;
 
+/// Default per-**room** send ceiling over a fixed 60s window, counting the *aggregate* of every member.
+/// The per-agent [`RateLimits::max_sends_per_min`] bounds one agent; this bounds one *room*, so a busy
+/// or abusive room full of agents can't monopolize the hub's single SQLite writer and starve every
+/// other room (the noisy-neighbor / write-DoS vector on a shared multi-tenant hub). Set well above a
+/// lively multi-agent conversation, so it only trips on runaway traffic. `0` disables. In-memory.
+pub const DEFAULT_MAX_ROOM_SENDS_PER_MIN: u32 = 1200;
+
+/// Default per-**room** blob-upload ceiling over a fixed 60-minute window. The hub's blob disk budget
+/// ([`DEFAULT_MAX_BLOB_DIR_BYTES`]) is shared across all rooms; this bounds how fast one room can
+/// consume it, so a single room can't fill storage (`STORAGE_FULL`) for everyone else. `0` disables.
+pub const DEFAULT_MAX_ROOM_BLOBS_PER_HOUR: u32 = 600;
+
 /// How long an unauthenticated socket may stay open before it must complete the handshake. Bounds
 /// slow-loris connections that open a socket and never authenticate.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,17 +102,28 @@ const MAX_TTL_SECS: u64 = 365 * 24 * 3600;
 /// without ever outliving the connection's own liveness window.
 const MAX_WAIT_SECS: u64 = 60;
 
-/// Per-agent flood limits (fixed-window). `0` disables a limit. State is in-memory and resets on
-/// hub restart — a deliberately simple posture for a low-ops bus.
+/// Flood limits (fixed-window), applied at two scopes: **per-agent** (one agent's own budget) and
+/// **per-room** (the aggregate budget of a whole room, so one busy room can't starve the shared hub).
+/// `0` disables a limit. State is in-memory and resets on hub restart — a deliberately simple posture
+/// for a low-ops bus.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimits {
     pub max_sends_per_min: u32,
     pub max_blobs_per_hour: u32,
+    /// Per-room send ceiling (aggregate over all members) per 60s window. `0` disables.
+    pub max_room_sends_per_min: u32,
+    /// Per-room blob-upload ceiling (aggregate over all members) per 60-minute window. `0` disables.
+    pub max_room_blobs_per_hour: u32,
 }
 
 impl Default for RateLimits {
     fn default() -> Self {
-        RateLimits { max_sends_per_min: 240, max_blobs_per_hour: 120 }
+        RateLimits {
+            max_sends_per_min: 240,
+            max_blobs_per_hour: 120,
+            max_room_sends_per_min: DEFAULT_MAX_ROOM_SENDS_PER_MIN,
+            max_room_blobs_per_hour: DEFAULT_MAX_ROOM_BLOBS_PER_HOUR,
+        }
     }
 }
 
@@ -152,8 +175,29 @@ struct Window {
     count: u32,
 }
 
+/// Charge one event against `window` (a fixed `window_ms` bucket) and report whether it is within
+/// `limit`. A `limit` of `0` disables the guard (always allowed). Shared by the per-agent
+/// ([`HubState::rate_allows`]) and per-room ([`HubState::room_rate_allows`]) limiters — same math, the
+/// only difference is which key the window is looked up by.
+fn charge_window(window: &mut Window, limit: u32, window_ms: i64, now: i64) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    if now - window.start >= window_ms {
+        window.start = now;
+        window.count = 0;
+    }
+    if window.count >= limit {
+        return false;
+    }
+    window.count += 1;
+    true
+}
+
+/// The two fixed windows charged together for one key — an agent id (per-agent limits) or a room name
+/// (per-room limits). Reused by both limiters; the key type is the only difference between them.
 #[derive(Default)]
-struct AgentRate {
+struct RateWindows {
     sends: Window,
     blobs: Window,
 }
@@ -215,7 +259,7 @@ pub struct HubState {
     /// Optional shared join secret. When set, a connection must present a matching `secret` on its
     /// signed `Hello` to authenticate — the access gate for a closed/private hub. `None` ⇒ open.
     pub join_secret: Option<String>,
-    /// Per-agent flood limits (authenticated WS ops).
+    /// Per-agent and per-room flood limits (authenticated WS ops).
     pub limits: RateLimits,
     /// Per-client-IP HTTP request budget per 60s window across the public front door (REST + `/ws`
     /// upgrade). `0` disables. Defaults to [`DEFAULT_MAX_HTTP_PER_MIN`].
@@ -223,7 +267,11 @@ pub struct HubState {
     /// How the background janitor bounds append-only growth (defaults to keep-everything).
     pub retention: Retention,
     /// In-memory rate-limit counters, keyed by agent id (resets on restart).
-    rate: Mutex<HashMap<String, AgentRate>>,
+    rate: Mutex<HashMap<String, RateWindows>>,
+    /// In-memory per-**room** rate-limit counters, keyed by room name (resets on restart). Bounds the
+    /// aggregate send/blob traffic of a single room so one noisy room can't starve the shared writer or
+    /// blob disk. Pruned by the janitor alongside `rate`.
+    room_rate: Mutex<HashMap<String, RateWindows>>,
     /// In-memory per-IP HTTP rate windows (resets on restart), pruned by the janitor alongside `rate`.
     http_rate: Mutex<HashMap<IpAddr, Window>>,
     /// In-memory per-IP windows for the tighter waitlist-signup budget ([`WAITLIST_MAX_PER_MIN`]),
@@ -281,6 +329,7 @@ impl HubState {
             max_http_per_min: DEFAULT_MAX_HTTP_PER_MIN,
             retention: Retention::default(),
             rate: Mutex::new(HashMap::new()),
+            room_rate: Mutex::new(HashMap::new()),
             http_rate: Mutex::new(HashMap::new()),
             waitlist_rate: Mutex::new(HashMap::new()),
             conn_count: AtomicUsize::new(0),
@@ -386,15 +435,28 @@ impl HubState {
             RateKind::Send => &mut ar.sends,
             RateKind::Blob => &mut ar.blobs,
         };
-        if now - w.start >= window_ms {
-            w.start = now;
-            w.count = 0;
+        charge_window(w, limit, window_ms, now)
+    }
+
+    /// Charge one event of `kind` against `room`'s fixed window; `true` if within the per-room limit.
+    /// The room-level twin of [`rate_allows`]: it caps the *aggregate* traffic of one room across every
+    /// member, so a single busy/abusive room can't monopolize the hub's shared SQLite writer (sends) or
+    /// blob disk budget (blobs) — the noisy-neighbor bound on a multi-tenant hub. `0` disables.
+    fn room_rate_allows(&self, room: &str, kind: RateKind, now: i64) -> bool {
+        let (limit, window_ms) = match kind {
+            RateKind::Send => (self.limits.max_room_sends_per_min, 60_000),
+            RateKind::Blob => (self.limits.max_room_blobs_per_hour, 3_600_000),
+        };
+        if limit == 0 {
+            return true;
         }
-        if w.count >= limit {
-            return false;
-        }
-        w.count += 1;
-        true
+        let mut map = self.room_rate.lock();
+        let ar = map.entry(room.to_string()).or_default();
+        let w = match kind {
+            RateKind::Send => &mut ar.sends,
+            RateKind::Blob => &mut ar.blobs,
+        };
+        charge_window(w, limit, window_ms, now)
     }
 
     /// Charge one HTTP request against `ip`'s fixed 60s window; `true` if it is within
@@ -581,6 +643,12 @@ fn prune_rate_windows(state: &HubState, now: i64) {
     const MAX_WINDOW_MS: i64 = 3_600_000; // the blob window (the longer of the two)
     {
         let mut map = state.rate.lock();
+        map.retain(|_, ar| now - ar.sends.start < MAX_WINDOW_MS || now - ar.blobs.start < MAX_WINDOW_MS);
+    }
+    // Per-room windows share the same shape and bound (the 60-minute blob window is the longer of the
+    // two); drop any room idle past it so the map stays sized to recently-active rooms.
+    {
+        let mut map = state.room_rate.lock();
         map.retain(|_, ar| now - ar.sends.start < MAX_WINDOW_MS || now - ar.blobs.start < MAX_WINDOW_MS);
     }
     // Per-IP HTTP windows are 60s; drop any whose window has fully elapsed so the map stays sized to
@@ -1866,6 +1934,14 @@ fn handle_put_blob(
         return Err(coded(error_code::STORAGE_FULL, "hub blob storage is full — try again later"));
     }
     let room = resolve_target(&state.store, me, &target)?;
+    // Per-room ceiling on top of the per-agent one: bound how fast this room can consume the shared
+    // blob disk budget, so a single room can't fill storage for everyone else.
+    if !state.room_rate_allows(&room, RateKind::Blob, now_ms()) {
+        return Err(coded(
+            error_code::RATE_LIMITED,
+            format!("rate limit: room '{room}' has too many uploads — slow down"),
+        ));
+    }
     conn.pending = Some(PendingUpload { id: sha256.clone(), room, author: me.id.clone(), size, media_type });
     Ok(Reply::Frame(ServerFrame::BlobReady { id: sha256 }))
 }
@@ -2141,6 +2217,15 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
                 ));
             }
             let room = resolve_target(store, me, &target)?;
+            // Per-room ceiling on top of the per-agent one: bound the *aggregate* send rate of this room
+            // so a busy/abusive room (many members, or one flooding agent) can't monopolize the shared
+            // SQLite writer and stall every other room.
+            if !state.room_rate_allows(&room, RateKind::Send, now_ms()) {
+                return Err(coded(
+                    error_code::RATE_LIMITED,
+                    format!("rate limit: room '{room}' is too busy — slow down"),
+                ));
+            }
             let mentions = mentions.as_deref().and_then(normalize_mentions);
             let from = EndpointRef { id: me.id.clone(), name: me.name.clone(), role: me.role.clone() };
             let now = now_ms();
@@ -2411,6 +2496,62 @@ mod tests {
         let map = state.rate.lock();
         assert!(map.contains_key("active"), "a recently active agent's counter is kept");
         assert!(!map.contains_key("idle"), "an agent idle past the longest window is dropped");
+    }
+
+    #[test]
+    fn room_rate_allows_enforces_per_room_budget_independent_of_agents_and_rolls() {
+        let store = Store::open(None).unwrap();
+        let mut state = HubState::new(store, "parler://x".into(), "T".into(), HubMode::Public);
+        state.limits.max_room_sends_per_min = 2;
+        let now = 10_000_000i64;
+
+        // The room's first two sends pass, the third in the same window is throttled — regardless of
+        // which agent sends them, because the budget is the room's aggregate.
+        assert!(state.room_rate_allows("roomA", RateKind::Send, now));
+        assert!(state.room_rate_allows("roomA", RateKind::Send, now));
+        assert!(!state.room_rate_allows("roomA", RateKind::Send, now), "over-budget room send is refused");
+        // A different room has its own independent budget.
+        assert!(state.room_rate_allows("roomB", RateKind::Send, now), "the limit is per-room, not global");
+        // A new 60s window resets the room's counter.
+        assert!(state.room_rate_allows("roomA", RateKind::Send, now + 60_000), "the window rolls after 60s");
+    }
+
+    #[test]
+    fn room_rate_limit_of_zero_is_disabled() {
+        let store = Store::open(None).unwrap();
+        let mut state = HubState::new(store, "parler://x".into(), "T".into(), HubMode::Public);
+        state.limits.max_room_sends_per_min = 0;
+        state.limits.max_room_blobs_per_hour = 0;
+        for _ in 0..1000 {
+            assert!(state.room_rate_allows("busy", RateKind::Send, 1), "a 0 send budget never throttles");
+            assert!(state.room_rate_allows("busy", RateKind::Blob, 1), "a 0 blob budget never throttles");
+        }
+    }
+
+    #[test]
+    fn room_limits_are_on_by_default() {
+        // A deployed hub bounds per-room traffic out of the box; regressing to keep-everything reopens
+        // the noisy-neighbor DoS. Blob and send windows are independent (different lengths).
+        let l = RateLimits::default();
+        assert!(l.max_room_sends_per_min > 0, "per-room send ceiling must be on by default");
+        assert!(l.max_room_blobs_per_hour > 0, "per-room blob ceiling must be on by default");
+    }
+
+    #[test]
+    fn prune_rate_windows_drops_only_idle_rooms() {
+        let store = Store::open(None).unwrap();
+        let state = HubState::new(store, "parler://x".into(), "T".into(), HubMode::Public);
+        let now = 10_000_000i64;
+
+        // `active` just sent; `idle` last sent over an hour ago (past the longest window).
+        state.room_rate_allows("active", RateKind::Send, now);
+        state.room_rate_allows("idle", RateKind::Send, now - 3_600_001);
+
+        assert_eq!(state.room_rate.lock().len(), 2);
+        prune_rate_windows(&state, now);
+        let map = state.room_rate.lock();
+        assert!(map.contains_key("active"), "a recently active room's counter is kept");
+        assert!(!map.contains_key("idle"), "a room idle past the longest window is dropped");
     }
 
     #[test]
