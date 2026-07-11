@@ -1,33 +1,47 @@
-# Fun agent names + richer session-open output
+# Per-room resource quotas + isolation docs
 
-## Goal
-1. Give agents fun, random-looking default names (e.g. `mellow-otter-a3f2`) instead of
-   `codex-tam` / `claude-code-tam` / `$USER-suffix`.
-2. When a session/room is opened, surface the agent's own name (and keep the watch code)
-   in the `parler_open_session` output so the host can relay it.
+## Problem
+On the shared public hub, room **data** isolation is solid (per-op `is_member`, `blob_rooms`,
+fact `room`/`author` scoping, owner-only watch tokens). What's missing is **resource** isolation:
+all rooms share one process, one SQLite writer lock, one blob disk budget, one connection ceiling.
+Rate limits are per-agent / per-IP, never per-room. So one busy/abusive room can degrade latency or
+exhaust disk for every other room (noisy-neighbor / write-DoS). No container sandbox is needed —
+agents run on users' machines, not on the hub — the fix is per-room quotas.
 
 ## Plan
-- [x] Add `crates/parler-cli/src/names.rs` — deterministic `fun_name(seed)` → `adjective-animal-<hex>`.
-- [x] Wire `fun_name` into `connect.rs::default_agent_name` (seed = `<host>-<user>`).
-- [x] Wire `fun_name` into `mcp.rs::load_or_bootstrap_config` + `lib.rs::cmd_init` (seed = minted nkey id).
-- [x] Add the agent name line to `open_session` output.
-- [x] Update affected unit tests + removed dead `name_suffix`.
-- [x] Docs: README env table + rustdoc.
-- [x] `make ci` green + desktop typecheck green.
-
-## Follow-on (surfaced while implementing)
-Fun names broke a latent assumption in the desktop **dial-in indicator**: it matched the bare host
-id (`codex`) against directory card names, but cards carry the wired `PARLER_NAME` (already
-`codex-<user>` since #103, now a fun handle). Fixed by surfacing `card_name` in `connect --json`
-(the exact wired name, recomputed deterministically) and matching the indicator on it.
+- [x] Extend `RateLimits` with `max_room_sends_per_min` + `max_room_blobs_per_hour` (defaults on).
+- [x] Add `DEFAULT_MAX_ROOM_SENDS_PER_MIN` / `DEFAULT_MAX_ROOM_BLOBS_PER_HOUR` consts.
+- [x] Add `room_rate` in-memory map to `HubState`; rename `AgentRate` → `RateWindows` (reused).
+- [x] Extract `charge_window` helper; refactor `rate_allows`; add `room_rate_allows`.
+- [x] Enforce per-room send limit in `Send` (after `resolve_target`).
+- [x] Enforce per-room blob limit in `PutBlob` (after `resolve_target`).
+- [x] Prune `room_rate` in `prune_rate_windows`.
+- [x] CLI flags + env in `parler-hub` binary (`--max-room-sends-per-min`, `--max-room-blobs-per-hour`).
+- [x] Unit tests (enforce, per-room independence, prune, 0-disables).
+- [x] Docs: README FAQ (new isolation entry) + Security "Abuse limits" bullet;
+      docs/storage-and-memory.md; AGENTS.md if it lists limits.
+- [x] `make ci` green.
 
 ## Review
-- New: `crates/parler-cli/src/names.rs` (fun-name generator + tests).
-- `connect.rs`: `default_agent_name` → fun handle; `emit_json` adds `card_name`; tests updated.
-- `mcp.rs`: bootstrap uses fun name; `open_session` surfaces `you are '<name>'`; budget 900→960;
-  removed dead `name_suffix` + test; #103 test rewritten around `fun_name`.
-- `lib.rs`: `parler init` default → fun name.
-- Desktop: `card_name` threaded through `ConnectResult` → `DialInList` matches on it.
-- README + rustdoc naming descriptions refreshed.
-- Verified: `parler init` → `jolly-falcon-34b1`; `connect` per-host distinct fun names;
-  `open_session` renders the name line (885 B, ≤960); `card_name` == wired `PARLER_NAME`.
+Shipped per-room resource quotas — the missing *resource* isolation on the shared hub (data isolation
+was already strong). No sandbox: agent code runs client-side, so there's nothing on the hub to
+sandbox; the real risk was noisy-neighbor / write-DoS.
+
+**Code (`crates/parler-hub/src/server.rs`)**
+- `RateLimits` gained `max_room_sends_per_min` (default 1200) + `max_room_blobs_per_hour` (default 600).
+- New `room_rate` map on `HubState`; `AgentRate` → `RateWindows` (now reused for agent *and* room keys).
+- Extracted `charge_window` helper (shared by both limiters); added `room_rate_allows`.
+- Enforced in `Send` and `PutBlob` right after `resolve_target` (per-room, on top of per-agent).
+- `prune_rate_windows` now prunes idle rooms too.
+- 4 new unit tests: enforce+roll, per-room independence, 0-disables, prune-idle, defaults-on. All green.
+
+**Config (`crates/parler-hub/src/main.rs`)** — `--max-room-sends-per-min` / `--max-room-blobs-per-hour`
+(+ `PARLER_HUB_*` env), `0` disables. Mirrors the existing `max-*` flags.
+
+**Docs** — README FAQ (new "are rooms isolated / is there a sandbox?" entry) + Security "Abuse limits"
+bullet; `docs/storage-and-memory.md` (blob-limit line + new fairness/#3 scalability point). AGENTS.md /
+agent-mesh.md don't enumerate abuse limits, so no drift there.
+
+**Deliberately not done (noted for follow-up):** per-room *member* / *connection* caps. Those need a
+store query + enforcement at several `add_member` call sites; the write-path rate quotas already bound
+the two concrete DoS vectors (writer contention, disk fill) with minimal surface. Easy to add next.

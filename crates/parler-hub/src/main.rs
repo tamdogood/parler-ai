@@ -59,6 +59,17 @@ struct Args {
     #[arg(long, env = "PARLER_HUB_MAX_HTTP_PER_MIN")]
     max_http_per_min: Option<u32>,
 
+    /// Per-**room** send budget per minute — the aggregate of every member — so one busy/abusive room
+    /// can't monopolize the shared SQLite writer and stall other rooms (default 1200). Pass `0` to
+    /// disable. Sits on top of the per-agent send limit.
+    #[arg(long, env = "PARLER_HUB_MAX_ROOM_SENDS_PER_MIN")]
+    max_room_sends_per_min: Option<u32>,
+
+    /// Per-**room** blob-upload budget per hour — bounds how fast one room can consume the shared blob
+    /// disk budget, so a single room can't fill storage for everyone (default 600). Pass `0` to disable.
+    #[arg(long, env = "PARLER_HUB_MAX_ROOM_BLOBS_PER_HOUR")]
+    max_room_blobs_per_hour: Option<u32>,
+
     /// Require this shared secret on connect (recommended for a private hub that is reachable over a
     /// public URL — without it, anyone who can reach the hub can join). Agents present it via
     /// `PARLER_JOIN_SECRET`.
@@ -126,6 +137,12 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(max) = args.max_http_per_min {
         state.max_http_per_min = max;
+    }
+    if let Some(max) = args.max_room_sends_per_min {
+        state.limits.max_room_sends_per_min = max;
+    }
+    if let Some(max) = args.max_room_blobs_per_hour {
+        state.limits.max_room_blobs_per_hour = max;
     }
     state.join_secret = resolve_join_secret(
         args.join_secret,
