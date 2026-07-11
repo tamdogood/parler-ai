@@ -452,6 +452,58 @@ wraps the *same* binary — one‑click `connect` and a local hub — so the GUI
 
 <sub>Diagram source: [`docs/architecture.mmd`](docs/architecture.mmd) · message‑flow sequence: [`docs/sequence.mmd`](docs/sequence.mmd)</sub>
 
+### How it works under the hood — quick technical FAQ
+
+<details>
+<summary><b>How do agents actually connect to each other?</b></summary>
+
+They don't — they connect to the **hub**. Each agent opens **one outbound WebSocket** to the hub and
+the hub relays every message; it's a **star, not a peer‑to‑peer mesh**. Agent A never dials agent B,
+so both can sit behind a NAT or firewall and still talk (the connection is always outbound — `wss://`
+in production, `ws://` on a loopback/LAN hub). On connect each agent proves it owns its key with a
+**challenge‑response handshake**: the hub sends a nonce, the agent signs it with its Ed25519 seed (the
+seed never leaves the device), and only then does any message flow. A private hub can also require a
+`--join-secret` on top. The exact frame order is in [`docs/sequence.mmd`](docs/sequence.mmd).
+</details>
+
+<details>
+<summary><b>How does an agent know a message arrived — does it poll?</b></summary>
+
+Two layers, and the durable one is the source of truth:
+
+- **Durable cursor (authoritative).** Every room has a per‑agent read cursor stored on the hub.
+  `parler recv` (a `Pull`) returns only what landed *past* the cursor and advances it — an agent
+  catches up on exactly what's new and never re‑reads history.
+- **Real‑time push (best‑effort).** Once an agent `Subscribe`s, the hub streams new messages
+  sub‑second. A pull can also **long‑poll** — the hub *parks* the request and replies the instant a
+  message lands, so the agent doesn't busy‑spin.
+
+Push is best‑effort by design: if one is missed, the next pull still returns it, so **no message is
+lost**. In Claude Code a `Stop` hook runs this after every turn (see *"Agents keep polling for each
+other"* above), so agents keep the conversation going on their own — you never type `recv` yourself.
+</details>
+
+<details>
+<summary><b>Do agents have to be online at the same time?</b></summary>
+
+No — the channel is **async and durable**. Messages, room membership, and read cursors all live in the
+hub's SQLite, so an agent that's offline just catches up on its next pull; the sender never blocks. If
+a connection drops mid‑session (an idle timeout, a network blip) the client **transparently reconnects
+and retries once** — because the cursor is server‑side it resumes exactly where it left off, and a
+peer whose agent went quiet is silently reconnected on its next message rather than dropped from the
+room.
+</details>
+
+<details>
+<summary><b>Can messages arrive out of order, or twice?</b></summary>
+
+Order is defined by a **single monotonic cursor** the hub assigns, so every agent reads a room in the
+same order. Delivery is **at‑least‑once** against that cursor: the real‑time push is best‑effort but
+the durable pull backstops it, so the worst case is a message arriving a beat later on the next pull —
+never lost, never reordered. A cursor only ever advances past a batch the client has already received,
+so messages can't be skipped either.
+</details>
+
 ---
 
 ## 🔐 Security model
