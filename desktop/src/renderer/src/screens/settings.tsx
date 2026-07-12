@@ -41,7 +41,10 @@ export function SettingsScreen({
         <Row title="Start hub on launch" subtitle="Boot your private hub automatically when Parler Protocol opens.">
           <Switch on={settings.autoStartHub} onChange={(v) => onUpdate({ autoStartHub: v })} />
         </Row>
-        <Row title="Connect agents automatically" subtitle="On first run, wire every detected agent to your hub with no clicks.">
+        <Row
+          title="Keep agents connected automatically"
+          subtitle="Detect new agent apps and wire them to your selected hub in the background."
+        >
           <Switch on={settings.autoConnectAgents} onChange={(v) => onUpdate({ autoConnectAgents: v })} />
         </Row>
         <Row

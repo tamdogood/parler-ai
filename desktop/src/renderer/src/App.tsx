@@ -49,9 +49,22 @@ export function App() {
       <div className="flex min-h-0 flex-1">
         <Sidebar active={screen} onNavigate={setScreen} status={status} pendingJoins={pendingJoins} />
         <main className="min-w-0 flex-1 overflow-y-auto">
-          {screen === "agents" && <AgentsScreen localUrl={localUrl} status={status} onConnect={() => setScreen("connect")} />}
+          {screen === "agents" && (
+            <AgentsScreen
+              localUrl={localUrl}
+              status={status}
+              onConnect={() => setScreen("connect")}
+              onStartSession={() => setScreen("sessions")}
+            />
+          )}
           {screen === "connect" && (
-            <ConnectScreen status={status} onStartHub={() => parler.hub.start()} onGoToAgents={() => setScreen("agents")} />
+            <ConnectScreen
+              status={status}
+              defaultTarget={settings.connectTarget}
+              onTargetChange={(connectTarget) => update({ connectTarget })}
+              onStartHub={() => parler.hub.start()}
+              onGoToAgents={() => setScreen("agents")}
+            />
           )}
           {screen === "sessions" && <SessionsScreen localUrl={localUrl} publicUrl={publicUrl} status={status} />}
           {screen === "settings" && (

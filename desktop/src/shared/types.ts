@@ -23,8 +23,8 @@ export interface Settings {
   /** Which hub the Connect flow targets by default. */
   connectTarget: HubTarget;
   /**
-   * On first launch, wire every detected agent to the local hub automatically once it's running —
-   * so a fresh download needs zero clicks. Off falls back to the manual "Connect all" button.
+   * Keep every detected agent wired to the selected hub automatically. First-run setup runs as soon
+   * as the local hub is ready; later scans pick up newly installed agents without another visit.
    */
   autoConnectAgents: boolean;
   /** Launch Parler Protocol at login (kept hidden in the tray) so the hub is up before agents dial in. */
@@ -213,6 +213,8 @@ export interface ParlerApi {
     approve(room: string, agent: string): Promise<ActionResult>;
     /** Turn away a pending joiner. */
     deny(room: string, agent: string): Promise<ActionResult>;
+    /** Open the native macOS Share menu for an intentionally selected session key. */
+    share(room: string, key: string): Promise<ActionResult>;
   };
   clipboard: {
     write(text: string): Promise<void>;
