@@ -13,6 +13,7 @@ import {
   Trash2,
   UserPlus,
   ServerOff,
+  Share2,
 } from "lucide-react";
 import type { HubStatus, OpenedSessionRecord, SessionJoinRequest } from "@shared/types";
 import { parler } from "@/lib/ipc";
@@ -324,7 +325,7 @@ function SessionCard({
 
       {/* The two codes — the whole point of an opened session. */}
       <div className="mt-4 grid gap-2 sm:grid-cols-2">
-        <TokenRow label="Session key" value={session.key} />
+        <TokenRow label="Session key" value={session.key} shareRoom={session.room} />
         {session.watch && <TokenRow label="Watch code" value={session.watch} />}
       </div>
 
@@ -378,7 +379,7 @@ function SessionCard({
   );
 }
 
-function TokenRow({ label, value }: { label: string; value: string }) {
+function TokenRow({ label, value, shareRoom }: { label: string; value: string; shareRoom?: string }) {
   return (
     <div className="min-w-0">
       <p className="mb-1 text-[11px] uppercase tracking-wide text-steel">{label}</p>
@@ -387,6 +388,15 @@ function TokenRow({ label, value }: { label: string; value: string }) {
           {value}
         </code>
         <CopyButton value={value} label="" />
+        {shareRoom && parler.app.platform === "darwin" && (
+          <button
+            onClick={() => parler.session.share(shareRoom, value)}
+            className="no-drag inline-flex items-center gap-1.5 rounded-[6px] border border-graphite-rail px-2 py-1 text-[12px] text-fog transition-colors hover:border-smoke hover:text-frost"
+            title="Share with Mail, Messages, AirDrop, or another Mac app"
+          >
+            <Share2 className="size-3.5" /> Share
+          </button>
+        )}
       </div>
     </div>
   );

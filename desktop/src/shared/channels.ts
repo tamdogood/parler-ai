@@ -28,6 +28,7 @@ export const CH = {
   sessionRequests: "session:requests",
   sessionApprove: "session:approve",
   sessionDeny: "session:deny",
+  sessionShare: "session:share",
   clipboardWrite: "clipboard:write",
   shellOpenExternal: "shell:openExternal",
   shellRevealPath: "shell:revealPath",

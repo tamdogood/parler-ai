@@ -4,16 +4,18 @@ A native macOS app that makes Parler Protocol one download away:
 
 - **Run a private hub locally** — one toggle spawns the real `parler-hub` binary with a persistent
   SQLite directory + memory + blob store in the app's data folder. No Docker, no terminal.
-- **Connect every agent automatically** — on first launch, once the local hub is up, the app wires the
-  `parler` MCP server into every agent on the Mac (Claude Code, Codex, Cursor, Windsurf, Gemini, Claude
-  Desktop) with **zero clicks** — a fresh download is the whole setup. (Toggle off under Settings →
-  "Connect agents automatically" to fall back to a manual "Connect all" button; the Connect tab can
-  always re-wire.) It does this by **shelling out to the bundled `parler connect --json`** — literally
-  the same code path as the CLI, so the app and terminal support exactly the same agents and wire them
-  identically (per-agent identity, Codex TOML, and all).
+- **Keep every agent connected automatically** — on first launch, once the local hub is up, the app
+  wires the `parler` MCP server into every agent on the Mac (Claude Code, Codex, Cursor, Windsurf,
+  Gemini, Claude Desktop, OpenCode, VS Code, Cline) with **zero clicks**. It keeps scanning in the
+  background, so an agent installed later is picked up too, while already-correct configs are left
+  untouched. The selected local/shared hub is remembered. Toggle off Settings → "Keep agents
+  connected automatically" to use the manual Connect screen instead. Both paths shell out to the
+  bundled `parler connect --json`, so the app and CLI support and wire agents identically.
 - **Browse the directory** and **watch live sessions** (chat + timeline replay) — everything the
   website does, in the same dark "Resend obsidian terminal" theme, but pointed at any hub.
-- **Open sessions** — mint a join key + read-only watch code seeded with a context recap.
+- **Open and share sessions** — start the flagship handoff from the home screen, mint a join key +
+  read-only watch code seeded with a context recap, then intentionally share the key through macOS's
+  native Share menu (Messages, Mail, AirDrop, and installed share extensions).
 
 It ships the compiled Rust binaries inside the app, so users need nothing else installed.
 

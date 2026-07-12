@@ -45,3 +45,26 @@ agent-mesh.md don't enumerate abuse limits, so no drift there.
 **Deliberately not done (noted for follow-up):** per-room *member* / *connection* caps. Those need a
 store query + enforcement at several `add_member` call sites; the write-path rate quotas already bound
 the two concrete DoS vectors (writer contention, disk fill) with minimal surface. Easy to add next.
+
+---
+
+# macOS automation and guided handoff UX
+
+## Plan
+- [x] Keep installed agents connected in the background using the existing `parler connect` source of truth; never rewrite hosts already pointed at the selected hub.
+- [x] Make the selected local/shared hub persistent so manual choices and background automation agree.
+- [x] Put the flagship session handoff on the home screen and add the native macOS Share menu for intentional key sharing.
+- [x] Add a dependency-free policy test, update desktop docs/settings copy, and run the desktop typecheck/build plus self-review.
+
+## Risks
+- Agent config writes must remain opt-in (`autoConnectAgents`) and must not race first-run onboarding.
+- Session keys are capabilities; sharing stays behind an explicit user click and is never sent automatically.
+
+## Review
+- Background scans are single-flight, wait until onboarding is complete, and only run against a
+  stopped hub when the remembered target is the shared hub.
+- The reconciliation policy has coverage for missing, misdirected, ready, and uninstalled hosts.
+- Session sharing validates bounded IPC inputs and only opens the macOS Share menu after the user
+  clicks Share; non-macOS builds fall back to copying the invitation.
+- Verified with `npm test`, `npm run typecheck`, `npm run build`, renderer smoke boot, and `make ci`.
+  Self-review against `docs/code-review-guidelines.md`: no remaining findings.

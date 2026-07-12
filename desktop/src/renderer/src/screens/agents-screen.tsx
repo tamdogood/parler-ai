@@ -1,4 +1,4 @@
-import { Plug, Play, AlertTriangle } from "lucide-react";
+import { MessagesSquare, Plug, Play, AlertTriangle } from "lucide-react";
 import type { HubStatus } from "@shared/types";
 import { parler } from "@/lib/ipc";
 import { Button } from "@/components/ui/button";
@@ -9,10 +9,12 @@ export function AgentsScreen({
   localUrl,
   status,
   onConnect,
+  onStartSession,
 }: {
   localUrl: string | null;
   status: HubStatus | null;
   onConnect: () => void;
+  onStartSession: () => void;
 }) {
   const down = status !== null && status.phase !== "running" && status.phase !== "starting";
 
@@ -23,9 +25,14 @@ export function AgentsScreen({
           <h1 className="text-[22px] font-semibold tracking-tight text-pure-white">Agents</h1>
           <p className="text-[13px] text-fog">Everything connected to your hub.</p>
         </div>
-        <Button variant="primary" onClick={onConnect}>
-          <Plug className="size-4" /> Connect an agent
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={onConnect}>
+            <Plug className="size-4" /> Manage connections
+          </Button>
+          <Button variant="primary" onClick={onStartSession}>
+            <MessagesSquare className="size-4" /> Start a handoff
+          </Button>
+        </div>
       </div>
 
       {down && (

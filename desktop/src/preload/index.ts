@@ -48,6 +48,7 @@ const api: ParlerApi = {
     requests: (room) => ipcRenderer.invoke(CH.sessionRequests, room),
     approve: (room, agent) => ipcRenderer.invoke(CH.sessionApprove, room, agent),
     deny: (room, agent) => ipcRenderer.invoke(CH.sessionDeny, room, agent),
+    share: (room, key) => ipcRenderer.invoke(CH.sessionShare, room, key),
   },
   clipboard: {
     write: (text) => ipcRenderer.invoke(CH.clipboardWrite, text),

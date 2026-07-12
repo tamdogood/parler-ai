@@ -14,6 +14,7 @@
     "typecheck:node": "tsc -p tsconfig.node.json --noEmit",
     "typecheck:web": "tsc -p tsconfig.web.json --noEmit",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
     "build:binaries": "bash scripts/build-binaries.sh",
     "pack": "npm run gen-icons && electron-vite build && electron-builder --dir",
     "dist": "npm run build:binaries && npm run gen-icons && electron-vite build && electron-builder --mac"

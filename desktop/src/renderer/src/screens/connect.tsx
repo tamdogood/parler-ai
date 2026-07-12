@@ -15,14 +15,18 @@ import { DialInList } from "@/components/dial-in";
  */
 export function ConnectScreen({
   status,
+  defaultTarget,
+  onTargetChange,
   onStartHub,
   onGoToAgents,
 }: {
   status: HubStatus | null;
+  defaultTarget: HubTarget;
+  onTargetChange: (target: HubTarget) => Promise<void>;
   onStartHub: () => void;
   onGoToAgents: () => void;
 }) {
-  const [target, setTarget] = useState<HubTarget>("local");
+  const [target, setTarget] = useState<HubTarget>(defaultTarget);
   const localUrl = useHubUrl("local", status);
   const [hosts, setHosts] = useState<McpHost[] | null>(null);
   const [snippet, setSnippet] = useState<ConnectSnippet | null>(null);
@@ -42,6 +46,12 @@ export function ConnectScreen({
   }, [refresh]);
 
   const localNotReady = target === "local" && status?.phase !== "running";
+
+  const toggleTarget = () => {
+    const next = target === "local" ? "public" : "local";
+    setTarget(next);
+    void onTargetChange(next);
+  };
 
   const act = async (host: McpHost, action: "connect" | "disconnect") => {
     setBusy(host.id);
@@ -83,7 +93,7 @@ export function ConnectScreen({
       {/* Which hub the agents point at. */}
       <div className="mt-3 flex items-center justify-between">
         <button
-          onClick={() => setTarget(target === "local" ? "public" : "local")}
+          onClick={toggleTarget}
           className="no-drag inline-flex items-center gap-1.5 text-[12.5px] text-steel transition-colors hover:text-frost"
         >
           <Cloud className="size-3.5" />

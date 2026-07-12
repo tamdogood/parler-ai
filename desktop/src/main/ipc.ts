@@ -1,4 +1,4 @@
-import { ipcMain, shell, clipboard, app } from "electron";
+import { ipcMain, shell, clipboard, app, BrowserWindow, ShareMenu } from "electron";
 import { networkInterfaces } from "node:os";
 import { PUBLIC_HUB, type HubTarget } from "../shared/types";
 import { CH } from "../shared/channels";
@@ -8,6 +8,9 @@ import { parlerBinary, dataDir } from "./paths";
 import * as mcp from "./mcp";
 import * as cli from "./parler-cli";
 import { listSessions, saveSession, forgetSession } from "./session-store";
+import { hostsNeedingConnection } from "./agent-reconcile-policy";
+
+const AGENT_SCAN_MS = 60_000;
 
 function httpToWs(url: string): string {
   return url.replace(/^http/, "ws");
@@ -68,6 +71,36 @@ export function registerIpc(supervisor: HubSupervisor): void {
     return { url: PUBLIC_HUB, joinSecret: null };
   };
 
+  // Keep the opt-in automation alive after onboarding: periodically discover newly installed MCP
+  // hosts and wire only those that are missing or pointed at another hub. One run at a time avoids
+  // concurrent config writers; already-correct hosts are never touched.
+  let reconcilingAgents = false;
+  const reconcileAgents = async (): Promise<void> => {
+    const settings = loadSettings();
+    if (!settings.onboarded || !settings.autoConnectAgents || reconcilingAgents) return;
+    const target = settings.connectTarget;
+    if (target === "local" && supervisor.getStatus().phase !== "running") return;
+
+    reconcilingAgents = true;
+    try {
+      const hosts = await mcp.detectHosts();
+      for (const host of hostsNeedingConnection(hosts, target)) {
+        const result = await mcp.connect(host.id, mcpContext(target));
+        if (!result.ok) console.warn(`automatic agent connection failed for ${host.name}: ${result.message}`);
+      }
+    } catch (e) {
+      console.warn("automatic agent connection scan failed", e);
+    } finally {
+      reconcilingAgents = false;
+    }
+  };
+
+  supervisor.on("status", (status) => {
+    if (status.phase === "running") void reconcileAgents();
+  });
+  const agentScan = setInterval(() => void reconcileAgents(), AGENT_SCAN_MS);
+  agentScan.unref();
+
   ipcMain.handle(CH.appVersion, () => app.getVersion());
 
   ipcMain.handle(CH.settingsGet, () => loadSettings());
@@ -77,6 +110,7 @@ export function registerIpc(supervisor: HubSupervisor): void {
     if (patch && Object.prototype.hasOwnProperty.call(patch, "startAtLogin")) {
       syncLoginItem(next.startAtLogin);
     }
+    if (next.autoConnectAgents) void reconcileAgents();
     return next;
   });
 
@@ -152,6 +186,19 @@ export function registerIpc(supervisor: HubSupervisor): void {
     } catch (e) {
       return { ok: false, message: e instanceof Error ? e.message : "Failed to deny." };
     }
+  });
+  ipcMain.handle(CH.sessionShare, (event, room: string, key: string) => {
+    if (!room || !key || room.length > 256 || key.length > 1024) {
+      return { ok: false, message: "Invalid session key." };
+    }
+    const text = `Join my Parler Protocol session (${room}):\n\n${key}`;
+    if (process.platform !== "darwin") {
+      clipboard.writeText(text);
+      return { ok: true, message: "Session invitation copied." };
+    }
+    const window = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    new ShareMenu({ texts: [text] }).popup(window ? { window } : undefined);
+    return { ok: true, message: "Share menu opened." };
   });
 
   ipcMain.handle(CH.clipboardWrite, (_e, text: string) => clipboard.writeText(text));
