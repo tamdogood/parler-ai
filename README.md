@@ -3,15 +3,14 @@
 
 <img src="docs/assets/parler-banner.svg" alt="Parler Protocol — chat protocol for AI agents" width="720"/>
 
-### Stop copy‑pasting context between agents.
+### Share the session. Skip the transcript.
 
-**Move a live coding‑agent session from one tool to another in about 10 seconds. No copy‑paste, no
-re‑briefing.** Works across Claude Code, Codex, Cursor, Windsurf, Gemini, OpenCode, VS Code, and Cline.
+**Move a live coding-agent session from one tool to another in about 10 seconds. No copy-paste. No
+re-briefing.** Works across Claude Code, Codex, Cursor, Windsurf, Gemini, OpenCode, VS Code, and Cline.
 
-You're mid‑chat with an AI agent and need another to jump in — **your own in a second repo, or your
-teammate's on the same project**. Share one **key**, not a transcript, and the next agent joins the
-*same* conversation with the full context already loaded. Built for hackathons, group projects, and
-anyone running more than one agent.
+When another agent needs to take over, share one short key instead of rebuilding the conversation by
+hand. The next agent joins the same live session, asks for approval, and lands with the context already
+loaded. Use it across your own tools, across repos, or with a teammate on another machine.
 
 <br/>
 
@@ -21,30 +20,43 @@ anyone running more than one agent.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#-license)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3ad389)](CONTRIBUTING.md)
 
-**[Live site](https://www.parlerprotocol.com)** · [Quickstart](#-quickstart) · [Hand off a conversation](#-hand-off-a-conversation) · [What agents can do](docs/communication.md) · [Why not Slack?](docs/vs-slack.md) · [Connect your agents](#-connect-your-agents) · [Docs](docs/)
+**[Get started](#-quickstart)** · [See the handoff](#-hand-off-a-conversation) · [Live site](https://www.parlerprotocol.com) · [What agents can do](docs/communication.md) · [Marketing kit](docs/marketing/README.md) · [Docs](docs/)
 
+</div>
+
+![Parler Protocol: one conversation branching through separate approval gates to three agent workspaces](docs/assets/marketing/session-handoff-hero.png)
+
+<div align="center">
+
+**One key carries the conversation. Every joiner is approved. The hub relays it; it does not become
+the root of trust.**
+
+</div>
 
 ---
 
-## 🎯 Mission & purpose
+## 🎯 The pitch in 30 seconds
 
-**Agents work better together — but they can't share what they know.** Whether it's *you* running an
-agent in two repos, or *three people* hacking on one project at a hackathon, each agent thinks it's
-alone in the world. The only way to share context is to **copy‑paste**: connection codes between
-terminals, and the entire conversation transcript every time you want a second agent — yours or a
-teammate's — to pick up where the first left off. It's slow, it's lossy, it isn't discoverable, and
-nothing stops a rogue process from impersonating "your reviewer agent."
+Most multi-agent workflows still make the human carry context between windows. Parler Protocol
+removes that clipboard step. It is one small Rust binary that ships as a CLI and an MCP server, so
+independent agents can find each other, prove who they are, and continue the same conversation.
 
-**Parler Protocol is the coordination layer that fixes this.** One small Rust binary gives a set of agents —
-**Claude Code, Codex, Cursor, Hermes, or your own** — four things they're missing:
+| If you are... | Parler helps you... |
+|---------------|---------------------|
+| A solo builder using several coding tools | Move a live session from Claude Code to Codex, Cursor, or another workspace without writing the brief again |
+| A team or hackathon group | Share one session key, approve each teammate's agent separately, and keep everyone on the same thread |
+| Building agent infrastructure | Add a message bus, signed identity, discovery, shared memory, service queues, and code or file handoff without standing up a broker stack |
 
-- a **shared message bus** (1:1 DMs, 1:many channels, many:1 service queues),
-- a **verifiable identity** each (an agent's id *is* its public key, so listings can't be forged),
-- a **searchable directory** to find one another, and
-- a **durable, token‑efficient memory** they can all read from.
+The flagship flow is session handoff. The rest of the protocol turns that handoff into a durable
+agent network:
 
-> Our goal is a world where agents are teammates — they can **find each other, prove who they are,
-> and hand off work** without a human shuttling text between windows, or between people.
+- a **shared message bus** for DMs, channels, and service queues,
+- a **verifiable identity** whose id is its Ed25519 public key,
+- a **searchable directory** for names, roles, tags, skills, and status, and
+- a **durable, token-efficient memory** that returns new or matching context instead of replaying
+  everything.
+
+> **The promise:** share the session, not the transcript.
 
 ---
 

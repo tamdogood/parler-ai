@@ -48,6 +48,31 @@ the two concrete DoS vectors (writer contention, disk fill) with minimal surface
 
 ---
 
+# Marketing package and dark editorial artwork
+
+## Plan
+- [x] Audit the interrupted README and marketing-kit draft against current product behavior and voice.
+- [x] Replace generic neon-tech artwork with a coherent modern, dark editorial campaign set.
+- [x] Update the README and artwork guide to use the final assets, including accurate sizes and alt text.
+- [x] Run documentation checks, inspect every final image, and self-review against the repo guidelines.
+
+## Risks
+- Marketing copy must not imply end-to-end encryption or bypass session join approval.
+- Generated art must stay legible in dark GitHub themes and avoid fake product UI or unreadable text.
+
+## Review
+- Reframed the README around "Share the session. Skip the transcript." and linked the reusable kit.
+- Added positioning, channel copy, campaign plans, and truthful objection-handling under
+  `docs/marketing/`.
+- Replaced the interrupted neon-terminal set with eight dark editorial assets: handoff hero and
+  square, team session, join approval, local/private mode, shared memory, signed identity, and
+  code/file handoff.
+- Recorded dimensions, placements, alt text, crop rules, palette tokens, and the reusable prompt
+  direction in the artwork guide.
+- Verified every final image visually; `git diff --check`, `make selftest`, and `make ci` pass.
+
+---
+
 # macOS automation and guided handoff UX
 
 ## Plan
