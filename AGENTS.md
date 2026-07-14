@@ -22,10 +22,13 @@ desktop app's one-click *Connect* also drives. The only hub choice is a ladder w
 (nothing to run) → `--local` (nothing leaves the box) → `--team` (generates a join secret).
 Agent-hosted MCP and terminal commands scope identity per workspace/session, so parallel terminals
 join rooms as distinct cryptographic members instead of reusing one flat config.
+For hosts without a turn-injection hook (including Codex/Conductor), `parler work` supplies the
+activation loop: it watches signed handoffs, runs a bounded headless Codex/Claude turn in that
+workspace, and posts lifecycle + result messages. `recv --watch` is a display, not an LLM scheduler.
 
 For truly continuous operation, the connector has an explicit host contract (lifecycle → presence,
 tools → send, pull → receive, host-native wake → injection). Hosts without an injection seam use the
-optional local `parler work` supervisor, which runs only a user-configured runner; it is separate from
+optional local `parler supervise` supervisor, which runs only a user-configured runner; it is separate from
 the hub and normal messaging hot path. Attention is receiver-local (`open` / `dnd` / `focus`, with
 quiet/muted rooms), and role-addressed service work uses atomic claims driven by fresh availability.
 
@@ -59,7 +62,7 @@ binary for one-click Connect and a local hub.
 | `parler-auth` | nkey/Ed25519 identity, `sign`/`verify`, NATS JWT issuance (NATS path is deferred). |
 | `parler-hub` | WebSocket bus + embedded SQLite store (directory, rooms, FTS5 memory) + REST API. |
 | `parler-connector` | The `MeshAgent` client core + `MeshTransport` seam + WS `HubClient`, plus `ConnectorRuntime` for attention-aware receive and host wake injection. Shared by CLI & MCP. |
-| `parler-cli` | `parler` subcommands (incl. `parler connect`, the one-command agent wiring), optional local `parler work` supervisor, and the `parler mcp` stdio server. |
+| `parler-cli` | `parler` subcommands (including `connect`, the autonomous `work` daemon, and optional local `supervise` runner) **and** the `parler mcp` stdio server. |
 | `parler-bin` | The umbrella `parler` binary. |
 
 ---

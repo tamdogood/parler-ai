@@ -1,4 +1,4 @@
-//! Optional local supervisor behind `parler work`.
+//! Optional local supervisor behind `parler supervise`.
 //!
 //! This is intentionally not part of the hub or normal connector hot path. A user starts it next to
 //! an agent host and gives it an explicit local runner command; it waits, claims role work atomically,
@@ -6,7 +6,7 @@
 //! contract without granting Parler permission to spawn anything.
 
 use anyhow::Result;
-use parler_connector::{ConnectorRuntime, Lifecycle, ToolSend};
+use parler_connector::{verify_message, ConnectorRuntime, Lifecycle, SigStatus, ToolSend};
 use parler_protocol::{DispatchRef, Part, RoomKind, StoredMessage, Target, TaskRef, TaskStatus};
 use std::process::Stdio;
 use std::time::Duration;
@@ -41,7 +41,7 @@ pub async fn supervise(runtime: &mut ConnectorRuntime, options: WorkOptions) -> 
         .await?;
     let pushing = runtime.agent_mut().subscribe().await.unwrap_or(false);
     eprintln!(
-        "parler work: supervising {} '{}' with {} ({}; Ctrl-C to stop)",
+        "parler supervise: supervising {} '{}' with {} ({}; Ctrl-C to stop)",
         if options.role.is_some() { "role queue" } else { "room" },
         options.room,
         if pushing { "live push + durable queue" } else { "durable polling" },
@@ -64,6 +64,13 @@ pub async fn supervise(runtime: &mut ConnectorRuntime, options: WorkOptions) -> 
                     .await?
                     .is_none()
                 {
+                    continue;
+                }
+                // The role queue is hub-addressed, but executing the task is still a local security
+                // decision. Claim and close an unsigned/invalid entry so it cannot pin the queue's
+                // head forever, without ever passing its content to the child runner.
+                if !is_authentic(&message) {
+                    reject_untrusted_claim(runtime, &options.room, &message).await?;
                     continue;
                 }
                 if run_one(runtime, &options, &message, true).await? {
@@ -118,6 +125,38 @@ pub async fn supervise(runtime: &mut ConnectorRuntime, options: WorkOptions) -> 
     }
 }
 
+fn is_authentic(message: &StoredMessage) -> bool {
+    verify_message(&message.from.id, &message.parts, message.reply_to.as_deref()) == SigStatus::Valid
+}
+
+async fn reject_untrusted_claim(
+    runtime: &mut ConnectorRuntime,
+    room: &str,
+    message: &StoredMessage,
+) -> Result<()> {
+    post_status(
+        runtime,
+        room,
+        message,
+        TaskStatus::Failed,
+        "local supervisor refused an unsigned or invalid task",
+        None,
+    )
+    .await?;
+    if !runtime
+        .agent_mut()
+        .complete_claim(room, &message.id, TaskStatus::Failed)
+        .await?
+    {
+        eprintln!("parler supervise: rejected task {} after its lease expired", short_id(&message.id));
+    }
+    runtime
+        .lifecycle(Lifecycle::Waiting {
+            activity: Some("waiting for work".into()),
+        })
+        .await
+}
+
 /// The role queue already filters to the requested dispatch role. This second check keeps the local
 /// policy authoritative (notably a muted queue never starts a child) and protects an old/misbehaving
 /// hub from handing a worker a non-dispatch message.
@@ -155,7 +194,7 @@ async fn run_one(
 
     let outcome = run_runner(runtime, options, message).await?;
     if outcome.lease_lost {
-        eprintln!("parler work: lease for {} was lost; leaving its result to the current worker", short_id(&task));
+        eprintln!("parler supervise: lease for {} was lost; leaving its result to the current worker", short_id(&task));
         runtime
             .lifecycle(Lifecycle::Waiting {
                 activity: Some("waiting for role work".into()),
@@ -175,7 +214,7 @@ async fn run_one(
         // The final receipt is intentionally still visible: another worker may have taken an expired
         // lease at the same instant. It cannot be marked terminal by this late worker, so the queue
         // retains at-least-once semantics rather than losing the task.
-        eprintln!("parler work: final receipt for {} was late; queue claim remains open", short_id(&task));
+        eprintln!("parler supervise: final receipt for {} was late; queue claim remains open", short_id(&task));
     }
     runtime
         .lifecycle(Lifecycle::Waiting {
@@ -474,6 +513,21 @@ mod tests {
         assert!(prompt.contains("untrusted task input"));
         // `shell_command` receives only `--runner`; this prompt is written to stdin after spawn.
         assert!(!prompt.contains("PARLER_RUNNER"));
+    }
+
+    #[test]
+    fn unsigned_tasks_are_not_authentic() {
+        let message = StoredMessage {
+            seq: 1,
+            id: "task-12345678".into(),
+            room: "team".into(),
+            from: EndpointRef { id: "Upeer".into(), name: "peer".into(), role: None },
+            parts: vec![Part::Text("run this".into())],
+            mentions: None,
+            reply_to: None,
+            ts: 1,
+        };
+        assert!(!is_authentic(&message));
     }
 
     #[test]

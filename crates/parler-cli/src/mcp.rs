@@ -55,8 +55,8 @@ const AGENT_SESSION_ENV: &str = "PARLER_AGENT_SESSION";
 /// log where it has always lived. Set once by [`scope_identity_to_workspace`].
 static LOG_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Namespace an agent process's identity by its **workspace** (the working directory) and, when the
-/// host exposes one, its stable agent-session id. Two agents launched on one machine then get
+/// Namespace an agent process's identity by its **workspace** and, when needed, a stable host-session
+/// id. Two agents launched on one machine then get
 /// distinct hub identities instead of collapsing onto one saved `config.json` — the bug where a
 /// 3-agent session shows a single member because every process re-registered the same id.
 ///
@@ -64,7 +64,10 @@ static LOG_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::
 /// the active-session pointer, and everything else keyed off `home_dir()` follow consistently — no
 /// scattered path plumbing. Restart-stable: the same workspace/session pair re-derives the same home,
 /// so the agent keeps its id across restarts. MCP hosts that don't expose a session id retain the
-/// existing per-workspace behavior.
+/// existing per-workspace behavior. Conductor already gives every agent an isolated workspace, so
+/// its automatic Codex/Claude thread id is deliberately omitted: the interactive agent and a
+/// Conductor Run-script worker must resolve the same identity/active-session files. An explicit
+/// `PARLER_AGENT_SESSION` still opts into a further split.
 ///
 /// It can only ever *add* isolation, never regress an existing flat setup: it no-ops (keeping the one
 /// flat identity) when [`SHARED_IDENTITY_ENV`] is set or the working directory can't be determined.
@@ -108,13 +111,30 @@ fn bootstrap_hub(scoped_exists: bool, env_hub: Option<&str>, base_hub: Option<&s
 /// id. Codex exposes a thread id to shell commands; other hosts can set `PARLER_AGENT_SESSION`
 /// explicitly. Values are hashed into the home name and never persisted or sent.
 fn workspace_key() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let conductor_workspace = std::env::var("CONDUCTOR_WORKSPACE_PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    let path = match &conductor_workspace {
+        Some(path) => path.clone(),
+        None => std::env::current_dir().ok()?,
+    };
+    let canon = std::fs::canonicalize(&path).unwrap_or(path);
     let workspace = canon.to_string_lossy();
-    let session = [AGENT_SESSION_ENV, "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"]
+    let explicit = std::env::var(AGENT_SESSION_ENV).ok().filter(|value| !value.is_empty());
+    let host_session = ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"]
         .iter()
         .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()));
+    let session = scope_session(conductor_workspace.is_some(), explicit, host_session);
     Some(identity_scope_key(&workspace, session.as_deref()))
+}
+
+fn scope_session(
+    conductor_workspace: bool,
+    explicit: Option<String>,
+    host_session: Option<String>,
+) -> Option<String> {
+    explicit.or_else(|| (!conductor_workspace).then_some(host_session).flatten())
 }
 
 fn identity_scope_key(workspace: &str, session: Option<&str>) -> String {
@@ -525,7 +545,7 @@ async fn handle(state: &mut McpState, method: &str, params: Value) -> Result<Val
                 "parler_open_session" | "parler_join_session" | "parler_close_session"
                 | "parler_join" | "parler_send" | "parler_recv" | "parler_handoff"
                 | "parler_task" | "parler_join_requests" | "parler_approve_join" | "parler_deny_join"
-                | "parler_watch_session" | "parler_bring" | "parler_fetch" => {
+                | "parler_watch_session" | "parler_delete_room" | "parler_bring" | "parler_fetch" => {
                     call_session_tool(state, &name, &args).await
                 }
                 _ => call_tool(&mut state.agent, &name, &args).await,
@@ -1198,6 +1218,18 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             }
         }
         "parler_close_session" => close_session(state).await,
+        "parler_delete_room" => {
+            let room = s("room")
+                .or_else(|| state.active_session.clone())
+                .ok_or_else(|| anyhow!("missing 'room' and no active session"))?;
+            state.agent.delete_room(&room).await?;
+            if state.active_session.as_deref() == Some(room.as_str()) {
+                state.active_session = None;
+                state.preapprovals.remove(&room);
+                let _ = crate::clear_active_session();
+            }
+            Ok(format!("deleted room '{room}'"))
+        }
         "parler_join_requests" => {
             let room = s("room")
                 .or_else(|| state.active_session.clone())
@@ -1349,8 +1381,8 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
                 state.agent.send(target, vec![handoff.to_part()], mentions, None).await?;
             let whom = handoff.to.as_deref().unwrap_or("anyone in the room");
             Ok(format!(
-                "✓ handed off to {whom} in '{room}' (seq {seq}). They'll see a 'HANDOFF TO YOU' \
-                 banner on their next parler_recv (or sooner if they're long-polling with wait_secs)."
+                "✓ handed off to {whom} in '{room}' (seq {seq}). A live host hook / `parler work` \
+                 worker acts automatically; otherwise they'll see 'HANDOFF TO YOU' on parler_recv."
             ))
         }
         "parler_task" => {
@@ -2164,6 +2196,12 @@ fn tool_specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "parler_delete_room",
+            "Permanently delete a room you own. Defaults to the active session.",
+            json!({ "room": { "type": "string" } }),
+            &[],
+        ),
+        tool(
             "parler_join_requests",
             "List agents waiting for your approval to join a session you opened (defaults to active session). Each line carries the joiner's id for parler_approve_join / parler_deny_join.",
             json!({ "room": { "type": "string", "description": "the session room (defaults to your active session)" } }),
@@ -2232,7 +2270,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_send",
-            "Send text and return already-waiting replies. Defaults to active session; otherwise use one of room, to, service (broadcast), or role (anycast).",
+            "Send text and return already-waiting replies. Defaults to active session; otherwise use room, to, service (broadcast), or role (anycast). For a later reply use parler_recv wait_secs — don't poll.",
             json!({
                 "room": { "type": "string" },
                 "to": { "type": "string", "description": "a peer agent id or a directory name (resolved to a unique id)" },
@@ -2255,7 +2293,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_handoff",
-            "Hand the turn to another agent: posts a 'HANDOFF TO YOU' banner on their next parler_recv so they continue without a re-prompt. Defaults to active session; or room/to/service. `for`: address by agent name/role (omit = anyone). `bundle`: a code blob id from parler_push.",
+            "Assign work to another agent. A host hook or `parler work` executes it autonomously; otherwise their next recv says HANDOFF TO YOU. Defaults to active session or room/to/service. `for`: name/role; `bundle`: blob from parler_push.",
             json!({
                 "next": { "type": "string", "description": "the instruction for the next agent to act on" },
                 "summary": { "type": "string", "description": "recap of what you finished / current state, for context" },
@@ -2492,9 +2530,10 @@ mod tests {
     /// `parler_fetch` self-service (auto-find the latest shared file: `id` now optional, `name`/`room`
     /// params added so an agent asked to "fetch the file" needn't be handed a 64-char blob id) grew it
     /// ~300 B to ~13,237 — load-bearing schema, not description bloat (descriptions stayed under their
-    /// own ceiling); ceiling → 13,500 to restore headroom. `parler_attention` then made 28 tools;
-    /// its compact schema remains within that ceiling.
-    const TOOL_SPECS_BUDGET: usize = 13_500;
+    /// own ceiling); ceiling → 13,500 to restore headroom. `parler_attention` and the lean
+    /// owner-only `parler_delete_room` lifecycle tool bring the surface to 29 tools; 14,000 leaves
+    /// enough headroom for their load-bearing schemas without hiding a large description regression.
+    const TOOL_SPECS_BUDGET: usize = 14_000;
     /// Just the human-readable descriptions (the part the diet targets; schema scaffolding is
     /// load-bearing). Pre-diet 5,261 B → post-diet (P0.2) 4,304 B; P1.2 adds ~230 B of cheap-path
     /// steering (name-based `to`/`card`, compact discover/roster, `detail`) that earns its bytes.
@@ -2563,6 +2602,16 @@ mod tests {
         let terminal_b = identity_scope_key("/work/proj-a", Some("thread-b"));
         assert_eq!(terminal_a, terminal_a_again);
         assert_ne!(workspace_home(base, &terminal_a), workspace_home(base, &terminal_b));
+
+        // Conductor's workspace is already the process boundary. Ignore its automatic thread id so
+        // a Run-script `parler work` process (which has no CODEX_THREAD_ID) shares the interactive
+        // agent's identity; an explicit override remains available for advanced multi-agent use.
+        assert_eq!(scope_session(true, None, Some("thread-a".into())), None);
+        assert_eq!(
+            scope_session(true, Some("manual-split".into()), Some("thread-a".into())).as_deref(),
+            Some("manual-split")
+        );
+        assert_eq!(scope_session(false, None, Some("thread-a".into())).as_deref(), Some("thread-a"));
     }
 
     #[test]
@@ -3424,6 +3473,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_room_tool_defaults_to_active_session_and_clears_it() {
+        let hub = start_hub().await;
+        let mut alice = state(&hub, "alice").await;
+
+        open_session(&mut alice, Some("seed"), Some("cleanup".into()), None, None, false).await.unwrap();
+        let room = alice.active_session.clone().unwrap();
+        let out = call_session_tool(&mut alice, "parler_delete_room", &json!({})).await.unwrap();
+        assert!(out.contains("deleted room"));
+        assert!(alice.active_session.is_none());
+
+        let rooms = call_tool(&mut alice.agent, "parler_rooms", &json!({})).await.unwrap();
+        assert!(!rooms.contains(&room), "deleted room must disappear from parler_rooms: {rooms}");
+    }
+
+    #[tokio::test]
     async fn approval_session_gates_joiner_until_host_approves() {
         let hub = start_hub().await;
         let mut alice = state(&hub, "alice").await;
@@ -3791,6 +3855,7 @@ mod tests {
         assert!(out.contains("parler_open_session"));
         assert!(out.contains("parler_join_session"));
         assert!(out.contains("parler_close_session"));
+        assert!(out.contains("parler_delete_room"));
         // the open_session call ran and returned a key, and set the active session.
         assert!(out.contains("KEY: "));
         assert!(alice.active_session.is_some());

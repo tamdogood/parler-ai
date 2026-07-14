@@ -6,7 +6,7 @@ work was not — a task, once sent, had no state you could see. This adds a smal
 status** so a dispatcher (or a human watching a queue) knows where a unit of work stands, and so a
 finished task leaves a **verifiable receipt**.
 
-For a new autonomous queue, use `send --role <role>` and `work --role <role> --runner <command>`.
+For a new autonomous queue, use `send --role <role>` and `supervise --role <role> --runner <command>`.
 That adds a typed dispatch marker plus an atomic, renewable hub lease: only one fresh `idle` or
 `waiting` worker claims it, `working` workers are skipped, and an expired lease can be reclaimed after
 a crash. The status messages below remain the same signed room messages; the claim/complete frames
@@ -70,7 +70,7 @@ parler task done    --service code-review --task 42 \
 An autonomous version is one command on the worker and one on the dispatcher:
 
 ```bash
-parler work --role code-review --runner 'codex exec -'
+parler supervise --role code-review --runner 'codex exec -'
 parler send --role code-review "Review PR #42"
 ```
 
@@ -79,11 +79,47 @@ then publishes `done` or `failed` and completes the claim. See
 [autonomous-runtime.md](autonomous-runtime.md) for attention policy and lease behavior.
 
 **MCP** — `parler_task { status, task?, note?, result?, tokens?, elapsed_ms?, room?/to?/service? }`.
-Dispatch role-anycast work with `parler_send { role, text }`; the worker's local `parler work` process
+Dispatch role-anycast work with `parler_send { role, text }`; the worker's local `parler supervise` process
 owns the claim and emits the lifecycle receipts.
 With an open/joined session it defaults to that room, so a worker inside Claude Code / Codex / Cursor
 just calls `parler_task status="working"` and the room sees it. A `result` blob comes from a prior
 `parler_push` (a code bundle) or `parler_send_file` (any file).
+
+## Run the work automatically
+
+`parler task` is the status primitive; `parler work` is the long-lived executor that emits those
+statuses automatically:
+
+```bash
+# trusted room: only signed, addressed handoffs execute by default
+parler work --room release-audit --runner codex
+
+# service queue: require cryptographic sender ids unless you deliberately allow every signer
+parler work --service code-review --runner claude --allow-from <agentId>
+```
+
+The worker long-polls through the self-healing cursor, accepts only valid signed messages, starts one
+headless runner at a time in the current workspace, posts `working`, then posts a signed `done` or
+`failed` receipt and result. Turns are bounded by `--timeout-secs` (15 minutes by default) and a
+rolling `--max-per-hour` cap (20; `0` disables). `--once` handles one request and exits for a launchd
+or CI scheduler.
+
+Room mode is deliberately task-shaped: use `parler handoff --for <name-or-role> --next "…"`. In a
+trusted two-agent room, `--all-messages` also treats ordinary signed peer text as work. Lifecycle-only
+messages are never executable, so two all-message workers cannot recurse on each other's results.
+The first completed result carries one addressed return handoff; because that return also carries a
+terminal receipt, it is handled once and never bounced back again.
+
+For an intentional longer chain, the runner can end its response with one addressed
+`PARLER_HANDOFF {"to":"agent-or-role","next":"specific task","summary":"completed state"}` line.
+The daemon strips and validates the envelope, then posts it as the next signed handoff. Invalid or
+unaddressed envelopes stay ordinary text. This is the only result-shaped input that extends a chain;
+plain lifecycle/results remain non-executable.
+
+The cursor is committed only after the terminal result lands. That preserves at-least-once delivery
+if the worker crashes, but it also means a task whose model turn already caused an external side
+effect can run again; make those operations idempotent. Use one activation consumer per identity and
+room: do not run the Claude Stop hook and `parler work` against the same cursor at the same time.
 
 ## Receipts → directory telemetry (design)
 
@@ -101,9 +137,10 @@ depends only on the receipts this doc defines, which flow today.
 
 ## What it does *not* do (boundaries)
 
-- **`parler task` alone doesn't run the work.** It reports status; executing is still the worker/host
-  boundary. The optional `parler work` local supervisor watches a role queue or room, runs its explicit
-  runner, and posts these statuses automatically.
+- **`parler task` itself doesn't run work.** It only reports status. `parler work` creates a separate
+  headless Codex/Claude turn, while the optional `parler supervise` local supervisor watches a role
+  queue or room, runs its explicit runner, and posts these statuses automatically. Neither can force
+  an already-stopped interactive host chat to resume without that host's injection seam.
 - **It doesn't gate on the kind.** The hub relays `com.parler.task` like any part; authorization is
   plain room membership. A status update is only as trustworthy as its signature — verify it the same
   way you verify any message.

@@ -10,10 +10,12 @@ for a human to enter the other chat and press Enter.
 1. **Host-native injection.** A host integration with a wake seam can inject a normal next model
    turn. The Claude Stop hook is one adapter: it receives a policy-approved batch and emits the
    host's continuation response.
-2. **Optional local supervisor.** `parler work` is a separate local process with an explicit runner
+2. **Managed headless worker.** `parler work` is a separate local process that runs a bounded Codex
+   or Claude turn for each signed task.
+3. **Optional local supervisor.** `parler supervise` is a separate local process with an explicit runner
    command. It stays connected, receives work, runs the command, observes the child, and posts signed
    task updates. This is the portable fully autonomous option when a host has no injection API.
-3. **Manual pull.** `parler recv` and `parler_recv` remain valid for a human-directed conversation;
+4. **Manual pull.** `parler recv` and `parler_recv` remain valid for a human-directed conversation;
    they do not claim to wake an idle host.
 
 The hub stays out of process supervision. It persists messages, presence, role registrations, and
@@ -68,13 +70,13 @@ offer send/receive tools and use the local supervisor for continuous operation.
 
 ```bash
 # worker machine: register the role and start a local autonomous runner
-parler work --role code-review --runner 'codex exec -'
+parler supervise --role code-review --runner 'codex exec -'
 
 # dispatcher: send one typed, role-addressed request
 parler send --role code-review "Review the current diff for correctness and security."
 ```
 
-The request carries a signed `com.parler.dispatch` part. Each `parler work --role` worker reads the
+The request carries a signed `com.parler.dispatch` part. Each `parler supervise --role` worker reads the
 ready-role index and asks the hub to claim the request. The claim succeeds for one worker only when
 that worker has fresh `idle` or `waiting` presence; `working` workers do not receive new work. The
 winner renews a bounded lease, publishes `accepted` / `working` / `done` or `failed` task messages,
@@ -87,16 +89,17 @@ the task, so execution is deliberately at-least-once.
 
 ## Local supervisor scope
 
-`parler work` is opt-in. It does not infer a runner, install a daemon, or execute a command received
+`parler supervise` is opt-in. It does not infer a runner, install a daemon, or execute a command received
 from another agent. You provide `--runner`; only that locally authored command is passed to the shell.
 Peer task content travels through stdin and `PARLER_*` environment values, never shell interpolation.
 
 ```bash
-parler work --role deploy --runner './scripts/deploy-agent' --timeout-secs 900
-parler work --room team --runner 'codex exec -' --once
+parler supervise --role deploy --runner './scripts/deploy-agent' --timeout-secs 900
+parler supervise --room team --runner 'codex exec -' --once
 ```
 
-The room form is a self-coordinating **body agent**: it continuously receives policy-approved peer
+The room form is a self-coordinating **body agent**: it continuously receives validly signed,
+policy-approved peer
 messages from one joined room, runs the configured local agent, and posts the result back. The role
 form adds atomic claims. Output is capped, child streams are drained, leases are bounded, and a
 timed-out child is stopped and reported failed. Use your usual operating-system process manager when

@@ -48,8 +48,8 @@ way.
 | **Finding a peer** | Guess the channel, or a human wires the integration | A signed **directory** — search by name, role, skill, tag, status, then DM by id with no pairing |
 | **Recalling a fact** | Search returns messages; the agent re-reads threads to find the answer | `recall` is full-text (BM25, optional vector) and returns **only the matching rows**, not the history |
 | **Handing over work** | A code block of a diff, pasted as text, hopefully applied by hand | `push` ships a **git bundle** (content-addressed, tamper-evident) that `apply` imports into `refs/parler/*` — never your working tree |
-| **"You're up next"** | A human @-mentions the bot and hopes it notices | A structured **turn handoff** — the receiver's `recv` leads with a `🤝 HANDOFF TO YOU` banner, an instruction to act on |
-| **Dispatching to a worker** | No native many→one work queue; you build one | A role-addressed **anycast queue**: `work --role <role>` advertises an available worker, and `send --role <role>` is atomically claimed by one |
+| **"You're up next"** | A human @-mentions the bot and hopes it notices | A structured **turn handoff** — the receiver sees a `🤝 HANDOFF TO YOU` banner, then a host hook, `work`, or `supervise` can create the next model turn |
+| **Dispatching to a worker** | No native many→one work queue; you build one | A role-addressed **anycast queue**: `supervise --role <role>` advertises an available worker and `send --role <role>` is atomically claimed by one; `work --service <svc>` runs trusted service requests |
 | **Keeping it private** | It's on a SaaS in someone else's cloud; org admins + Slack see everything | `parler connect --local` binds a hub to loopback — **nothing leaves your machine** |
 | **Cost & limits** | Per-seat pricing, API rate limits, message-size caps, retention windows | One free Apache-2.0 binary you run yourself; the limits are the ones **you** set |
 

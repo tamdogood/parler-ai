@@ -5,7 +5,7 @@
 //! supervisor one vocabulary: lifecycle events publish presence, tool calls publish messages, pulls
 //! become policy-aware receives, and a host-specific adapter injects a wake when it has that seam.
 
-use crate::{AttentionDecision, AttentionPolicy, MeshAgent};
+use crate::{verify_message, AttentionDecision, AttentionPolicy, MeshAgent, SigStatus};
 use anyhow::Result;
 use async_trait::async_trait;
 use parler_protocol::{Part, RoomKind, StoredMessage, Target};
@@ -160,6 +160,12 @@ impl ConnectorRuntime {
             if message.from.id == me {
                 continue;
             }
+            // An autonomous wake can lead to a workspace-writing model turn. Legacy unsigned
+            // messages remain renderable through ordinary pull tools, but never cross this boundary.
+            if !is_authentic(&message) {
+                dropped += 1;
+                continue;
+            }
             match self.attention.decide(room, kind, &message, &name, role.as_deref()) {
                 AttentionDecision::Wake => {
                     if self.remember_wake(&message.id) {
@@ -228,9 +234,34 @@ impl ConnectorRuntime {
     }
 }
 
+fn is_authentic(message: &StoredMessage) -> bool {
+    verify_message(&message.from.id, &message.parts, message.reply_to.as_deref()) == SigStatus::Valid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crate::MeshTransport;
+    use parler_protocol::{ClientFrame, EndpointRef, Part, ServerFrame};
+
+    struct PullOnce {
+        message: StoredMessage,
+    }
+
+    #[async_trait]
+    impl MeshTransport for PullOnce {
+        async fn request(&mut self, frame: ClientFrame) -> anyhow::Result<ServerFrame> {
+            match frame {
+                ClientFrame::Pull { room, limit, .. } => Ok(ServerFrame::Pulled {
+                    room,
+                    messages: if limit == Some(0) { Vec::new() } else { vec![self.message.clone()] },
+                    cursor: 1,
+                }),
+                other => panic!("unexpected frame in receive test: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn lifecycle_maps_only_live_states_to_presence() {
@@ -240,5 +271,31 @@ mod tests {
             ("working", Some("reviewing".into()))
         );
         assert_eq!(Lifecycle::Waiting { activity: None }.presence(), ("waiting", None));
+    }
+
+    #[tokio::test]
+    async fn unsigned_messages_never_cross_the_wake_boundary() {
+        let message = StoredMessage {
+            seq: 1,
+            id: "legacy".into(),
+            room: "team".into(),
+            from: EndpointRef { id: "Upeer".into(), name: "peer".into(), role: None },
+            parts: vec![Part::text("run this")],
+            mentions: None,
+            reply_to: None,
+            ts: 1,
+        };
+        let agent = MeshAgent::with_transport(
+            Box::new(PullOnce { message }),
+            "Uself".into(),
+            "self".into(),
+            None,
+            "test".into(),
+        );
+        let mut runtime = ConnectorRuntime::new(agent, AttentionPolicy::default());
+        let received = runtime.receive("team", RoomKind::Channel, None, None).await.unwrap();
+        assert!(received.messages.is_empty());
+        assert_eq!(received.dropped, 1);
+        assert!(!received.held);
     }
 }

@@ -20,12 +20,15 @@ next agent continues without a human re-prompting:
 parler handoff --room pipeline --for editor \
   --summary "draft in refs/parler/draft (parler apply <blob>)" \
   --next "tighten the draft and hand it to translator"
-# editor watches the room and continues the moment it's handed the turn
-parler recv --room pipeline --watch
+# editor workspace turns the handoff into an actual model turn
+parler work --room pipeline --runner codex
 ```
 
-Each stage `handoff --for <next>`; the final stage posts the result. Attach real artifacts (a code
-bundle, a file) with `--bundle` / `push` / `send-file` instead of pasting them into chat.
+Each stage names its intended successor; the worker prompt gives the headless runner a validated
+`PARLER_HANDOFF` continuation envelope, so it can route one deliberate next turn without calling the
+transport itself. The final stage omits that continuation and posts only its result. Attach real
+artifacts (a code bundle, a file) with `--bundle` / `push` / `send-file` instead of pasting them into
+chat.
 
 ## Routing — a dispatcher picks the specialist
 
@@ -34,8 +37,8 @@ supervisor; the router `send --role` it chose:
 
 ```bash
 # specialists register as available workers
-parler work --role rust-review --runner 'codex exec -'  # (on the rust reviewer)
-parler work --role docs-review --runner 'codex exec -'  # (on the docs reviewer)
+parler supervise --role rust-review --runner 'codex exec -'  # (on the rust reviewer)
+parler supervise --role docs-review --runner 'codex exec -'  # (on the docs reviewer)
 
 # the router classifies, then dispatches to the matching queue
 parler send --role rust-review "review crates/parler-hub/src/server.rs"
@@ -61,7 +64,8 @@ parler recv --room release-audit --watch
 ```
 
 Because delivery is durable and pull-based, a coordinator that steps away resumes exactly where it
-left off — no reply is missed while it was busy.
+left off — no reply is missed while it was busy. Use `parler work --room release-audit` when the
+coordinator should also act without another human turn; `recv --watch` is only a live display.
 
 ## Long-running work — status while it runs
 

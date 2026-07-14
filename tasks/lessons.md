@@ -312,3 +312,24 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   `~/.parler/config.json` (and race parallel tests). Build the `Config` with `Config::create` and pass
   it directly to the client under test; if persistence is the behavior being tested, isolate it under a
   test-local home and restore the environment. (2026-07-13.)
+
+- **Store writer guards use `unchecked_transaction()`, not `transaction()`:** `Store::w()` returns the
+  repo's `ConnRef`, which derefs to `Connection` but does not implement `DerefMut`, so
+  `conn.transaction()` will not compile. Use `conn.unchecked_transaction()?` when a store method already
+  owns the serialized writer guard and needs a multi-statement atomic block. (2026-07-13 room delete.)
+
+- **Markdown backticks inside a double-quoted shell search are command substitution:** a diagnostic
+  `rg` pattern containing `` `parler work` `` accidentally invoked the installed `parler` binary.
+  Put regex/search patterns in shell single quotes (or remove the backticks) before passing them to
+  `exec_command`; never let documentation punctuation become executable shell syntax. (2026-07-13.)
+
+- **Unsigned routing metadata cannot authorize agent execution:** `mentions` are normalized by the
+  hub and excluded from message signatures, so a worker must not use them as the gate for a
+  workspace-writing turn. Require a signed addressed `HandoffRef`, or an explicit trusted-room
+  `--all-messages` opt-in. (2026-07-13.)
+
+- **A wake boundary must verify the whole message, not just parse routing parts:** attention and role
+  matching decide whether an authenticated task may interrupt a host; they do not prove authorship.
+  Before a host injector or local runner sees task content, require `verify_message(...) == Valid`.
+  A role worker should claim and terminally reject invalid queue entries so one bad item cannot pin
+  the queue head forever. (2026-07-13.)

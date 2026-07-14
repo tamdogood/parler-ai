@@ -17,7 +17,7 @@ The delivery patterns are all just **rooms** with different membership shapes:
 | **1:many** | a channel room with N members | `send --room team` |
 | **1:1** | a 2-member DM room | `send --to <agentId>` |
 | **many:1 legacy** | a broadcast service room many publishers share with worker(s) | `serve <svc>` + `send --service <svc>` |
-| **role anycast** | one fresh available worker atomically claims typed role work | `work --role <role> --runner <command>` + `send --role <role>` |
+| **role anycast** | one fresh available worker atomically claims typed role work | `supervise --role <role> --runner <command>` + `send --role <role>` |
 
 ## Build
 
@@ -250,9 +250,8 @@ push path — no new frame, no hub change.
 
 The recipient's side is what makes it *autonomous*: when a handoff addressed to them lands, the MCP
 `parler_recv` / `parler_send` result is prefixed with a **`🤝 HANDOFF TO YOU`** banner — an explicit
-instruction to act on now, not a transcript line to skim. Combine it with the long-poll wakeup
-(`recv --watch` / `parler_recv wait_secs`, the sub-second push from #37) and you get a worker that
-continues the moment it's handed the turn:
+instruction to act on now, not a transcript line to skim. Combine it with the activation worker
+below and it continues the moment it's handed the turn:
 
 ```bash
 # alice finishes her part and hands the turn to the webdev agent (optionally attaching code)
@@ -260,23 +259,18 @@ parler handoff --room team --for webdev \
   --summary "design direction locked, see seed message" \
   --next "build the page structure from the design"
 
-# bob, running as a worker: stream the room and act on each handoff as it lands
-parler recv --room team --watch
-#   …prints "🤝 handoff → webdev: build the page structure …" the instant alice hands off
+# bob's workspace: turn each addressed handoff into a real Codex turn
+parler work --room team --runner codex
+#   …posts working, runs the task, then posts a signed done/failed result
 ```
 
-The honest boundary: "bob continues with zero prompting in his *own separate chat*" needs a host
-injection seam. Parler Protocol delivers the handoff instantly and carries the intent; where that seam
-does not exist, run an explicit local body agent instead:
-
-```bash
-parler work --room team --runner 'codex exec -'
-```
-
-It continuously receives policy-approved peer messages and runs only that local command, so no human
-has to enter the other chat. Attention modes (`open` / `dnd` / `focus`, quiet/muted rooms) decide what
-may interrupt it. The full argument for why this is the hard part of agent communication, with the
-`HandoffRef` type and the banner, is in
+The honest boundary: resuming Bob's *already-stopped interactive chat* still needs that host to expose
+turn injection. Claude Code has a Stop hook, and another host can implement the same connector wake
+contract. Otherwise `parler work` closes the loop with a separate bounded headless Codex/Claude turn
+in Bob's workspace, while `parler supervise --room team --runner '<local-agent-command>'` runs an
+explicit attention-aware local body agent. `recv --watch` alone only prints; it never activates an
+LLM. The full argument for why this is the hard part of agent communication, with the `HandoffRef`
+type and the banner, is in
 [The hard part of agent communication is the next turn](https://www.parlerprotocol.com/blog/agent-communication-the-next-turn).
 See also [autonomous-runtime.md](autonomous-runtime.md).
 
@@ -286,7 +280,9 @@ See also [autonomous-runtime.md](autonomous-runtime.md).
   On connect the client proves ownership via a challenge-response signature. Agent-hosted commands
   subdivide this **per workspace/session** under `$PARLER_HOME/ws/<stable-hash>/config.json`, so an
   MCP process and a terminal-driven join cannot silently collapse every terminal onto the old flat
-  identity. The same scope re-derives the same identity across restarts. Set
+  identity. Conductor already isolates each workspace, so its interactive agent and Run-script
+  worker intentionally share the workspace scope; `PARLER_AGENT_SESSION` can split it further. The
+  same scope re-derives the same identity across restarts. Set
   `PARLER_SHARED_IDENTITY=1` to pin one identity across all workspaces instead.
 - Membership + the per-room **read cursor** live in the hub's SQLite. So reconnecting (new process,
   crash, machine reboot) **resumes from where you left off** — you never re-read old messages, and
@@ -307,25 +303,29 @@ See also [autonomous-runtime.md](autonomous-runtime.md).
 | `parler session requests --room R` / `session approve --room R <id>` / `session deny --room R <id>` | list pending joiners / admit one / reject one (owner only) |
 | `parler session watch --room R [--ttl]` | mint a read-only watch code to view the session from the website (owner only) |
 | `parler serve <svc>` | join a legacy broadcast service room as a worker |
-| `parler work --role R --runner CMD` / `parler work --room R --runner CMD` | optional local supervisor: atomically claim role work / continuously run a body agent for a room |
+| `parler supervise --role R --runner CMD` / `parler supervise --room R --runner CMD` | optional local supervisor: atomically claim role work / continuously run a body agent for a room |
 | `parler send (--room\|--to\|--service\|--role) <text>` | send (channel / DM / legacy service broadcast / role-addressed anycast) |
 | `parler handoff (--room\|--to\|--service) --next S [--summary S][--for WHO][--bundle ID]` | hand the turn to the next agent ("you're up next") |
 | `parler task <status> (--room\|--to\|--service) [--task ID][--note N][--result BLOB][--tokens N][--elapsed-ms N]` | report task status (accepted/working/awaiting/done/failed/cancelled); a terminal status is a signed receipt |
+| `parler work [--room R\|--service S] --runner <codex\|claude> [--all-messages][--allow-from ID\|--allow-any][--max-per-hour N][--timeout-secs N][--once]` | long-lived autonomous worker: wake, execute a bounded headless turn, post lifecycle + result |
 | `parler recv --room <r> [--since N\|--all][--limit][--watch]` | pull new messages (advances cursor); `--watch` long-polls/streams |
 | `parler attention [open\|dnd\|focus]` / `attention [quiet\|muted\|inherit] --room R` | set global or receiver-local interruption policy |
 | `parler remember [--key K][--room R] <text>` | write a fact (keyed = idempotent) |
 | `parler recall [--room R][--limit] <query>` | full-text recall |
 | `parler push (--room\|--to\|--service) [--base R][--summary S][--note N] [gitref]` | hand off code as a git bundle |
 | `parler fetch <blobId> [-o file]` / `parler apply <blobId>` | download / import a pushed bundle |
+| `parler delete-room --room R` | permanently delete a room you own and its room-scoped data |
 | `parler rooms` / `roster --room R` / `presence <s>` / `whoami` | introspection |
 
 ## MCP integration (Claude Code, Codex, …)
 
 `parler mcp` is a stdio MCP server exposing the same ops as `parler_*` tools
 (`parler_open_session`, `parler_join_session`, `parler_close_session`, `parler_join_requests`,
-`parler_approve_join`, `parler_deny_join`, `parler_watch_session`, `parler_bring`, `parler_invite`, `parler_join`,
-`parler_send`, `parler_recv`, `parler_handoff`, `parler_push`, `parler_fetch`, `parler_remember`, `parler_recall`,
-`parler_rooms`, `parler_roster`, `parler_serve`, `parler_presence`, `parler_attention`). It self-bootstraps an identity on first launch,
+`parler_delete_room`, `parler_approve_join`, `parler_deny_join`, `parler_watch_session`,
+`parler_register`, `parler_discover`, `parler_card`, `parler_send`, `parler_recv`, `parler_handoff`,
+`parler_task`, `parler_bring`, `parler_push`, `parler_send_file`, `parler_fetch`, `parler_apply`,
+`parler_invite`, `parler_join`, `parler_serve`, `parler_remember`, `parler_recall`, `parler_rooms`,
+`parler_roster`, `parler_presence`, `parler_attention`). It self-bootstraps an identity on first launch,
 so setup is just wiring the server — no `parler init`, no pasted codes.
 
 **The easy way — wire every agent at once** (the single source of truth; the desktop app runs this too):
@@ -385,20 +385,26 @@ gated on an active session, so ordinary solo turns pay nothing. Opt out with `pa
 --no-hooks`; remove it with `parler connect --remove`.
 
 Other MCP hosts may have no `Stop` hook. If they expose their own turn-injection API, implement the
-same connector wake contract. Otherwise prefer `parler work --room team --runner '<local-agent-command>'`
-for a real autonomous body agent; the old `--watch` script below only prints a notification and cannot
-make an arbitrary host start a model turn:
+same connector wake contract. Otherwise use the built-in worker (a managed headless turn) or the
+explicit `parler supervise --room team --runner '<local-agent-command>'`; a terminal watch only prints
+a notification and cannot make an already-stopped chat start a model turn:
 
 ```bash
-#!/usr/bin/env bash
-# .claude/hooks/parler-wake.sh  — only for non–Claude Code hosts. `--watch` blocks until a peer posts
-# (sub-second via push), so the turn resumes the instant there's something to read.
-out=$(timeout 30 parler recv --room team --watch 2>/dev/null | head -c 4000)
-case "$out" in
-  ?*) printf '{"decision":"block","reason":%s}\n' \
-        "$(printf 'New messages on the mesh:\n%s' "$out" | jq -Rs .)" ;;
-esac
+parler work --room team --runner codex
+# only in a trusted two-agent room where every ordinary text message is a task:
+parler work --room team --runner codex --all-messages
 ```
+
+The worker requires valid message signatures, supports `--allow-from <agent-id>`, defaults to 20
+turns/hour, and never executes lifecycle-only result messages. On success it returns one addressed
+handoff to the requester; because that return already carries a terminal task receipt, the next
+worker handles it once and does not bounce it back. Use `recv --watch` when you only want a live
+terminal display. A request is acknowledged only after its terminal result is posted, so a crash can
+redeliver it; make external side effects idempotent. Do not run the Claude Stop hook and a worker as
+two consumers of the same identity/room cursor. The runner prompt also defines an addressed
+`PARLER_HANDOFF {…}` final-line envelope for cases where a different specialist truly owns the next
+step. The daemon removes, validates, and signs that continuation; malformed or unaddressed envelopes
+remain inert result text.
 
 ## Architecture / crates
 
