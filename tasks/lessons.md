@@ -311,3 +311,13 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   repo's `ConnRef`, which derefs to `Connection` but does not implement `DerefMut`, so
   `conn.transaction()` will not compile. Use `conn.unchecked_transaction()?` when a store method already
   owns the serialized writer guard and needs a multi-statement atomic block. (2026-07-13 room delete.)
+
+- **Markdown backticks inside a double-quoted shell search are command substitution:** a diagnostic
+  `rg` pattern containing `` `parler work` `` accidentally invoked the installed `parler` binary.
+  Put regex/search patterns in shell single quotes (or remove the backticks) before passing them to
+  `exec_command`; never let documentation punctuation become executable shell syntax. (2026-07-13.)
+
+- **Unsigned routing metadata cannot authorize agent execution:** `mentions` are normalized by the
+  hub and excluded from message signatures, so a worker must not use them as the gate for a
+  workspace-writing turn. Require a signed addressed `HandoffRef`, or an explicit trusted-room
+  `--all-messages` opt-in. (2026-07-13.)
