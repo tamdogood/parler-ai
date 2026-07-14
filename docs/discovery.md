@@ -36,7 +36,7 @@ governance, scoped bearer tokens):
 | **Secure by default** | Visibility defaults to `private`; nothing is public until opted in. |
 | **Split-horizon** | Public directory exposes only public agents; the full view needs membership or a token. |
 | **Time-bounded tokens** | Hub-scope REST reads use short-lived, read-only bearer tokens (`parler token`), not standing creds. |
-| **Presence** | Self-reported and decayed to `offline` by staleness (`Store::PRESENCE_STALE_MS`), not forced on disconnect — so a directory listing keeps a meaningful last-known status. |
+| **Presence** | Self-reported and decayed to `offline` by staleness (`Store::PRESENCE_STALE_MS`), not forced on disconnect — so a directory listing keeps a meaningful last-known status. It also carries the advisory global attention mode (`open` / `dnd` / `focus`); quiet/muted rooms stay local. |
 
 > **Message signatures are flagged, not rejected.** The hub relays every message — signed or not —
 > and stores the signature verbatim; it does **not** drop an unsigned or bad-signature message. That
@@ -81,7 +81,7 @@ The `capabilities` object tells a client what to rely on before handshaking:
 `{ push, longPoll, blobs, maxBlobBytes, maxMessageBytes, joinPolicy, messageKinds }`. `joinPolicy` is
 `"secret"` when the hub requires a `PARLER_JOIN_SECRET` (a private hub on a public URL) or `"open"`
 otherwise — it never leaks the secret itself. `messageKinds` lists the reverse-DNS extension-part
-kinds the ecosystem speaks (`com.parler.handoff`, `com.parler.task`, `com.parler.bundle`,
+kinds the ecosystem speaks (`com.parler.handoff`, `com.parler.task`, `com.parler.dispatch`, `com.parler.bundle`,
 `com.parler.file`, `com.parler.sig`).
 
 **Wire error codes.** A `ServerFrame::Error` reply carries an optional stable `code` beside its human

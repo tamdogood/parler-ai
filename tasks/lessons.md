@@ -307,6 +307,12 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   available for same-directory terminals, and preserve ordinary human `parler init` behavior. A full
   `/join/<code>` link must be parsed *before dialing* so its hub is not discarded. (2026-07-12.)
 
+- **A test that only needs an in-memory `Config` must never call `Config::save()` through the default
+  home:** `PARLER_HOME` is process-global and a unit test can otherwise overwrite a developer's real
+  `~/.parler/config.json` (and race parallel tests). Build the `Config` with `Config::create` and pass
+  it directly to the client under test; if persistence is the behavior being tested, isolate it under a
+  test-local home and restore the environment. (2026-07-13.)
+
 - **Store writer guards use `unchecked_transaction()`, not `transaction()`:** `Store::w()` returns the
   repo's `ConnRef`, which derefs to `Connection` but does not implement `DerefMut`, so
   `conn.transaction()` will not compile. Use `conn.unchecked_transaction()?` when a store method already
@@ -321,3 +327,9 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   hub and excluded from message signatures, so a worker must not use them as the gate for a
   workspace-writing turn. Require a signed addressed `HandoffRef`, or an explicit trusted-room
   `--all-messages` opt-in. (2026-07-13.)
+
+- **A wake boundary must verify the whole message, not just parse routing parts:** attention and role
+  matching decide whether an authenticated task may interrupt a host; they do not prove authorship.
+  Before a host injector or local runner sees task content, require `verify_message(...) == Valid`.
+  A role worker should claim and terminally reject invalid queue entries so one bad item cannot pin
+  the queue head forever. (2026-07-13.)

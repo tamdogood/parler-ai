@@ -10,13 +10,14 @@ low-cost, low-ops: one small hub binary + an embedded SQLite store. No external 
      Hermes    ┘   the parler_* tools       └── SQLite memory (message log + FTS recall)
 ```
 
-The three delivery patterns are all just **rooms** with different membership shapes:
+The delivery patterns are all just **rooms** with different membership shapes:
 
 | Pattern | How | CLI |
 |---|---|---|
 | **1:many** | a channel room with N members | `send --room team` |
 | **1:1** | a 2-member DM room | `send --to <agentId>` |
-| **many:1** | a service room many publishers share with the worker(s) | `serve <svc>` + `send --service <svc>` |
+| **many:1 legacy** | a broadcast service room many publishers share with worker(s) | `serve <svc>` + `send --service <svc>` |
+| **role anycast** | one fresh available worker atomically claims typed role work | `supervise --role <role> --runner <command>` + `send --role <role>` |
 
 ## Build
 
@@ -264,12 +265,14 @@ parler work --room team --runner codex
 ```
 
 The honest boundary: resuming Bob's *already-stopped interactive chat* still needs that host to expose
-turn injection. Claude Code has a Stop hook; Codex/Conductor currently does not. `parler work` closes
-the loop without pretending otherwise: it owns a separate, bounded headless Codex/Claude turn in
-Bob's workspace, executes only signed addressed handoffs by default, and posts the result plus one
-structured return turn. `recv --watch` alone only prints; it never activates an LLM. The full argument
-for why this is the hard part of agent communication, with the `HandoffRef` type and the banner, is in
+turn injection. Claude Code has a Stop hook, and another host can implement the same connector wake
+contract. Otherwise `parler work` closes the loop with a separate bounded headless Codex/Claude turn
+in Bob's workspace, while `parler supervise --room team --runner '<local-agent-command>'` runs an
+explicit attention-aware local body agent. `recv --watch` alone only prints; it never activates an
+LLM. The full argument for why this is the hard part of agent communication, with the `HandoffRef`
+type and the banner, is in
 [The hard part of agent communication is the next turn](https://www.parlerprotocol.com/blog/agent-communication-the-next-turn).
+See also [autonomous-runtime.md](autonomous-runtime.md).
 
 ## How "keep the connection going" works
 
@@ -299,12 +302,14 @@ for why this is the hard part of agent communication, with the `HandoffRef` type
 | `parler session open [--context C][--topic T][--no-approval][--ttl][--max-uses]` / `session join <key\|link> [--once]` | open a shared session (prints a key + portable link; approval-gated by default) / join one on the link's hub (prints context, then stays connected; `--once` exits after printing) |
 | `parler session requests --room R` / `session approve --room R <id>` / `session deny --room R <id>` | list pending joiners / admit one / reject one (owner only) |
 | `parler session watch --room R [--ttl]` | mint a read-only watch code to view the session from the website (owner only) |
-| `parler serve <svc>` | join a service queue as a worker |
-| `parler send (--room\|--to\|--service) <text>` | send (1:many / 1:1 / many:1) |
+| `parler serve <svc>` | join a legacy broadcast service room as a worker |
+| `parler supervise --role R --runner CMD` / `parler supervise --room R --runner CMD` | optional local supervisor: atomically claim role work / continuously run a body agent for a room |
+| `parler send (--room\|--to\|--service\|--role) <text>` | send (channel / DM / legacy service broadcast / role-addressed anycast) |
 | `parler handoff (--room\|--to\|--service) --next S [--summary S][--for WHO][--bundle ID]` | hand the turn to the next agent ("you're up next") |
 | `parler task <status> (--room\|--to\|--service) [--task ID][--note N][--result BLOB][--tokens N][--elapsed-ms N]` | report task status (accepted/working/awaiting/done/failed/cancelled); a terminal status is a signed receipt |
 | `parler work [--room R\|--service S] --runner <codex\|claude> [--all-messages][--allow-from ID\|--allow-any][--max-per-hour N][--timeout-secs N][--once]` | long-lived autonomous worker: wake, execute a bounded headless turn, post lifecycle + result |
 | `parler recv --room <r> [--since N\|--all][--limit][--watch]` | pull new messages (advances cursor); `--watch` long-polls/streams |
+| `parler attention [open\|dnd\|focus]` / `attention [quiet\|muted\|inherit] --room R` | set global or receiver-local interruption policy |
 | `parler remember [--key K][--room R] <text>` | write a fact (keyed = idempotent) |
 | `parler recall [--room R][--limit] <query>` | full-text recall |
 | `parler push (--room\|--to\|--service) [--base R][--summary S][--note N] [gitref]` | hand off code as a git bundle |
@@ -320,7 +325,7 @@ for why this is the hard part of agent communication, with the `HandoffRef` type
 `parler_register`, `parler_discover`, `parler_card`, `parler_send`, `parler_recv`, `parler_handoff`,
 `parler_task`, `parler_bring`, `parler_push`, `parler_send_file`, `parler_fetch`, `parler_apply`,
 `parler_invite`, `parler_join`, `parler_serve`, `parler_remember`, `parler_recall`, `parler_rooms`,
-`parler_roster`, `parler_presence`). It self-bootstraps an identity on first launch,
+`parler_roster`, `parler_presence`, `parler_attention`). It self-bootstraps an identity on first launch,
 so setup is just wiring the server — no `parler init`, no pasted codes.
 
 **The easy way — wire every agent at once** (the single source of truth; the desktop app runs this too):
@@ -373,14 +378,16 @@ the durable cursor (you still `Pull` to read+advance, which also dedups).
 In Claude Code this is **automatic**: `parler connect` installs a `Stop` hook (`parler hook stop`)
 into `~/.claude/settings.json`, so agents in a session poll for each other and continue on their own
 — nobody runs `parler recv`. On a turn's end the hook blocks up to `PARLER_WAKE_WAIT_SECS` (default
-30) for a peer's message (sub-second via push), advances the durable cursor, and hands the message
-back as `{"decision":"block","reason":…}` so the turn resumes; a quiet timeout lets the turn end. It's
+30) for a peer's message (sub-second via push), applies the receiver's attention policy, and hands an
+eligible message back as `{"decision":"block","reason":…}` so the turn resumes; a held quiet/focus
+batch remains durable for later. A quiet timeout lets the turn end. It's
 gated on an active session, so ordinary solo turns pay nothing. Opt out with `parler connect
 --no-hooks`; remove it with `parler connect --remove`.
 
-Other MCP hosts have no `Stop` hook. Use the built-in worker instead (a managed headless turn,
-because a terminal watch cannot inject into an
-already-stopped chat):
+Other MCP hosts may have no `Stop` hook. If they expose their own turn-injection API, implement the
+same connector wake contract. Otherwise use the built-in worker (a managed headless turn) or the
+explicit `parler supervise --room team --runner '<local-agent-command>'`; a terminal watch only prints
+a notification and cannot make an already-stopped chat start a model turn:
 
 ```bash
 parler work --room team --runner codex

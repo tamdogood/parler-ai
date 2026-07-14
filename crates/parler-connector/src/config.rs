@@ -4,6 +4,7 @@
 //! it holds the nkey **seed** (the private half of the identity), which never goes on the wire.
 
 use anyhow::{Context, Result};
+use crate::AttentionPolicy;
 use parler_auth::{new_identity, Identity};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ struct ConfigFile {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     role: Option<String>,
+    #[serde(default)]
+    attention: AttentionPolicy,
 }
 
 // `seed` is private key material — keep it out of any `{:?}` / log line (mirrors `Identity`'s Debug).
@@ -27,6 +30,7 @@ impl std::fmt::Debug for ConfigFile {
             .field("seed", &"<redacted>")
             .field("name", &self.name)
             .field("role", &self.role)
+            .field("attention", &self.attention)
             .finish()
     }
 }
@@ -38,6 +42,8 @@ pub struct Config {
     pub identity: Identity,
     pub name: String,
     pub role: Option<String>,
+    /// Local, receiver-enforced interruption policy. Older config files deserialize to open mode.
+    pub attention: AttentionPolicy,
 }
 
 /// The Parler Protocol home directory: `$PARLER_HOME`, else `~/.parler`.
@@ -79,6 +85,7 @@ impl Config {
             identity: new_identity()?,
             name: name.into(),
             role,
+            attention: AttentionPolicy::default(),
         })
     }
 
@@ -94,6 +101,7 @@ impl Config {
             identity: Identity { id: f.id, seed: f.seed },
             name: f.name,
             role: f.role,
+            attention: f.attention,
         })
     }
 
@@ -110,6 +118,7 @@ impl Config {
             seed: self.identity.seed.clone(),
             name: self.name.clone(),
             role: self.role.clone(),
+            attention: self.attention.clone(),
         };
         let path = config_path();
         let body = serde_json::to_string_pretty(&f)?;

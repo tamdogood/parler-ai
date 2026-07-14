@@ -54,6 +54,40 @@ pub enum Visibility {
     Private,
 }
 
+/// How readily an agent wants inbound mesh traffic to interrupt its current work. This is advisory
+/// presence metadata: the receiver enforces the policy locally, while the hub keeps delivering
+/// durably according to room membership and cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Attention {
+    /// Ambient room traffic may wake the agent.
+    #[default]
+    Open,
+    /// Hold ambient room traffic; direct messages, addressed handoffs, and assigned work may wake it.
+    Dnd,
+    /// Hold everything except explicitly addressed handoffs and assigned role work.
+    Focus,
+}
+
+impl Attention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Attention::Open => "open",
+            Attention::Dnd => "dnd",
+            Attention::Focus => "focus",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "open" => Some(Attention::Open),
+            "dnd" => Some(Attention::Dnd),
+            "focus" => Some(Attention::Focus),
+            _ => None,
+        }
+    }
+}
+
 impl Visibility {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -96,6 +130,9 @@ pub struct DirectoryEntry {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// Receiver-side interruption preference, mirrored into presence for peers to observe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<Attention>,
     /// The hub (workspace) this agent registered in.
     pub hub: String,
     /// Whether the hub verified `sig` against `card.id` at registration.
@@ -188,6 +225,12 @@ pub struct RosterEntry {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// Receiver-side interruption preference, mirrored into presence for peers to observe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<Attention>,
+    /// The role this member is actively serving in this service room, if any.
+    #[serde(default, rename = "serviceRole", skip_serializing_if = "Option::is_none")]
+    pub service_role: Option<String>,
     #[serde(rename = "lastSeen")]
     pub last_seen: i64,
 }
@@ -256,6 +299,33 @@ pub enum ClientFrame {
     },
     /// Join/create a service room as a worker, so `Send`/`Pull` on it are authorized.
     Serve { service: String },
+    /// Atomically claim one role-dispatched message in a service room. Only a worker that has served
+    /// the room and is currently `idle`/`waiting` may claim it. Repeating a successful claim by the
+    /// same worker renews its lease; another worker may take it after the lease expires.
+    Claim {
+        room: String,
+        message: String,
+        #[serde(default, rename = "leaseSecs", skip_serializing_if = "Option::is_none")]
+        lease_secs: Option<u64>,
+    },
+    /// List unclaimed (or expired) role-addressed work for a service worker. This is deliberately a
+    /// queue read rather than a room cursor read: a worker that crashes after claiming work must be
+    /// able to discover the expired lease after it reconnects, even though it already pulled the
+    /// service room's broadcast log.
+    Queue {
+        room: String,
+        role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Mark a claim terminal after the local worker has published its signed task receipt. Only the
+    /// current claim owner may complete it; an expired claim that another worker took cannot be
+    /// completed by the old worker.
+    Complete {
+        room: String,
+        message: String,
+        status: TaskStatus,
+    },
     /// Publish (or refresh) this agent's directory card. `card.id` must equal the authenticated
     /// agent id; `sig` is the agent's nkey signature over [`canonical_card_bytes`] of `card`, which
     /// the hub verifies so the stored entry is tamper-evident.
@@ -388,7 +458,12 @@ pub enum ClientFrame {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention: Option<Attention>,
     },
+    /// Change the advisory global interruption mode without overwriting the host's current lifecycle
+    /// status/activity. Room-level quiet/muted overrides never leave the receiver.
+    SetAttention { attention: Attention },
     /// Reserve storage for a content-addressed blob (e.g. a git bundle) bound to the room that
     /// `target` resolves to. The hub checks membership + the size cap, replies
     /// [`ServerFrame::BlobReady`], and then expects the bytes as a **single binary frame**; once it
@@ -447,6 +522,28 @@ pub enum ServerFrame {
     Joined {
         room: String,
         kind: RoomKind,
+    },
+    /// The result of an atomic service-task claim. `claimed = false` means another available worker
+    /// already owns the live lease; it is a normal queue outcome, not an error.
+    Claimed {
+        room: String,
+        message: String,
+        claimed: bool,
+        #[serde(default, rename = "leaseUntil", skip_serializing_if = "Option::is_none")]
+        lease_until: Option<i64>,
+    },
+    /// Available role-addressed work returned to a registered service worker. This read never
+    /// changes the room cursor; [`ClientFrame::Claim`] is the routing decision.
+    Queued {
+        room: String,
+        messages: Vec<StoredMessage>,
+    },
+    /// Result of [`ClientFrame::Complete`]. `completed = false` means the caller no longer owned
+    /// the claim (normally because its lease expired and another worker took it).
+    Completed {
+        room: String,
+        message: String,
+        completed: bool,
     },
     /// A redeem of an approval-gated invite was recorded as a **pending request** — the room owner
     /// must approve before the caller is admitted. The caller is *not* a member yet (it cannot read
@@ -518,6 +615,7 @@ pub enum ServerFrame {
         entries: Vec<RosterEntry>,
     },
     PresenceOk,
+    AttentionOk,
     /// Storage reserved for a [`ClientFrame::PutBlob`] — send the bytes as one binary frame next.
     BlobReady {
         id: String,
@@ -722,6 +820,11 @@ pub const HANDOFF_KIND: &str = "com.parler.handoff";
 /// The reverse-DNS [`Part`] kind that carries a **task status update** — where a dispatched unit of
 /// work stands in its lifecycle. See [`TaskRef`].
 pub const TASK_KIND: &str = "com.parler.task";
+
+/// The reverse-DNS [`Part`] kind that marks a service-room message as role-addressed work. Legacy
+/// `--service` messages remain ordinary room broadcasts; a `DispatchRef` opts into the atomic
+/// anycast claim path used by `parler work --role`.
+pub const DISPATCH_KIND: &str = "com.parler.dispatch";
 
 /// A reference to a content-addressed artifact (a git bundle by default) carried inside a room
 /// message as a [`Part::Extension`] of kind [`BUNDLE_KIND`].
@@ -978,6 +1081,38 @@ impl HandoffRef {
     }
 }
 
+/// A role-addressed work request carried alongside the human-readable task parts in a service room.
+///
+/// The hub does not need to rewrite or interpret this extension: it persists it verbatim, while an
+/// available worker uses the separate [`ClientFrame::Claim`] operation to atomically own the stored
+/// message. This keeps the authored request signed end-to-end and makes the queue upgrade additive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchRef {
+    /// The role/service that should execute this request (for example `reviewer`).
+    pub role: String,
+}
+
+impl DispatchRef {
+    /// Encode as the `com.parler.dispatch` extension [`Part`].
+    pub fn to_part(&self) -> Part {
+        let fields = match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        Part::Extension { kind: DISPATCH_KIND.to_string(), fields }
+    }
+
+    /// Recover a role dispatch from one extension part.
+    pub fn from_part(part: &Part) -> Option<DispatchRef> {
+        match part {
+            Part::Extension { kind, fields } if kind == DISPATCH_KIND => {
+                serde_json::from_value(serde_json::Value::Object(fields.clone())).ok()
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Where a dispatched unit of work stands in its lifecycle.
 ///
 /// Borrowed from ACP's run state machine (`created → in-progress → awaiting → completed/failed/
@@ -1188,6 +1323,7 @@ mod tests {
             visibility: Visibility::Public,
             status: "working".into(),
             activity: Some("planning the sprint".into()),
+            attention: Some(Attention::Focus),
             hub: "Parler Protocol Public".into(),
             verified: true,
             sig: Some("AAAA".into()),

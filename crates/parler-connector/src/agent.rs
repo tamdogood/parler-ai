@@ -9,9 +9,9 @@ use anyhow::{bail, Result};
 use parler_auth::Identity;
 use parler_protocol::{
     canonical_card_bytes, canonical_message_bytes, is_message_sig_part, AgentCard, AgentSkill,
-    BundleRef, ClientFrame, DirectoryEntry, DiscoverScope, EndpointKind, Fact, FileRef, JoinRequest,
-    MessageSig, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, ServerFrame, StoredMessage, Target,
-    Visibility,
+    Attention, BundleRef, ClientFrame, DirectoryEntry, DiscoverScope, EndpointKind, Fact, FileRef,
+    JoinRequest, MessageSig, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, ServerFrame,
+    StoredMessage, Target, Visibility,
 };
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,10 @@ pub struct MeshAgent {
     /// trip. Only ever set to a `pending_ack` value we durably committed, so `committed >= pending`
     /// can only mean the hub's monotonic cursor is already at least there — never a lost commit.
     committed_ack: std::collections::HashMap<String, i64>,
+    /// Rooms whose pending cursor must not ride an ordinary subsequent pull yet. Attention-aware
+    /// runtimes set this while a batch is held or while a host wake is still being injected; the
+    /// high-water remains available for an explicit successful [`MeshAgent::commit_reads`].
+    held_reads: std::collections::HashSet<String>,
 }
 
 impl MeshAgent {
@@ -116,6 +120,7 @@ impl MeshAgent {
             subscribed: false,
             pending_ack: std::collections::HashMap::new(),
             committed_ack: std::collections::HashMap::new(),
+            held_reads: std::collections::HashSet::new(),
         })
     }
 
@@ -128,7 +133,18 @@ impl MeshAgent {
         role: Option<String>,
         hub_url: String,
     ) -> MeshAgent {
-        MeshAgent { transport, id, name, role, hub_url, identity: None, subscribed: false, pending_ack: std::collections::HashMap::new(), committed_ack: std::collections::HashMap::new() }
+        MeshAgent {
+            transport,
+            id,
+            name,
+            role,
+            hub_url,
+            identity: None,
+            subscribed: false,
+            pending_ack: std::collections::HashMap::new(),
+            committed_ack: std::collections::HashMap::new(),
+            held_reads: std::collections::HashSet::new(),
+        }
     }
 
     /// Like [`MeshAgent::with_transport`], but carries a real `identity` + `hub_url`, so the
@@ -153,6 +169,7 @@ impl MeshAgent {
             subscribed: false,
             pending_ack: std::collections::HashMap::new(),
             committed_ack: std::collections::HashMap::new(),
+            held_reads: std::collections::HashSet::new(),
         }
     }
 
@@ -289,6 +306,53 @@ impl MeshAgent {
         match self.request(ClientFrame::Serve { service: service.to_string() }).await? {
             ServerFrame::Joined { room, .. } => Ok(room),
             other => Err(crate::unexpected_reply("register as a worker", &other)),
+        }
+    }
+
+    /// Atomically claim one role-dispatched message in a service room. `Some(lease_until)` means
+    /// this worker owns (or renewed) the lease; `None` is the ordinary anycast outcome where another
+    /// available worker already owns it.
+    pub async fn claim(&mut self, room: &str, message: &str, lease_secs: Option<u64>) -> Result<Option<i64>> {
+        match self
+            .request(ClientFrame::Claim {
+                room: room.to_string(),
+                message: message.to_string(),
+                lease_secs,
+            })
+            .await?
+        {
+            ServerFrame::Claimed { claimed, lease_until, .. } => Ok(claimed.then_some(lease_until).flatten()),
+            other => Err(crate::unexpected_reply("claim the role task", &other)),
+        }
+    }
+
+    /// Read work that is ready for this served role without changing the ordinary room cursor. Queue
+    /// reads are separate from [`MeshAgent::pull`]: they include an expired lease a restarted worker
+    /// must discover even when its broadcast-room cursor already passed the request.
+    pub async fn queue(&mut self, room: &str, role: &str, limit: Option<u32>) -> Result<Vec<StoredMessage>> {
+        match self
+            .request(ClientFrame::Queue { room: room.to_string(), role: role.to_string(), limit })
+            .await?
+        {
+            ServerFrame::Queued { messages, .. } => Ok(messages),
+            other => Err(crate::unexpected_reply("read the role queue", &other)),
+        }
+    }
+
+    /// Mark this worker's live claim terminal. Returns `false` if the lease expired and another
+    /// worker already took the task, so a late child process cannot overwrite its successor's result.
+    pub async fn complete_claim(
+        &mut self,
+        room: &str,
+        message: &str,
+        status: parler_protocol::TaskStatus,
+    ) -> Result<bool> {
+        match self
+            .request(ClientFrame::Complete { room: room.to_string(), message: message.to_string(), status })
+            .await?
+        {
+            ServerFrame::Completed { completed, .. } => Ok(completed),
+            other => Err(crate::unexpected_reply("complete the role task", &other)),
         }
     }
 
@@ -472,7 +536,11 @@ impl MeshAgent {
     /// hub commits a batch only once we've acked it; a bare `Some(0)` on the first pull is a no-op
     /// advance (monotonic max) that still opts into no-advance-on-read.
     fn ack_for(&self, room: &str) -> Option<i64> {
-        Some(self.pending_ack.get(room).copied().unwrap_or(0))
+        Some(if self.held_reads.contains(room) {
+            0
+        } else {
+            self.pending_ack.get(room).copied().unwrap_or(0)
+        })
     }
 
     /// Record the cursor the hub reported for `room`, so the next pull acks up to it. On an empty pull
@@ -499,6 +567,7 @@ impl MeshAgent {
     pub async fn commit_reads(&mut self, room: &str) -> Result<()> {
         let pending = self.pending_ack.get(room).copied().unwrap_or(0);
         if pending == 0 || self.committed_ack.get(room).copied().unwrap_or(0) >= pending {
+            self.held_reads.remove(room);
             return Ok(());
         }
         match self
@@ -513,10 +582,18 @@ impl MeshAgent {
         {
             ServerFrame::Pulled { .. } => {
                 self.committed_ack.insert(room.to_string(), pending);
+                self.held_reads.remove(room);
                 Ok(())
             }
             other => Err(crate::unexpected_reply("commit reads", &other)),
         }
+    }
+
+    /// Keep the last pulled batch unacknowledged. Attention adapters call this for a quiet/focus
+    /// hold or while a host wake is in flight: subsequent pulls send `ack: 0`, deliberately re-read
+    /// the durable batch, and retain its high-water for an explicit successful [`MeshAgent::commit_reads`].
+    pub fn defer_reads(&mut self, room: &str) {
+        self.held_reads.insert(room.to_string());
     }
 
     /// Best-effort [`MeshAgent::commit_reads`] for every room with a pending ack — call on an exit path
@@ -524,7 +601,12 @@ impl MeshAgent {
     /// the process. Errors are swallowed: a missed commit just re-reads the last batch on the next
     /// start, the documented at-least-once behavior.
     pub async fn flush_acks(&mut self) {
-        let rooms: Vec<String> = self.pending_ack.keys().cloned().collect();
+        let rooms: Vec<String> = self
+            .pending_ack
+            .keys()
+            .filter(|room| !self.held_reads.contains(*room))
+            .cloned()
+            .collect();
         for room in rooms {
             let _ = self.commit_reads(&room).await;
         }
@@ -772,12 +854,32 @@ impl MeshAgent {
 
     /// Advertise presence (status + optional activity line).
     pub async fn presence(&mut self, status: &str, activity: Option<String>) -> Result<()> {
+        self.presence_with_attention(status, activity, None).await
+    }
+
+    /// Advertise lifecycle status plus the optional receiver-side attention mode peers may observe.
+    /// The policy is advisory metadata: it never changes membership or hub delivery guarantees.
+    pub async fn presence_with_attention(
+        &mut self,
+        status: &str,
+        activity: Option<String>,
+        attention: Option<Attention>,
+    ) -> Result<()> {
         match self
-            .request(ClientFrame::Presence { status: status.to_string(), activity })
+            .request(ClientFrame::Presence { status: status.to_string(), activity, attention })
             .await?
         {
             ServerFrame::PresenceOk => Ok(()),
             other => Err(crate::unexpected_reply("update presence", &other)),
+        }
+    }
+
+    /// Update the globally visible attention preference without replacing the host's current
+    /// lifecycle status or activity line.
+    pub async fn set_attention(&mut self, attention: Attention) -> Result<()> {
+        match self.request(ClientFrame::SetAttention { attention }).await? {
+            ServerFrame::AttentionOk => Ok(()),
+            other => Err(crate::unexpected_reply("update attention", &other)),
         }
     }
 
@@ -1049,6 +1151,7 @@ mod tests {
             identity: parler_auth::new_identity().unwrap(),
             name: "alice".into(),
             role: None,
+            attention: crate::AttentionPolicy::default(),
         })
         .await
         .unwrap();
@@ -1092,6 +1195,7 @@ mod tests {
             identity: parler_auth::new_identity().unwrap(),
             name: "alice".into(),
             role: None,
+            attention: crate::AttentionPolicy::default(),
         })
         .await
         .unwrap();

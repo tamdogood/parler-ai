@@ -1004,6 +1004,7 @@ mod tests {
             identity: parler_auth::new_identity().unwrap(),
             name: name.into(),
             role: None,
+            attention: Default::default(),
         };
         MeshAgent::connect(&cfg).await.unwrap()
     }

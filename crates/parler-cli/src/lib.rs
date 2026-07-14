@@ -9,13 +9,17 @@ pub mod connect;
 pub mod mcp;
 pub mod worker;
 pub(crate) mod names;
+pub mod work;
 
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use parler_connector::{verify_message, BundleMeta, Config, MeshAgent, SigStatus};
+use parler_connector::{
+    verify_message, BundleMeta, Config, ConnectorRuntime, HostWakeInjector, Lifecycle, MeshAgent,
+    RoomAttention, SigStatus, ToolSend, WakeRequest,
+};
 use parler_protocol::{
-    is_message_sig_part, AgentSkill, BundleRef, DirectoryEntry, DiscoverScope, FileRef, HandoffRef,
-    Part, RoomKind, StoredMessage, Target, TaskRef, TaskStatus, Visibility,
+    is_message_sig_part, AgentSkill, Attention, BundleRef, DirectoryEntry, DiscoverScope, DispatchRef,
+    FileRef, HandoffRef, Part, RoomKind, StoredMessage, Target, TaskRef, TaskStatus, Visibility,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -50,10 +54,12 @@ enum Cmd {
         /// The code (or full link) the other agent gave you.
         code: String,
     },
-    /// Join a service queue as a worker (many-to-one), then `recv` it for tasks.
+    /// Join a legacy broadcast service room as a worker, then `recv` it for tasks.
     Serve {
         service: String,
     },
+    /// Run an optional local supervisor that watches a room or role queue and spawns an explicit runner.
+    Supervise(SuperviseArgs),
     /// Open or join a shared live session — hand a key to another agent mid-conversation.
     #[command(subcommand)]
     Session(SessionCmd),
@@ -69,7 +75,7 @@ enum Cmd {
     },
     /// Mint a directory token to paste into the website to view this hub's private directory.
     Token(TokenArgs),
-    /// Send a message (one of --room / --to / --service).
+    /// Send a message (one of --room / --to / --service / --role).
     Send(SendArgs),
     /// Hand off the turn: post a structured "you're up next" so a watching agent continues.
     Handoff(HandoffArgs),
@@ -110,6 +116,8 @@ enum Cmd {
         #[arg(long)]
         activity: Option<String>,
     },
+    /// Set local interruption policy: open/dnd/focus globally, or quiet/muted/inherit for one room.
+    Attention(AttentionArgs),
     /// Print this agent's identity and hub.
     Whoami,
     /// Run the MCP server (stdio) exposing the parler_* tools to an MCP host.
@@ -363,6 +371,9 @@ struct SendArgs {
     /// Send to a service queue (many-to-one).
     #[arg(long)]
     service: Option<String>,
+    /// Send role-addressed anycast work. Exactly one available worker serving this role can claim it.
+    #[arg(long)]
+    role: Option<String>,
     /// The message text.
     #[arg(required = true, trailing_var_arg = true)]
     text: Vec<String>,
@@ -534,6 +545,40 @@ struct RecvArgs {
 }
 
 #[derive(Args)]
+struct SuperviseArgs {
+    /// Serve this role and atomically claim role-addressed work from its service queue.
+    #[arg(long)]
+    role: Option<String>,
+    /// Watch this already-joined room instead of a role queue (useful for a self-coordinating body agent).
+    #[arg(long)]
+    room: Option<String>,
+    /// Explicit local command to run for each accepted message. The rendered task is passed on stdin.
+    #[arg(long)]
+    runner: String,
+    /// Lease length for a role task; the supervisor renews it while the child runs (15–3600 seconds).
+    #[arg(long, default_value_t = 300)]
+    lease_secs: u64,
+    /// Maximum wall-clock seconds for one local runner before it is stopped and reported failed.
+    #[arg(long, default_value_t = 1800)]
+    timeout_secs: u64,
+    /// Exit after completing one task instead of supervising continuously.
+    #[arg(long)]
+    once: bool,
+    /// Maximum bytes retained from each child stdout/stderr stream (the child is still fully drained).
+    #[arg(long, default_value_t = 65_536)]
+    max_output_bytes: usize,
+}
+
+#[derive(Args)]
+struct AttentionArgs {
+    /// Global: open | dnd | focus. With --room: quiet | muted | inherit. Omit to show the policy.
+    mode: Option<String>,
+    /// Apply the room-local override to this room instead of changing the global mode.
+    #[arg(long)]
+    room: Option<String>,
+}
+
+#[derive(Args)]
 struct RememberArgs {
     /// A stable key — re-remembering the same key overwrites (idempotent).
     #[arg(long)]
@@ -617,6 +662,7 @@ pub async fn run() -> Result<()> {
         Cmd::Invite(a) => cmd_invite(a).await,
         Cmd::Join { code } => cmd_join(code).await,
         Cmd::Serve { service } => cmd_serve(service).await,
+        Cmd::Supervise(a) => cmd_supervise(a).await,
         Cmd::Session(c) => cmd_session(c).await,
         Cmd::Bring(a) => cmd_bring(a).await,
         Cmd::Register(a) => cmd_register(a).await,
@@ -638,6 +684,7 @@ pub async fn run() -> Result<()> {
         Cmd::DeleteRoom { room } => cmd_delete_room(room).await,
         Cmd::Roster { room } => cmd_roster(room).await,
         Cmd::Presence { status, activity } => cmd_presence(status, activity).await,
+        Cmd::Attention(a) => cmd_attention(a).await,
         Cmd::Whoami => cmd_whoami(),
         Cmd::Mcp => mcp::serve_stdio().await,
         Cmd::Doctor => cmd_doctor().await,
@@ -647,7 +694,7 @@ pub async fn run() -> Result<()> {
 }
 
 fn command_uses_workspace_identity(cmd: &Cmd, agent_shell: bool) -> bool {
-    matches!(cmd, Cmd::Mcp | Cmd::Work(_) | Cmd::Hook { .. })
+    matches!(cmd, Cmd::Mcp | Cmd::Supervise(_) | Cmd::Work(_) | Cmd::Hook { .. })
         || (agent_shell && !matches!(cmd, Cmd::Hub(_) | Cmd::Connect(_) | Cmd::Init(_) | Cmd::Doctor))
 }
 
@@ -1173,8 +1220,58 @@ async fn cmd_serve(service: String) -> Result<()> {
     let mut ag = connect().await?;
     let room = ag.serve(&service).await?;
     println!("✓ serving '{service}' (room '{room}')");
-    println!("  receive tasks with:  parler recv --room {room}");
+    println!("  legacy broadcast tasks:  parler recv --room {room}");
+    println!("  autonomous role worker: parler supervise --role {service} --runner '<your-agent-command>'");
     Ok(())
+}
+
+/// Start the optional local supervisor. The role form is a real anycast queue: it only runs a child
+/// after the hub grants an atomic claim; the room form is the useful "body agent" case that keeps one
+/// explicitly configured local runner listening to an ongoing session without a human pressing enter.
+async fn cmd_supervise(a: SuperviseArgs) -> Result<()> {
+    if a.role.is_some() == a.room.is_some() {
+        bail!("specify exactly one of --role (anycast queue) or --room (continuous body agent)");
+    }
+    if a.runner.trim().is_empty() {
+        bail!("--runner needs an explicit local command");
+    }
+    let policy = if Config::exists() { Config::load()?.attention } else { mcp::load_or_bootstrap_config()?.attention };
+    let ag = connect().await?;
+    let mut runtime = ConnectorRuntime::new(ag, policy);
+    let (room, kind, role) = match (a.role, a.room) {
+        (Some(role), None) => {
+            let role = role.trim().to_string();
+            if role.is_empty() {
+                bail!("--role needs a non-empty role name");
+            }
+            let room = runtime.agent_mut().serve(&role).await?;
+            (room, RoomKind::Service, Some(role))
+        }
+        (None, Some(room)) => {
+            let rooms = runtime.agent_mut().rooms().await?;
+            let kind = rooms
+                .iter()
+                .find(|entry| entry.name == room)
+                .map(|entry| entry.kind)
+                .ok_or_else(|| anyhow::anyhow!("not a member of room '{room}' — join it before starting a body agent"))?;
+            (room, kind, None)
+        }
+        _ => unreachable!("validated above"),
+    };
+    work::supervise(
+        &mut runtime,
+        work::WorkOptions {
+            room,
+            kind,
+            role,
+            runner: a.runner,
+            lease_secs: a.lease_secs.clamp(15, 3_600),
+            once: a.once,
+            timeout_secs: a.timeout_secs.max(1),
+            max_output_bytes: a.max_output_bytes,
+        },
+    )
+    .await
 }
 
 /// `parler bring <agent>` — run another AI agent on some context and hand back its review, no
@@ -1508,6 +1605,29 @@ fn target_from(room: Option<String>, to: Option<String>, service: Option<String>
     }
 }
 
+/// Resolve a normal send target plus the additive role-dispatch marker. `--service` intentionally
+/// preserves its historical broadcast behavior; only `--role` opts a request into atomic anycast.
+fn send_target_from(
+    room: Option<String>,
+    to: Option<String>,
+    service: Option<String>,
+    role: Option<String>,
+) -> Result<(Target, Option<String>)> {
+    match role {
+        Some(role) => {
+            let role = role.trim().to_string();
+            if role.is_empty() {
+                bail!("--role needs a non-empty role name");
+            }
+            if room.is_some() || to.is_some() || service.is_some() {
+                bail!("--role cannot be combined with --room, --to, or --service");
+            }
+            Ok((Target::Service { service: role.clone() }, Some(role)))
+        }
+        None => Ok((target_from(room, to, service)?, None)),
+    }
+}
+
 /// True when `s` parses as an nkey public key (an agent id); anything else is treated as a name.
 fn looks_like_agent_id(s: &str) -> bool {
     nkeys::KeyPair::from_public_key(s).is_ok()
@@ -1549,12 +1669,20 @@ pub(crate) async fn resolve_target(ag: &mut MeshAgent, target: Target) -> Result
 }
 
 async fn cmd_send(a: SendArgs) -> Result<()> {
-    let target = target_from(a.room, a.to, a.service)?;
+    let (target, role) = send_target_from(a.room, a.to, a.service, a.role)?;
     let text = a.text.join(" ");
     let mut ag = connect().await?;
     let target = resolve_target(&mut ag, target).await?;
-    let (_id, seq, room) = ag.send_text(target, &text).await?;
-    println!("✓ sent to '{room}' (seq {seq})");
+    let mut parts = vec![Part::Text(text)];
+    if let Some(role) = &role {
+        parts.push(DispatchRef { role: role.clone() }.to_part());
+    }
+    let (_id, seq, room) = ag.send(target, parts, None, None).await?;
+    if let Some(role) = role {
+        println!("✓ role-dispatched to '{role}' in '{room}' (seq {seq})");
+    } else {
+        println!("✓ sent to '{room}' (seq {seq})");
+    }
     Ok(())
 }
 
@@ -1857,7 +1985,9 @@ async fn cmd_roster(room: String) -> Result<()> {
     for e in &entries {
         let role = e.role.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
         let act = e.activity.as_deref().map(|a| format!(" — {a}")).unwrap_or_default();
-        println!("  {} {}{role}  [{}]{act}", e.name, e.id, e.status);
+        let attention = e.attention.map(|mode| format!(", {}", mode.as_str())).unwrap_or_default();
+        let serving = e.service_role.as_deref().map(|role| format!(" serving:{role}")).unwrap_or_default();
+        println!("  {} {}{role}  [{}{attention}]{serving}{act}", e.name, e.id, e.status);
     }
     Ok(())
 }
@@ -1866,6 +1996,61 @@ async fn cmd_presence(status: String, activity: Option<String>) -> Result<()> {
     let mut ag = connect().await?;
     ag.presence(&status, activity).await?;
     println!("✓ presence: {status}");
+    Ok(())
+}
+
+/// Persist the local interruption policy and immediately mirror only its global mode into presence.
+/// The hub never receives quiet/muted room names: those are a receiver-side attention boundary.
+async fn cmd_attention(a: AttentionArgs) -> Result<()> {
+    let mut cfg = if Config::exists() { Config::load()? } else { mcp::load_or_bootstrap_config()? };
+    let room_arg = a.room;
+    let mode_arg = a.mode;
+    match (room_arg.as_deref(), mode_arg.as_deref()) {
+        (None, None) => {
+            println!("global attention: {}", cfg.attention.mode.as_str());
+            let quiet = if cfg.attention.quiet_rooms.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.attention.quiet_rooms.join(", ")
+            };
+            let muted = if cfg.attention.muted_rooms.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.attention.muted_rooms.join(", ")
+            };
+            println!("quiet rooms: {quiet}");
+            println!("muted rooms: {muted}");
+            return Ok(());
+        }
+        (None, Some(mode)) => {
+            cfg.attention.mode = Attention::parse(mode).ok_or_else(|| {
+                anyhow::anyhow!("unknown global attention '{mode}' — use open, dnd, or focus")
+            })?;
+        }
+        (Some(room), Some(mode)) => {
+            if room.trim().is_empty() {
+                bail!("--room needs a room name");
+            }
+            let room_mode = RoomAttention::parse(mode).ok_or_else(|| {
+                anyhow::anyhow!("unknown room attention '{mode}' — use quiet, muted, or inherit")
+            })?;
+            cfg.attention.set_room(room.trim(), room_mode);
+        }
+        (Some(_), None) => bail!("with --room, specify quiet, muted, or inherit"),
+    }
+    let global = cfg.attention.mode;
+    cfg.save()?;
+    let mut ag = connect().await?;
+    ag.set_attention(global).await?;
+    if let Some(room) = room_arg {
+        println!(
+            "✓ room attention for '{room}' saved locally ({}); global presence remains {}",
+            mode_arg.unwrap_or_default(),
+            global.as_str()
+        );
+    } else {
+        println!("✓ global attention: {}", global.as_str());
+    }
     Ok(())
 }
 
@@ -1899,10 +2084,8 @@ fn render_entry(e: &DirectoryEntry) -> String {
         .as_deref()
         .map(|t| t.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
-    format!(
-        "● {}{role}  {}  [{}]  {}  {}",
-        e.card.name, e.card.id, vis, e.status, tags
-    )
+    let attention = e.attention.map(|mode| format!(", {}", mode.as_str())).unwrap_or_default();
+    format!("● {}{role}  {}  [{}]  {}{attention}  {}", e.card.name, e.card.id, vis, e.status, tags)
 }
 
 /// Multi-line directory card for `parler card <id>`.
@@ -1914,6 +2097,9 @@ fn render_entry_full(e: &DirectoryEntry) -> String {
         out.push_str(&format!("role:    {role}\n"));
     }
     out.push_str(&format!("hub:     {}\n", e.hub));
+    if let Some(attention) = e.attention {
+        out.push_str(&format!("attention: {}\n", attention.as_str()));
+    }
     out.push_str(&format!(
         "visible: {} ({})\n",
         e.visibility.as_str(),
@@ -2333,12 +2519,29 @@ async fn cmd_hook(kind: String) -> Result<()> {
     
     let data: serde_json::Value = serde_json::from_str(&stdin_buffer).unwrap_or(serde_json::Value::Null);
 
-    let mut ag = connect().await?;
+    let policy = Config::load().map(|cfg| cfg.attention).unwrap_or_default();
+    let ag = connect().await?;
+    let mut runtime = ConnectorRuntime::new(ag, policy);
+    let lifecycle = match kind.as_str() {
+        "session-start" | "SessionStart" => Lifecycle::Started,
+        "session-end" | "SessionEnd" => Lifecycle::Waiting { activity: Some("session ended".into()) },
+        "user-prompt-submit" | "UserPromptSubmit" | "prompt-submit" | "PromptSubmit" => {
+            Lifecycle::Working { activity: Some("responding to a prompt".into()) }
+        }
+        "post-tool-use" | "PostToolUse" | "post-tool-use-failure" | "PostToolUseFailure" => {
+            Lifecycle::Working { activity: Some("running tools".into()) }
+        }
+        _ => return Ok(()),
+    };
+    runtime.lifecycle(lifecycle).await?;
 
     let parts = match kind.as_str() {
         "session-start" | "SessionStart" => {
             let cwd = data.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-            vec![Part::Text(format!("🚀 Session started by agent {} in directory {cwd}", ag.name))]
+            vec![Part::Text(format!(
+                "🚀 Session started by agent {} in directory {cwd}",
+                runtime.agent().name
+            ))]
         }
         "session-end" | "SessionEnd" => {
             vec![Part::Text("👋 Session ended.".to_string())]
@@ -2404,7 +2607,14 @@ async fn cmd_hook(kind: String) -> Result<()> {
     };
 
     if !parts.is_empty() {
-        let _ = ag.send(Target::Room { room }, parts, None, None).await;
+        let _ = runtime
+            .send(ToolSend {
+                target: Target::Room { room },
+                parts,
+                mentions: None,
+                reply_to: None,
+            })
+            .await;
     }
 
     Ok(())
@@ -2417,8 +2627,9 @@ async fn cmd_hook(kind: String) -> Result<()> {
 /// conversation is live, and stops when it goes quiet.
 ///
 /// Bounded by design: it only runs when the agent is in a session (a local file read, so normal solo
-/// turns stay instant and never touch the hub), and each drain advances the durable cursor, so a
-/// message is injected exactly once and the loop can't spin on stale history.
+/// turns stay instant and never touch the hub). Policy-admitted batches advance the durable cursor;
+/// a quiet/focus hold intentionally does not, and the connector suppresses duplicate injections
+/// while that held context is re-read.
 async fn wake_hook() -> Result<()> {
     // No active session → nothing to poll. Keep this before any hub round-trip so a plain Claude Code
     // turn pays zero latency for having Parler Protocol wired in.
@@ -2440,30 +2651,25 @@ async fn wake_hook() -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(30);
 
-    let mut ag = connect().await?;
-    let me = ag.id.clone();
-    let pushing = ag.subscribe().await.unwrap_or(false);
+    let policy = Config::load().map(|cfg| cfg.attention).unwrap_or_default();
+    let ag = connect().await?;
+    let mut runtime = ConnectorRuntime::new(ag, policy);
+    // The Stop hook is the moment the host becomes interruptible again. Mirror that transition so
+    // role routing sees a waiting worker rather than a stale last tool status.
+    runtime
+        .lifecycle(Lifecycle::Waiting {
+            activity: Some(format!("waiting in session {room}")),
+        })
+        .await?;
+    let pushing = runtime.agent_mut().subscribe().await.unwrap_or(false);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
     loop {
-        // Read + advance the durable cursor: anything the agent already saw via `parler_recv` is gone,
-        // so we only ever surface genuinely new messages.
-        let (msgs, _) = ag.pull(&room, None, None).await?;
-        if !msgs.is_empty() {
-            // Advance past the whole batch (including our own posts) so nothing re-triggers next turn.
-            ag.commit_reads(&room).await?;
-            // Only *peers'* messages should wake the agent — surfacing its own sends back to it would
-            // make it continue on its own words and self-loop.
-            let peers: Vec<&StoredMessage> = msgs.iter().filter(|m| m.from.id != me).collect();
-            if !peers.is_empty() {
-                let body = peers.iter().map(|m| render_message(m)).collect::<Vec<_>>().join("\n");
-                let reason = format!(
-                    "New messages from other agents in session '{room}':\n{body}\n\n\
-                     Continue the conversation — reply with parler_send if a response is warranted; \
-                     otherwise you can stop."
-                );
-                println!("{}", serde_json::json!({ "decision": "block", "reason": reason }));
-                return Ok(());
-            }
+        // Pull → policy-aware receive → host-native injection. A muted room is acknowledged without
+        // a wake; a held quiet/focus batch remains durable until attention opens.
+        let received = runtime.receive(&room, RoomKind::Channel, None, None).await?;
+        let mut injector = ClaudeStopInjector;
+        if runtime.inject(&mut injector, received).await? {
+            return Ok(());
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2473,11 +2679,45 @@ async fn wake_hook() -> Result<()> {
         if pushing {
             // Wake the moment a peer posts (any room), or fall through to re-pull well before the hub's
             // idle timeout. Never overshoot the deadline.
-            let _ = ag.next_delivery(remaining.min(Duration::from_secs(25))).await?;
+            let _ = runtime.agent_mut().next_delivery(remaining.min(Duration::from_secs(25))).await?;
         } else {
             tokio::time::sleep(remaining.min(Duration::from_secs(2))).await;
         }
     }
+}
+
+/// Claude Code's documented Stop-hook injection seam. Other hosts need their own adapter for the
+/// same [`HostWakeInjector`] contract; where none exists, `parler work --room …` is the autonomous
+/// local process boundary instead of a fiction that MCP can start an idle model turn.
+struct ClaudeStopInjector;
+
+#[async_trait::async_trait]
+impl HostWakeInjector for ClaudeStopInjector {
+    async fn inject(&mut self, wake: WakeRequest) -> Result<()> {
+        let body = truncate_wake(
+            &wake.messages.iter().map(render_message).collect::<Vec<_>>().join("\n"),
+            64 * 1024,
+        );
+        let reason = format!(
+            "New messages from other agents in session '{}':\n{body}\n\n\
+             Continue the conversation — reply with parler_send if a response is warranted; \
+             otherwise you can stop.",
+            wake.room
+        );
+        println!("{}", serde_json::json!({ "decision": "block", "reason": reason }));
+        Ok(())
+    }
+}
+
+fn truncate_wake(input: &str, cap: usize) -> String {
+    if input.len() <= cap {
+        return input.to_string();
+    }
+    let mut end = cap;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[...wake context truncated; use parler_recv for the full durable backlog]", &input[..end])
 }
 
 async fn cmd_consolidate() -> Result<()> {
@@ -2660,6 +2900,15 @@ mod tests {
     }
 
     #[test]
+    fn role_send_is_an_exclusive_anycast_target() {
+        let (target, role) = send_target_from(None, None, None, Some(" reviewer ".into())).unwrap();
+        assert_eq!(target, Target::Service { service: "reviewer".into() });
+        assert_eq!(role.as_deref(), Some("reviewer"));
+        assert!(send_target_from(Some("team".into()), None, None, Some("reviewer".into())).is_err());
+        assert!(send_target_from(None, None, None, Some("   ".into())).is_err());
+    }
+
+    #[test]
     fn unknown_code_error_becomes_a_hub_signpost() {
         // The hub's terminal "unknown invite code" is rewritten to name the hub we tried and the
         // portable form that carries the minting hub — so a wrong-hub hand-off is self-diagnosing.
@@ -2737,15 +2986,9 @@ mod tests {
     #[tokio::test]
     async fn test_stale_session_key_detection() {
         let hub_url = start_hub().await;
-        
-        // Setup a temporary configuration directory
-        let temp_dir = tempfile::tempdir().unwrap();
-        let old_home = std::env::var("PARLER_HOME").ok();
-        std::env::set_var("PARLER_HOME", temp_dir.path());
-
-        // Create config pointing to our local hub
+        // This check only consumes the supplied Config; persisting it through the process-global
+        // PARLER_HOME would make an otherwise pure transport test race unrelated tests.
         let cfg = Config::create(&hub_url, "doctor_test", None).unwrap();
-        cfg.save().unwrap();
 
         // Testing check_session_key with a stale key
         let stale_key = "INVALIDKEY";
@@ -2756,12 +2999,6 @@ mod tests {
         assert!(err_msg.contains("❌ STALE/CLOSED"));
         assert!(err_msg.contains(stale_key));
         
-        // Clean up environment variables
-        if let Some(h) = old_home {
-            std::env::set_var("PARLER_HOME", h);
-        } else {
-            std::env::remove_var("PARLER_HOME");
-        }
     }
 
     /// Write a `config.json` with the given id into `home` — mirrors what `parler mcp` persists on
