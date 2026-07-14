@@ -51,6 +51,7 @@ fn cfg(hub: &str, name: &str, role: Option<&str>) -> Config {
         identity: parler_auth::new_identity().unwrap(),
         name: name.to_string(),
         role: role.map(String::from),
+        attention: parler_connector::AttentionPolicy::default(),
     }
 }
 

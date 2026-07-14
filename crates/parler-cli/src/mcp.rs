@@ -6,10 +6,10 @@
 //! surface tiny and gives exact control over the wire, which matters more than an SDK here.
 
 use anyhow::{anyhow, bail, Result};
-use parler_connector::{BundleMeta, Config, JoinOutcome, MeshAgent};
+use parler_connector::{BundleMeta, Config, JoinOutcome, MeshAgent, RoomAttention};
 use parler_protocol::{
-    AgentSkill, BundleRef, DiscoverScope, FileRef, HandoffRef, RoomKind, StoredMessage, Target,
-    Visibility,
+    AgentSkill, Attention, BundleRef, DiscoverScope, DispatchRef, FileRef, HandoffRef, RoomKind,
+    StoredMessage, Target, Visibility,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -842,10 +842,12 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
                 .iter()
                 .map(|e| {
                     let role = e.role.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+                    let attention = e.attention.map(|a| format!(", {}", a.as_str())).unwrap_or_default();
+                    let serving = e.service_role.as_deref().map(|r| format!(" serving:{r}")).unwrap_or_default();
                     if detail {
-                        format!("{}{role} {} [{}]", e.name, e.id, e.status)
+                        format!("{}{role} {} [{}{attention}]{serving}", e.name, e.id, e.status)
                     } else {
-                        format!("{}{role} [{}]", e.name, e.status)
+                        format!("{}{role} [{}{attention}]{serving}", e.name, e.status)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -855,6 +857,38 @@ async fn call_tool(agent: &mut MeshAgent, name: &str, args: &Value) -> Result<St
             let status = s("status").ok_or_else(|| anyhow!("missing 'status'"))?;
             agent.presence(&status, s("activity")).await?;
             Ok(format!("presence: {status}"))
+        }
+        "parler_attention" => {
+            let mut cfg = Config::load()?;
+            let room = s("room");
+            let mode = s("mode");
+            match (room.as_deref(), mode.as_deref()) {
+                (None, None) => {
+                    return Ok(format!(
+                        "attention: {} (quiet: {}; muted: {})",
+                        cfg.attention.mode.as_str(),
+                        list_or_none(&cfg.attention.quiet_rooms),
+                        list_or_none(&cfg.attention.muted_rooms)
+                    ));
+                }
+                (None, Some(mode)) => {
+                    cfg.attention.mode = Attention::parse(mode)
+                        .ok_or_else(|| anyhow!("unknown global attention '{mode}' — use open, dnd, or focus"))?;
+                }
+                (Some(room), Some(mode)) => {
+                    let room_mode = RoomAttention::parse(mode)
+                        .ok_or_else(|| anyhow!("unknown room attention '{mode}' — use quiet, muted, or inherit"))?;
+                    cfg.attention.set_room(room, room_mode);
+                }
+                (Some(_), None) => bail!("with room, pass mode=quiet, muted, or inherit"),
+            }
+            let global = cfg.attention.mode;
+            cfg.save()?;
+            agent.set_attention(global).await?;
+            Ok(match room {
+                Some(room) => format!("saved local attention for '{room}' (global: {})", global.as_str()),
+                None => format!("attention: {}", global.as_str()),
+            })
         }
         "parler_register" => {
             let visibility = match s("visibility").as_deref() {
@@ -1231,17 +1265,34 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
         }
         "parler_send" => {
             let text = s("text").ok_or_else(|| anyhow!("missing 'text'"))?;
-            // Exactly one explicit target; otherwise default to the active session.
-            let target = match select_target(s("room"), s("to"), s("service"))? {
-                Some(t) => t,
-                None => match state.active_session.clone() {
-                    Some(room) => Target::Room { room },
-                    None => bail!("provide one of room / to / service, or open/join a session first"),
+            let dispatch_role = s("role").map(|role| role.trim().to_string()).filter(|role| !role.is_empty());
+            if args.get("role").is_some() && dispatch_role.is_none() {
+                bail!("'role' needs a non-empty role name");
+            }
+            // `service` remains a broadcast room for old workers. `role` is the explicit opt-in to
+            // atomic anycast, so it cannot be combined with an ordinary destination.
+            let target = match dispatch_role.as_deref() {
+                Some(role) => {
+                    if s("room").is_some() || s("to").is_some() || s("service").is_some() {
+                        bail!("'role' cannot be combined with room, to, or service");
+                    }
+                    Target::Service { service: role.to_string() }
+                }
+                None => match select_target(s("room"), s("to"), s("service"))? {
+                    Some(t) => t,
+                    None => match state.active_session.clone() {
+                        Some(room) => Target::Room { room },
+                        None => bail!("provide one of room / to / service, or open/join a session first"),
+                    },
                 },
             };
             // Let `to` be a directory name, not just a 56-char id (unique-match-or-error; never guess).
             let target = crate::resolve_target(&mut state.agent, target).await?;
-            let (_id, seq, room) = state.agent.send_text(target, &text).await?;
+            let mut parts = vec![parler_protocol::Part::Text(text)];
+            if let Some(role) = &dispatch_role {
+                parts.push(DispatchRef { role: role.clone() }.to_part());
+            }
+            let (_id, seq, room) = state.agent.send(target, parts, None, None).await?;
             // Auto-pull right after sending so an already-waiting reply shows up without a separate
             // parler_recv (read-after-write); for a reply that hasn't landed yet, use parler_recv with
             // wait_secs to long-poll. Our own just-sent message is filtered out; the pull records an
@@ -1251,7 +1302,10 @@ async fn call_session_tool(state: &mut McpState, name: &str, args: &Value) -> Re
             // advances the cursor through what it returned). We deliberately do NOT commit_reads here:
             // one extra round trip per send isn't worth it; the ack (#85) rides the next real pull, and
             // a batch seen only via auto-pull before an MCP restart is re-read after — at-least-once.
-            let mut out = format!("sent to '{room}' (seq {seq})");
+            let mut out = match dispatch_role {
+                Some(role) => format!("role-dispatched to '{role}' in '{room}' (seq {seq})"),
+                None => format!("sent to '{room}' (seq {seq})"),
+            };
             let auto_limit = if verbose_render() { None } else { Some(AUTOPULL_LIMIT) };
             if let Ok((msgs, _cursor)) = state.agent.pull(&room, None, auto_limit).await {
                 let batch_full = auto_limit.is_some_and(|l| msgs.len() as u32 >= l);
@@ -2067,6 +2121,10 @@ fn str_list(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn list_or_none(items: &[String]) -> String {
+    if items.is_empty() { "none".into() } else { items.join(", ") }
+}
+
 fn tool_specs() -> Vec<Value> {
     fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
         json!({
@@ -2078,7 +2136,7 @@ fn tool_specs() -> Vec<Value> {
     vec![
         tool(
             "parler_open_session",
-            "Open a shared live session; returns a KEY to hand another agent so it joins already caught up, plus a read-only WATCH code the user pastes into the web/desktop viewer (do NOT paste the KEY there). `context` posts first — recap task/decisions/files/state. Joiners need your approval by default (confirm with the user). Becomes your active session (send/recv need no room).",
+            "Open a live session. Give its KEY to an agent to join caught up; WATCH is read-only for a human viewer. Context posts first. Approval is on by default. Becomes active for send/recv.",
             json!({
                 "context": { "type": "string", "description": "recap of the conversation/state to catch up joiners" },
                 "topic": { "type": "string", "description": "short session name" },
@@ -2091,7 +2149,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_join_session",
-            "Join a session with a KEY. If approval is required you're held pending; pass wait_secs to wait for the host in this call. You get a context digest (seed + recent tail); backlog:\"full\" replays all. Becomes your active session (send/recv need no room).",
+            "Join with a KEY. Approval-gated joins can wait in this call. Returns a context digest; backlog:full replays all. Becomes active for send/recv.",
             json!({
                 "key": { "type": "string", "description": "the session key or link you were handed" },
                 "backlog": { "type": "string", "enum": ["recent", "full"], "description": "recent (default): seed + recent tail; full: whole backlog" },
@@ -2131,7 +2189,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_watch_session",
-            "Mint a read-only WATCH code so the user can watch this session live on the Parler Protocol website (/session). Owner-only, separate from the join key (the safe way to let a human view it). Defaults to active session; hand the code to the user.",
+            "Mint an owner-only read-only WATCH code for a human to view the session. Separate from the join key; defaults to active session.",
             json!({
                 "room": { "type": "string", "description": "the session room (defaults to your active session)" },
                 "ttl_secs": { "type": "integer", "description": "how long the watch code stays valid (default 1h)" }
@@ -2140,7 +2198,7 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_bring",
-            "Get an independent second opinion from another AI agent (v1: codex) — no copy-paste. Posts its review into your active session (opening one if needed); call parler_recv to read it. Returns immediately; the review lands in a few minutes.",
+            "Ask another AI agent (v1: codex) for a review. It posts into the active session and returns immediately; use parler_recv for the result.",
             json!({
                 "agent": { "type": "string", "description": "which agent to ask (default and v1-only: codex)" },
                 "context": { "type": "string", "description": "what to review — recap of the code/decision and what you want a second opinion on" }
@@ -2168,17 +2226,18 @@ fn tool_specs() -> Vec<Value> {
         ),
         tool(
             "parler_serve",
-            "Join a service queue as a worker (many-to-one); then parler_recv it for tasks.",
+            "Join a legacy broadcast service room and register its matching role. Use `parler work --role` for atomic anycast and a local runner.",
             json!({ "service": { "type": "string" } }),
             &["service"],
         ),
         tool(
             "parler_send",
-            "Send a message; returns replies already waiting (read-after-write). Defaults to active session; else exactly one of room (channel), to (peer id/name, DM), service (queue). For a reply not yet landed, use parler_recv wait_secs — don't poll.",
+            "Send text and return already-waiting replies. Defaults to active session; otherwise use one of room, to, service (broadcast), or role (anycast).",
             json!({
                 "room": { "type": "string" },
                 "to": { "type": "string", "description": "a peer agent id or a directory name (resolved to a unique id)" },
                 "service": { "type": "string" },
+                "role": { "type": "string", "description": "Anycast role; one available worker claims it. Cannot combine with other targets." },
                 "text": { "type": "string" }
             }),
             &["text"],
@@ -2312,6 +2371,15 @@ fn tool_specs() -> Vec<Value> {
             &["status"],
         ),
         tool(
+            "parler_attention",
+            "Set or inspect global attention (open|dnd|focus) or a local room override (quiet|muted|inherit).",
+            json!({
+                "mode": { "type": "string", "description": "Global: open|dnd|focus; with room: quiet|muted|inherit." },
+                "room": { "type": "string", "description": "Room for a local override." }
+            }),
+            &[],
+        ),
+        tool(
             "parler_register",
             "Publish your discovery card. visibility: private (default, same-hub) or public (anyone). Signed with your key.",
             json!({
@@ -2424,7 +2492,8 @@ mod tests {
     /// `parler_fetch` self-service (auto-find the latest shared file: `id` now optional, `name`/`room`
     /// params added so an agent asked to "fetch the file" needn't be handed a 64-char blob id) grew it
     /// ~300 B to ~13,237 — load-bearing schema, not description bloat (descriptions stayed under their
-    /// own ceiling); ceiling → 13,500 to restore headroom.
+    /// own ceiling); ceiling → 13,500 to restore headroom. `parler_attention` then made 28 tools;
+    /// its compact schema remains within that ceiling.
     const TOOL_SPECS_BUDGET: usize = 13_500;
     /// Just the human-readable descriptions (the part the diet targets; schema scaffolding is
     /// load-bearing). Pre-diet 5,261 B → post-diet (P0.2) 4,304 B; P1.2 adds ~230 B of cheap-path
@@ -3653,6 +3722,37 @@ mod tests {
         // An unknown name is an error, not a wrong-agent guess.
         let err = call_session_tool(&mut peer, "parler_send", &json!({ "to": "nobody-here", "text": "x" })).await;
         assert!(err.is_err(), "an unresolvable name must error, never guess");
+    }
+
+    #[tokio::test]
+    async fn mcp_role_send_creates_claimable_anycast_work() {
+        let hub = start_hub().await;
+        let mut worker = state(&hub, "worker").await;
+        let mut dispatcher = state(&hub, "dispatcher").await;
+        call_tool(&mut worker.agent, "parler_serve", &json!({ "service": "reviewer" }))
+            .await
+            .unwrap();
+        let room = worker
+            .agent
+            .rooms()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == RoomKind::Service)
+            .map(|entry| entry.name)
+            .unwrap();
+
+        let sent = call_session_tool(
+            &mut dispatcher,
+            "parler_send",
+            &json!({ "role": "reviewer", "text": "review this change" }),
+        )
+        .await
+        .unwrap();
+        assert!(sent.contains("role-dispatched"), "role send is explicit: {sent}");
+        let queued = worker.agent.queue(&room, "reviewer", None).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].parts.iter().any(|part| DispatchRef::from_part(part).is_some()));
     }
 
     #[test]

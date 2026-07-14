@@ -2,10 +2,12 @@
 //! the three delivery patterns, paste-a-code pairing, memory scoping, durable resume, and authz.
 
 use parler_connector::{
-    verify_message, BundleMeta, Config, HubClient, JoinOutcome, MeshAgent, MeshTransport, SigStatus,
+    verify_message, AttentionPolicy, ConnectorRuntime, HostWakeInjector, BundleMeta, Config,
+    HubClient, JoinOutcome, MeshAgent, MeshTransport, SigStatus, WakeRequest,
 };
 use parler_protocol::{
-    BundleRef, ClientFrame, EndpointRef, FileRef, Part, RoomKind, ServerFrame, StoredMessage, Target,
+    Attention, BundleRef, ClientFrame, DispatchRef, EndpointRef, FileRef, HandoffRef, Part,
+    RoomKind, ServerFrame, StoredMessage, Target, TaskStatus,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,6 +92,7 @@ fn cfg(hub: &str, name: &str, role: Option<&str>) -> Config {
         identity: parler_auth::new_identity().unwrap(),
         name: name.to_string(),
         role: role.map(String::from),
+        attention: parler_connector::AttentionPolicy::default(),
     }
 }
 
@@ -110,6 +113,28 @@ fn texts(msgs: &[StoredMessage]) -> Vec<String> {
                 .join(" ")
         })
         .collect()
+}
+
+#[derive(Default)]
+struct RecordingInjector {
+    wakes: Vec<WakeRequest>,
+}
+
+#[async_trait::async_trait]
+impl HostWakeInjector for RecordingInjector {
+    async fn inject(&mut self, wake: WakeRequest) -> anyhow::Result<()> {
+        self.wakes.push(wake);
+        Ok(())
+    }
+}
+
+struct RejectingInjector;
+
+#[async_trait::async_trait]
+impl HostWakeInjector for RejectingInjector {
+    async fn inject(&mut self, _wake: WakeRequest) -> anyhow::Result<()> {
+        anyhow::bail!("host is unavailable")
+    }
 }
 
 #[tokio::test]
@@ -157,6 +182,80 @@ async fn one_to_many_channel_fans_out() {
 }
 
 #[tokio::test]
+async fn connector_runtime_holds_ambient_and_injects_an_addressed_handoff_once() {
+    let hub = start_hub().await;
+    let mut sender = agent(&hub, "sender", None).await;
+    let mut body = agent(&hub, "body", None).await;
+    let inv = sender.invite(RoomKind::Channel, Some("team".into()), None, None).await.unwrap();
+    body.join(&inv.code).await.unwrap();
+
+    let policy = AttentionPolicy { mode: Attention::Focus, ..Default::default() };
+    let mut runtime = ConnectorRuntime::new(body, policy);
+    sender.send_text(Target::Room { room: inv.room.clone() }, "ambient status update").await.unwrap();
+
+    // Focus retains ambient context in the durable backlog rather than advancing through it.
+    let held = runtime.receive(&inv.room, RoomKind::Channel, None, None).await.unwrap();
+    assert!(held.held);
+    assert!(held.messages.is_empty());
+
+    sender
+        .send(
+            Target::Room { room: inv.room.clone() },
+            vec![HandoffRef {
+                next: "implement the patch".into(),
+                summary: Some("review is complete".into()),
+                to: Some("body".into()),
+                bundle: None,
+            }
+            .to_part()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The addressed handoff wakes once even though the earlier ambient context stays held.
+    let received = runtime.receive(&inv.room, RoomKind::Channel, None, None).await.unwrap();
+    assert!(received.held);
+    assert_eq!(received.messages.len(), 1);
+    let mut injector = RecordingInjector::default();
+    assert!(runtime.inject(&mut injector, received).await.unwrap());
+    assert_eq!(injector.wakes.len(), 1);
+    assert_eq!(injector.wakes[0].messages.len(), 1);
+
+    // Re-reading the held batch cannot inject the same model turn repeatedly.
+    let repeated = runtime.receive(&inv.room, RoomKind::Channel, None, None).await.unwrap();
+    assert!(repeated.held);
+    assert!(!runtime.inject(&mut injector, repeated).await.unwrap());
+    assert_eq!(injector.wakes.len(), 1);
+}
+
+#[tokio::test]
+async fn connector_runtime_retries_a_wake_when_the_host_injector_fails() {
+    let hub = start_hub().await;
+    let mut sender = agent(&hub, "sender", None).await;
+    let mut body = agent(&hub, "body", None).await;
+    let inv = sender.invite(RoomKind::Channel, Some("team".into()), None, None).await.unwrap();
+    body.join(&inv.code).await.unwrap();
+    let mut runtime = ConnectorRuntime::new(body, AttentionPolicy::default());
+    sender.send_text(Target::Room { room: inv.room.clone() }, "please take this task").await.unwrap();
+
+    let received = runtime.receive(&inv.room, RoomKind::Channel, None, None).await.unwrap();
+    assert_eq!(received.messages.len(), 1);
+    assert!(runtime.inject(&mut RejectingInjector, received).await.is_err());
+
+    // The failed injection did not advance the cursor or permanently suppress the wake.
+    let retry = runtime.receive(&inv.room, RoomKind::Channel, None, None).await.unwrap();
+    assert_eq!(retry.messages.len(), 1);
+    let mut injector = RecordingInjector::default();
+    assert!(runtime.inject(&mut injector, retry).await.unwrap());
+    assert_eq!(injector.wakes.len(), 1);
+    let drained = runtime.receive(&inv.room, RoomKind::Channel, None, None).await.unwrap();
+    assert!(drained.messages.is_empty());
+    assert!(!drained.held);
+}
+
+#[tokio::test]
 async fn many_to_one_service_collects() {
     let hub = start_hub().await;
     let mut manager = agent(&hub, "manager", Some("reviewer")).await;
@@ -172,6 +271,37 @@ async fn many_to_one_service_collects() {
     assert_eq!(t.len(), 2);
     assert!(t.contains(&"review PR #1".to_string()));
     assert!(t.contains(&"review PR #2".to_string()));
+}
+
+#[tokio::test]
+async fn role_queue_anycasts_to_one_available_worker_and_finishes() {
+    let hub = start_hub().await;
+    let mut requester = agent(&hub, "requester", None).await;
+    let mut busy = agent(&hub, "busy", Some("reviewer")).await;
+    let mut ready = agent(&hub, "ready", Some("reviewer")).await;
+    let room = busy.serve("reviewer").await.unwrap();
+    assert_eq!(ready.serve("reviewer").await.unwrap(), room);
+    busy.presence("working", Some("another task".into())).await.unwrap();
+    ready.presence("idle", None).await.unwrap();
+
+    let (task, _seq, _) = requester
+        .send(
+            Target::Service { service: "reviewer".into() },
+            vec![Part::Text("review the patch".into()), DispatchRef { role: "reviewer".into() }.to_part()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(busy.queue(&room, "reviewer", None).await.unwrap().is_empty(), "working workers do not route new work");
+    let queued = ready.queue(&room, "reviewer", None).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, task);
+    assert!(ready.claim(&room, &task, Some(60)).await.unwrap().is_some());
+    busy.presence("idle", None).await.unwrap();
+    assert!(busy.claim(&room, &task, Some(60)).await.unwrap().is_none(), "live lease excludes a second worker");
+    assert!(ready.complete_claim(&room, &task, TaskStatus::Done).await.unwrap());
+    assert!(busy.queue(&room, "reviewer", None).await.unwrap().is_empty());
 }
 
 #[tokio::test]

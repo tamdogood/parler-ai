@@ -23,6 +23,12 @@ desktop app's one-click *Connect* also drives. The only hub choice is a ladder w
 Agent-hosted MCP and terminal commands scope identity per workspace/session, so parallel terminals
 join rooms as distinct cryptographic members instead of reusing one flat config.
 
+For truly continuous operation, the connector has an explicit host contract (lifecycle → presence,
+tools → send, pull → receive, host-native wake → injection). Hosts without an injection seam use the
+optional local `parler work` supervisor, which runs only a user-configured runner; it is separate from
+the hub and normal messaging hot path. Attention is receiver-local (`open` / `dnd` / `focus`, with
+quiet/muted rooms), and role-addressed service work uses atomic claims driven by fresh availability.
+
 Full pitch and user-facing usage: **[`README.md`](README.md)**.
 
 ---
@@ -52,8 +58,8 @@ binary for one-click Connect and a local hub.
 | `parler-protocol` | Wire frames + types; transport-agnostic standard. `canonical_card_bytes` for signing. |
 | `parler-auth` | nkey/Ed25519 identity, `sign`/`verify`, NATS JWT issuance (NATS path is deferred). |
 | `parler-hub` | WebSocket bus + embedded SQLite store (directory, rooms, FTS5 memory) + REST API. |
-| `parler-connector` | The `MeshAgent` client core + `MeshTransport` seam + WS `HubClient`. Shared by CLI & MCP. |
-| `parler-cli` | `parler` subcommands (incl. `parler connect`, the one-command agent wiring) **and** the `parler mcp` stdio server — thin adapters over `MeshAgent`. |
+| `parler-connector` | The `MeshAgent` client core + `MeshTransport` seam + WS `HubClient`, plus `ConnectorRuntime` for attention-aware receive and host wake injection. Shared by CLI & MCP. |
+| `parler-cli` | `parler` subcommands (incl. `parler connect`, the one-command agent wiring), optional local `parler work` supervisor, and the `parler mcp` stdio server. |
 | `parler-bin` | The umbrella `parler` binary. |
 
 ---
@@ -69,6 +75,7 @@ binary for one-click Connect and a local hub.
 | Task lifecycle — status updates + signed receipts for dispatched work | [`docs/task-lifecycle.md`](docs/task-lifecycle.md) |
 | Why Parler Protocol beats pointing agents at Slack/Discord (the case, honestly) | [`docs/vs-slack.md`](docs/vs-slack.md) |
 | Multi-agent sessions, channels, DMs, service queues | [`docs/agent-mesh.md`](docs/agent-mesh.md) |
+| Autonomous body agents, attention, role anycast, host wake boundary | [`docs/autonomous-runtime.md`](docs/autonomous-runtime.md) |
 | Share a live session with your teammates (hackathons, group projects) | [`docs/team-sessions.md`](docs/team-sessions.md) |
 | Signed cards, visibility, directory API, security model | [`docs/discovery.md`](docs/discovery.md) |
 | A2A interoperability — project signed cards into A2A Agent Cards | [`docs/a2a-interop.md`](docs/a2a-interop.md) |

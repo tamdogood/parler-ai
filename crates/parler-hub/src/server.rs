@@ -915,6 +915,7 @@ fn hub_capabilities(state: &HubState) -> serde_json::Value {
         "messageKinds": [
             parler_protocol::HANDOFF_KIND,
             parler_protocol::TASK_KIND,
+            parler_protocol::DISPATCH_KIND,
             parler_protocol::BUNDLE_KIND,
             parler_protocol::FILE_KIND,
             parler_protocol::MESSAGE_SIG_KIND,
@@ -2057,7 +2058,7 @@ fn handle_hello(
             if let Err(e) = state.store.upsert_agent(&id, &name, role.as_deref(), now) {
                 return ServerFrame::error_coded(error_code::INTERNAL, e.to_string());
             }
-            let _ = state.store.touch_presence(&id, "idle", None, now);
+            let _ = state.store.touch_presence(&id, "idle", None, None, now);
             conn.authed = Some(Authed { id: id.clone(), name: name.clone(), role });
             ServerFrame::Welcome { id, name }
         }
@@ -2197,7 +2198,65 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             let now = now_ms();
             store.ensure_room(&room, RoomKind::Service, None, now)?;
             store.add_member(&room, &me.id, now)?;
+            store.serve_role(&room, &me.id, &service, now)?;
             Ok(ServerFrame::Joined { room, kind: RoomKind::Service })
+        }
+
+        ClientFrame::Claim { room, message, lease_secs } => {
+            if !store.is_member(&room, &me.id)? {
+                return Err(coded(error_code::NOT_MEMBER, format!("not a member of '{room}'")));
+            }
+            if store.room_kind(&room)? != Some(RoomKind::Service) {
+                return Err(coded(
+                    error_code::NOT_AUTHORIZED,
+                    format!("'{room}' is not a service room"),
+                ));
+            }
+            // The hub owns the lease bound regardless of client input. A worker may renew often,
+            // but a hostile client cannot pin one task forever or churn the SQLite writer with
+            // zero-length leases.
+            let lease_secs = lease_secs.unwrap_or(300).clamp(15, 3_600);
+            let lease_until = store.claim_service_message(&room, &message, &me.id, lease_secs, now_ms())?;
+            Ok(ServerFrame::Claimed {
+                room,
+                message,
+                claimed: lease_until.is_some(),
+                lease_until,
+            })
+        }
+
+        ClientFrame::Queue { room, role, limit } => {
+            if !store.is_member(&room, &me.id)? {
+                return Err(coded(error_code::NOT_MEMBER, format!("not a member of '{room}'")));
+            }
+            if store.room_kind(&room)? != Some(RoomKind::Service) {
+                return Err(coded(
+                    error_code::NOT_AUTHORIZED,
+                    format!("'{room}' is not a service room"),
+                ));
+            }
+            let messages = store.queued_service_messages(&room, &me.id, &role, limit, now_ms())?;
+            Ok(ServerFrame::Queued { room, messages })
+        }
+
+        ClientFrame::Complete { room, message, status } => {
+            if !store.is_member(&room, &me.id)? {
+                return Err(coded(error_code::NOT_MEMBER, format!("not a member of '{room}'")));
+            }
+            if store.room_kind(&room)? != Some(RoomKind::Service) {
+                return Err(coded(
+                    error_code::NOT_AUTHORIZED,
+                    format!("'{room}' is not a service room"),
+                ));
+            }
+            if !status.is_terminal() {
+                return Err(coded(
+                    error_code::NOT_AUTHORIZED,
+                    "a service claim can only be completed with done, failed, or cancelled",
+                ));
+            }
+            let completed = store.complete_service_message(&room, &message, &me.id, status, now_ms())?;
+            Ok(ServerFrame::Completed { room, message, completed })
         }
 
         ClientFrame::Send { target, parts, mentions, reply_to, client_id } => {
@@ -2310,9 +2369,14 @@ fn handle_authed(state: &HubState, me: &Authed, frame: ClientFrame) -> anyhow::R
             Ok(ServerFrame::Roster { room: room.clone(), entries: store.roster(&room, now_ms())? })
         }
 
-        ClientFrame::Presence { status, activity } => {
-            store.touch_presence(&me.id, &status, activity.as_deref(), now_ms())?;
+        ClientFrame::Presence { status, activity, attention } => {
+            store.touch_presence(&me.id, &status, activity.as_deref(), attention, now_ms())?;
             Ok(ServerFrame::PresenceOk)
+        }
+
+        ClientFrame::SetAttention { attention } => {
+            store.set_attention(&me.id, attention, now_ms())?;
+            Ok(ServerFrame::AttentionOk)
         }
 
         ClientFrame::Ping => Ok(ServerFrame::Pong),
@@ -2808,6 +2872,7 @@ mod tests {
             visibility: Visibility::Public,
             status: "idle".into(),
             activity: None,
+            attention: None,
             hub: "Test Hub".into(),
             verified,
             sig: sig.map(str::to_string),

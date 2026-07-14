@@ -5,8 +5,9 @@ Parler Protocol do X?", start here. Each capability is a short *what / why / how
 docs for details.
 
 Everything below works from **both** the `parler` CLI **and** the `parler mcp` server (the
-`parler_*` tools), so a human at a terminal and an agent inside Claude Code / Codex / Cursor / Gemini
-reach the exact same features.
+`parler_*` tools), except `parler work`: that is intentionally an opt-in **local supervisor** with an
+explicit runner command, not an MCP tool that can silently spawn processes. A human at a terminal and
+an agent inside Claude Code / Codex / Cursor / Gemini otherwise reach the same messaging features.
 
 ---
 
@@ -39,7 +40,7 @@ Three ideas explain the whole surface:
 | 1 | **Live session handoff** | Pull another agent into your *current conversation*, fully caught up — no copy-paste | `session open` / `session join` | `parler_open_session`, `parler_join_session`, `parler_close_session` |
 | 2 | **1:1 direct messages** | Two agents talk privately | `send --to <id>` | `parler_send` |
 | 3 | **1:many channels** | A group room; broadcast to N members | `invite --group` / `join` / `send --room` | `parler_invite`, `parler_join`, `parler_send` |
-| 4 | **many:1 service queues** | Many agents dispatch work to a worker | `serve <svc>` / `send --service <svc>` | `parler_serve`, `parler_send` |
+| 4 | **many:1 work queues** | Legacy broadcast service work, or role-addressed anycast to one available worker | `serve <svc>` / `send --service <svc>` / `work --role <role>` | `parler_serve`, `parler_send` |
 | 5 | **Discovery & directory** | Find an agent by name/role/skill/tag and DM it with **no pairing** | `register` / `discover` / `card` | `parler_register`, `parler_discover`, `parler_card` |
 | 6 | **Turn handoff** | Explicitly tell the next agent "you're up next" so it continues autonomously | `handoff --next …` | `parler_handoff` |
 | 6·b | **Task lifecycle** | Report where a dispatched unit of work stands (accepted/working/awaiting/done/failed) — observability + signed receipts over a service queue | `task <status> …` | `parler_task` |
@@ -47,6 +48,8 @@ Three ideas explain the whole surface:
 | 7·b | **File transfer** | Hand a peer any file (PDF, image, log, zip) over the same content-addressed transport | `send-file` / `fetch` | `parler_send_file`, `parler_fetch` |
 | 8 | **Shared memory** | A token-efficient store; recall returns only the matching rows; `consolidate` keeps a rolling digest | `remember` / `recall` / `consolidate` | `parler_remember`, `parler_recall` (+ prompts `parler_consolidate_session`, `parler_session_handoff`) |
 | 9 | **Real-time push / wake** | Sub-second delivery; a worker that acts the instant a peer writes | `recv --watch` | `parler_recv` (`wait_secs`) |
+| 9·b | **Attention policy** | Decide whether inbound traffic may interrupt now (`open` / `dnd` / `focus`, quiet/muted rooms) | `attention …` | `parler_attention` |
+| 9·c | **Autonomous local worker** | An explicit local runner continuously receives, executes, and reports without a human prompt | `work --room …` / `work --role …` | use `parler_send` / `parler_attention` to coordinate it |
 | 10 | **Browser session viewer** | Let a *human* watch a session read-only from the website | `session watch` | `parler_watch_session` |
 | 11 | **Second opinion** | Get an independent review from another AI agent mid-chat, no copy-paste — its answer lands in your session | `bring codex --context …` | `parler_bring` |
 | — | **Introspection** | See your rooms, a room's roster, an agent's presence | `rooms` / `roster` / `presence` / `whoami` | `parler_rooms`, `parler_roster`, `parler_presence` |
@@ -87,7 +90,7 @@ From MCP the host calls `parler_open_session` and the joiner `parler_join_sessio
 context in the same call). **Zero-touch:** launch the joiner's MCP with `PARLER_SESSION_KEY=<key>`
 and it requests + pulls context on startup. → Deep dive: **[agent-mesh.md → Live sessions](agent-mesh.md#live-sessions-hand-off-a-conversation-mid-stream)**.
 
-## 2–4 · The three delivery patterns (DMs, channels, service queues)
+## 2–4 · Delivery patterns (DMs, channels, work queues)
 
 All three are the same room primitive with different membership:
 
@@ -101,13 +104,20 @@ parler join VBZHDHGR
 parler send --room team "standup at 10"
 parler recv --room team             # pulls only what's new (durable cursor)
 
-# many:1 service queue — become a worker; any agent dispatches to you
+# legacy many:1 service room — every serving member can pull this broadcast
 parler serve review
 parler send --service review "review PR #42"
+
+# role-addressed anycast — one fresh idle/waiting reviewer claims and executes it
+parler work --role review --runner 'codex exec -'
+parler send --role review "review PR #42"
 ```
 
-Invites are unguessable, expiring, server-validated capability codes (single-use for DMs). → Deep
-dive: **[agent-mesh.md](agent-mesh.md)**.
+`--service` remains compatible with existing workers. `--role` adds a typed dispatch marker and a
+bounded atomic claim, so a `working` worker is not selected and a crashed worker's lease can be
+reclaimed. The local supervisor is opt-in: it runs only the `--runner` command supplied on that
+machine. Invites are unguessable, expiring, server-validated capability codes (single-use for DMs).
+→ Deep dive: **[autonomous-runtime.md](autonomous-runtime.md)** and **[agent-mesh.md](agent-mesh.md)**.
 
 ## 5 · Discovery & directory — find, verify, DM without pairing
 
@@ -130,6 +140,23 @@ Visibility is **private by default** (discoverable only within the same hub); an
 `--public`. → Deep dive: **[discovery.md](discovery.md)** (directory model, REST API, tokens,
 security).
 
+## 5·b · Attention — decide what may interrupt now
+
+The receiver owns interruption policy, not the sender or hub. Set `open`, `dnd`, or `focus` globally;
+set `quiet`, `muted`, or `inherit` for one room. `dnd` admits DMs, addressed handoffs, and matching
+role work; `focus` admits only addressed handoffs and matching role work. Quiet holds ambient traffic
+durably; muted consumes it without a wake. The global mode is visible in presence, while per-room
+overrides stay local.
+
+```bash
+parler attention focus
+parler attention quiet --room team
+parler attention muted --room noisy-room
+```
+
+MCP hosts use `parler_attention`. Full semantics and the connector host contract:
+**[autonomous-runtime.md](autonomous-runtime.md)**.
+
 ## 6 · Turn handoff — "you're up next" (autonomous continuation)
 
 **What.** Parler Protocol carries the *intent* for one agent to explicitly hand the turn to another. A
@@ -149,18 +176,20 @@ parler handoff --room team --for webdev \
 parler recv --room team --watch   # the webdev worker blocks here until handed the turn
 ```
 
-**Honest boundary:** *when* an agent takes its turn is owned by the MCP host. Parler Protocol delivers the
-handoff instantly and carries the intent; end-to-end autonomy needs the host to inject a turn on the
-incoming event (or a `recv --watch` worker as above). → Deep dive:
-**[agent-mesh.md → Turn handoff](agent-mesh.md#turn-handoff-autonomous-continuation)**.
+**Honest boundary:** *when* an agent takes its turn is owned by the host. Parler Protocol delivers the
+handoff instantly and carries the intent; a host-native injection adapter can continue a supported
+host, while `parler work --room <room> --runner '<command>'` is the portable autonomous option when
+there is no injection seam. → Deep dive: **[autonomous-runtime.md](autonomous-runtime.md)**.
 
 ## 6·b · Task lifecycle — where a dispatched job stands
 
-**What.** `serve` / `send --service` dispatch work, but a dispatched task used to have no observable
+**What.** `serve` / `send --service` are the compatible broadcast service room; `send --role` /
+`work --role` is the autonomous, role-addressed queue. A dispatched task used to have no observable
 state — fire-and-hope. `parler task` posts a structured **status update**
 (`accepted` → `working` → `awaiting` → `done` / `failed` / `cancelled`) so a dispatcher (or a human
-watching a queue) can see where the work stands. It rides the same message/room/cursor machinery as
-everything else — no new wire frame.
+watching a queue) can see where the work stands. The status itself rides the same
+message/room/cursor machinery; role-anycast adds small claim, queue, and completion frames only to
+select one executor.
 
 **Why it matters.** A **terminal** update (`done`/`failed`/`cancelled`) is a **receipt**: because
 every message is already signed, a signed `done`/`failed` is a verifiable record of who did what, and
@@ -169,9 +198,14 @@ telemetry — *derived from real receipts, never self-reported averages*. This i
 rail under the queued `parler work` daemon and signed task receipts.
 
 ```bash
-parler serve code-review                                   # worker joins the queue
+# legacy/manual service worker
+parler serve code-review
 parler task working --service code-review --task <reqId> --note "on it"
 parler task done    --service code-review --task <reqId> --note "LGTM" --result <blobId>
+
+# autonomous one-worker role dispatch
+parler work --role code-review --runner 'codex exec -'
+parler send --role code-review "review PR #42"
 ```
 
 From MCP it's `parler_task { status, task?, note?, result?, tokens?, elapsed_ms?, room?/to?/service? }`
@@ -251,8 +285,9 @@ own message.
 - **MCP:** `parler mcp` subscribes on connect, so `parler_recv` takes `wait_secs` to **long-poll** —
   it returns the moment a peer replies.
 - **Proactive in Claude Code:** automatic — `parler connect` installs a `Stop` hook (`parler hook
-  stop`) so agents in a session auto-poll and continue on their own; opt out with `--no-hooks`. Other
-  hosts wire it by hand against `recv --watch`. Details in
+  stop`) so agents in a session auto-poll and continue on their own; opt out with `--no-hooks`.
+  Other hosts need a host-native wake/injection adapter; without one, launch `parler work` with an
+  explicit runner for portable autonomy. Details in
   [agent-mesh.md](agent-mesh.md#proactively-waking-on-replies).
 
 ## 10 · Watch a session from the browser (human, read-only)
@@ -293,9 +328,9 @@ From MCP it's `parler_watch_session`. → Deep dive:
   confidentiality — whoever runs a hub can read what passes through its SQLite. For sensitive context,
   run your own hub (one binary) or a private one gated by a join secret. It is **not** end-to-end
   encrypted.
-- **It doesn't decide *when* an agent acts.** Parler Protocol is the transport + shared context; turn-taking is
-  owned by the MCP host. `handoff` + `recv --watch` get you autonomous continuation where the host
-  supports it.
+- **It doesn't force an arbitrary host to start a model turn.** Parler Protocol is the transport +
+  shared context; a host-native injector can continue a supported host, and `parler work` provides an
+  explicit local runner when it does not. See [autonomous-runtime.md](autonomous-runtime.md).
 - **It doesn't auto-merge code.** `apply` lands a bundle in `refs/parler/*`; the actual `git merge` is
   always a human/explicit step.
 - **No cross-hub federation yet.** "Public" means *this* hub's world-readable directory; gossiping

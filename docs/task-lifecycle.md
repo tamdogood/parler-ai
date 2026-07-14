@@ -6,11 +6,18 @@ work was not — a task, once sent, had no state you could see. This adds a smal
 status** so a dispatcher (or a human watching a queue) knows where a unit of work stands, and so a
 finished task leaves a **verifiable receipt**.
 
+For a new autonomous queue, use `send --role <role>` and `work --role <role> --runner <command>`.
+That adds a typed dispatch marker plus an atomic, renewable hub lease: only one fresh `idle` or
+`waiting` worker claims it, `working` workers are skipped, and an expired lease can be reclaimed after
+a crash. The status messages below remain the same signed room messages; the claim/complete frames
+only choose who executes the work. Legacy `send --service` remains a broadcast service room for
+existing workers.
+
 It borrows the state machine from [ACP](https://agentcommunicationprotocol.dev)'s agent-run lifecycle
 (`created → in-progress → awaiting → completed/failed/cancelled`) and collapses it onto Parler
 Protocol's chat model: a status update is just a message part, so it rides the ordinary
-room / cursor / durability / signature machinery with **no new wire frame** and works against the
-deployed hub.
+room / cursor / durability / signature machinery. Role-anycast's claim/complete frames are additive;
+they do not change how existing task updates render or verify.
 
 ## The status model
 
@@ -60,7 +67,20 @@ parler task done    --service code-review --task 42 \
   --note "LGTM" --result <blobId> --tokens 1800 --elapsed-ms 42000   # a signed receipt
 ```
 
+An autonomous version is one command on the worker and one on the dispatcher:
+
+```bash
+parler work --role code-review --runner 'codex exec -'
+parler send --role code-review "Review PR #42"
+```
+
+The supervisor publishes `accepted` and `working`, feeds the request to its explicit local runner,
+then publishes `done` or `failed` and completes the claim. See
+[autonomous-runtime.md](autonomous-runtime.md) for attention policy and lease behavior.
+
 **MCP** — `parler_task { status, task?, note?, result?, tokens?, elapsed_ms?, room?/to?/service? }`.
+Dispatch role-anycast work with `parler_send { role, text }`; the worker's local `parler work` process
+owns the claim and emits the lifecycle receipts.
 With an open/joined session it defaults to that room, so a worker inside Claude Code / Codex / Cursor
 just calls `parler_task status="working"` and the room sees it. A `result` blob comes from a prior
 `parler_push` (a code bundle) or `parler_send_file` (any file).
@@ -81,9 +101,9 @@ depends only on the receipts this doc defines, which flow today.
 
 ## What it does *not* do (boundaries)
 
-- **It doesn't run the work.** `parler task` reports status; executing the task and deciding *when* to
-  act stays with the worker/host (the same boundary as turn handoff). The queued `parler work` daemon
-  is the piece that watches a queue, runs a runner, and posts these statuses automatically.
+- **`parler task` alone doesn't run the work.** It reports status; executing is still the worker/host
+  boundary. The optional `parler work` local supervisor watches a role queue or room, runs its explicit
+  runner, and posts these statuses automatically.
 - **It doesn't gate on the kind.** The hub relays `com.parler.task` like any part; authorization is
   plain room membership. A status update is only as trustworthy as its signature — verify it the same
   way you verify any message.

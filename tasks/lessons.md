@@ -306,3 +306,9 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   workspace scoping. Scope agent-hosted CLI/hook commands too, include a stable host session id when
   available for same-directory terminals, and preserve ordinary human `parler init` behavior. A full
   `/join/<code>` link must be parsed *before dialing* so its hub is not discarded. (2026-07-12.)
+
+- **A test that only needs an in-memory `Config` must never call `Config::save()` through the default
+  home:** `PARLER_HOME` is process-global and a unit test can otherwise overwrite a developer's real
+  `~/.parler/config.json` (and race parallel tests). Build the `Config` with `Config::create` and pass
+  it directly to the client under test; if persistence is the behavior being tested, isolate it under a
+  test-local home and restore the environment. (2026-07-13.)

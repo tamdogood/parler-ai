@@ -8,8 +8,9 @@
 
 use anyhow::{anyhow, bail, Result};
 use parler_protocol::{
-    estimate_message_tokens, AgentCard, DirectoryEntry, DiscoverScope, EndpointRef, Fact,
-    JoinRequest, Part, RecallHit, RoomInfo, RoomKind, RosterEntry, StoredMessage, Visibility,
+    estimate_message_tokens, AgentCard, Attention, DirectoryEntry, DiscoverScope, DispatchRef,
+    EndpointRef, Fact, JoinRequest, Part, RecallHit, RoomInfo, RoomKind, RosterEntry,
+    StoredMessage, TaskStatus, Visibility,
 };
 use rusqlite::{named_params, params, Connection, OpenFlags, OptionalExtension};
 use std::collections::HashMap;
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS presence (
   agent    TEXT PRIMARY KEY,
   status   TEXT NOT NULL,
   activity TEXT,
+  attention TEXT,
   ts       INTEGER NOT NULL
 );
 
@@ -105,6 +107,41 @@ CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 -- Membership keyed by agent: `members` PK is (room, agent), so "every room an agent is in" (rooms_of,
 -- and the recall room-scope subquery) can't use the PK prefix without this index.
 CREATE INDEX IF NOT EXISTS idx_members_agent ON members(agent);
+
+-- A service-room member becomes a role worker only by calling Serve. Requesters auto-join service
+-- rooms to read results, but are deliberately absent from this table and cannot claim dispatched work.
+CREATE TABLE IF NOT EXISTS service_workers (
+  room       TEXT NOT NULL,
+  agent      TEXT NOT NULL,
+  role       TEXT NOT NULL,
+  registered INTEGER NOT NULL,
+  PRIMARY KEY (room, agent)
+);
+
+-- One live lease per dispatched message. The lease is renewable by its owner and reclaimable after
+-- expiry, giving local supervisors at-least-once execution after a crash without broadcasting work
+-- to every worker forever.
+CREATE TABLE IF NOT EXISTS service_claims (
+  room        TEXT NOT NULL,
+  message     TEXT NOT NULL,
+  worker      TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'active',
+  claimed     INTEGER NOT NULL,
+  lease_until INTEGER NOT NULL,
+  PRIMARY KEY (room, message)
+);
+CREATE INDEX IF NOT EXISTS idx_service_claims_lease ON service_claims(lease_until);
+
+-- A small role index keeps the worker hot path out of the broadcast room log. It is populated only
+-- for a typed `com.parler.dispatch` part, so legacy `send --service` traffic remains a broadcast.
+CREATE TABLE IF NOT EXISTS service_dispatches (
+  room    TEXT NOT NULL,
+  message TEXT NOT NULL,
+  role    TEXT NOT NULL,
+  seq     INTEGER NOT NULL,
+  PRIMARY KEY (room, message, role)
+);
+CREATE INDEX IF NOT EXISTS idx_service_dispatches_ready ON service_dispatches(room, role, seq);
 
 CREATE TABLE IF NOT EXISTS facts (
   id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -317,6 +354,8 @@ impl Store {
         add_column_if_missing(&writer, "rooms", "owner", "TEXT")?;
         add_column_if_missing(&writer, "invites", "require_approval", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&writer, "facts", "embedding_model", "TEXT")?;
+        add_column_if_missing(&writer, "presence", "attention", "TEXT")?;
+        add_column_if_missing(&writer, "service_claims", "state", "TEXT NOT NULL DEFAULT 'active'")?;
         // Estimated communication tokens per message (see `estimate_message_tokens`). When freshly
         // added to an existing DB, backfill historical rows once so a watched session's totals aren't
         // skewed toward zero by messages that predate the column.
@@ -400,12 +439,33 @@ impl Store {
         Ok(())
     }
 
-    pub fn touch_presence(&self, agent: &str, status: &str, activity: Option<&str>, now: i64) -> Result<()> {
+    pub fn touch_presence(
+        &self,
+        agent: &str,
+        status: &str,
+        activity: Option<&str>,
+        attention: Option<Attention>,
+        now: i64,
+    ) -> Result<()> {
         let conn = self.w();
         conn.execute(
-            "INSERT INTO presence (agent, status, activity, ts) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(agent) DO UPDATE SET status = excluded.status, activity = excluded.activity, ts = excluded.ts",
-            params![agent, status, activity, now],
+            "INSERT INTO presence (agent, status, activity, attention, ts) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(agent) DO UPDATE SET status = excluded.status, activity = excluded.activity,
+                 attention = COALESCE(excluded.attention, presence.attention), ts = excluded.ts",
+            params![agent, status, activity, attention.map(Attention::as_str), now],
+        )?;
+        Ok(())
+    }
+
+    /// Refresh just the globally observable attention mode. A connection handshake normally already
+    /// created an `idle` presence row; the insert fallback keeps a direct API caller well-defined
+    /// without guessing an activity string or changing a live worker's status.
+    pub fn set_attention(&self, agent: &str, attention: Attention, now: i64) -> Result<()> {
+        let conn = self.w();
+        conn.execute(
+            "INSERT INTO presence (agent, status, activity, attention, ts) VALUES (?1, 'idle', NULL, ?2, ?3)
+             ON CONFLICT(agent) DO UPDATE SET attention = excluded.attention, ts = excluded.ts",
+            params![agent, attention.as_str(), now],
         )?;
         Ok(())
     }
@@ -428,6 +488,178 @@ impl Store {
             params![room, agent, now],
         )?;
         Ok(())
+    }
+
+    /// Register (or refresh) a service worker. This intentionally sits apart from `members`: a
+    /// requester can join a service room to receive a result, but only a worker that called `serve`
+    /// is eligible for an anycast claim.
+    pub fn serve_role(&self, room: &str, agent: &str, role: &str, now: i64) -> Result<()> {
+        let conn = self.w();
+        conn.execute(
+            "INSERT INTO service_workers (room, agent, role, registered) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(room, agent) DO UPDATE SET role = excluded.role, registered = excluded.registered",
+            params![room, agent, role, now],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically claim one role-dispatched service message. A `None` outcome is ordinary queue
+    /// contention or ineligibility; it intentionally reveals neither another worker's id nor its
+    /// lease details to a requester/non-worker.
+    pub fn claim_service_message(&self, room: &str, message: &str, worker: &str, lease_secs: u64, now: i64) -> Result<Option<i64>> {
+        let conn = self.w();
+        let role: Option<String> = conn
+            .query_row(
+                "SELECT role FROM service_workers WHERE room = ?1 AND agent = ?2",
+                params![room, worker],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(role) = role else { return Ok(None) };
+        let (status, presence_ts): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, ts FROM presence WHERE agent = ?1",
+                params![worker],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None));
+        // New work routes only to a fresh idle/waiting worker. Its existing live owner may renew
+        // while `working`, otherwise the presence update that makes availability visible would make
+        // a long-running task unable to extend its own lease.
+        let owns_live_claim: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM service_claims
+                  WHERE room = ?1 AND message = ?2 AND worker = ?3
+                    AND state = 'active' AND lease_until > ?4)",
+                params![room, message, worker, now],
+                |r| r.get(0),
+            )?;
+        let available = owns_live_claim
+            || (matches!(status.as_deref(), Some("idle") | Some("waiting"))
+                && presence_ts.is_some_and(|ts| now - ts <= PRESENCE_STALE_MS));
+        if !available {
+            return Ok(None);
+        }
+        let parts_json: Option<String> = conn
+            .query_row(
+                "SELECT parts FROM messages WHERE room = ?1 AND id = ?2",
+                params![room, message],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let dispatched = parts_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<Part>>(raw).ok())
+            .is_some_and(|parts| {
+                parts.iter().filter_map(DispatchRef::from_part).any(|dispatch| dispatch.role.eq_ignore_ascii_case(&role))
+            });
+        if !dispatched {
+            return Ok(None);
+        }
+        let lease_until = now.saturating_add((lease_secs as i64).saturating_mul(1000));
+        let changed = conn.execute(
+            "INSERT INTO service_claims (room, message, worker, state, claimed, lease_until)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5)
+             ON CONFLICT(room, message) DO UPDATE SET worker = excluded.worker, state = 'active',
+                 claimed = excluded.claimed, lease_until = excluded.lease_until
+             WHERE service_claims.state = 'active'
+               AND (service_claims.worker = excluded.worker OR service_claims.lease_until <= ?4)",
+            params![room, message, worker, now, lease_until],
+        )?;
+        Ok((changed == 1).then_some(lease_until))
+    }
+
+    /// Return role-dispatched service messages that have never been claimed or whose active lease
+    /// expired. This deliberately ignores the caller's normal room cursor: a queue worker needs to
+    /// notice an expired claim after a process crash, even if it previously read the broadcast room.
+    pub fn queued_service_messages(
+        &self,
+        room: &str,
+        worker: &str,
+        role: &str,
+        limit: Option<u32>,
+        now: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        let conn = self.r();
+        let served: Option<String> = conn
+            .query_row(
+                "SELECT role FROM service_workers WHERE room = ?1 AND agent = ?2",
+                params![room, worker],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if !served.is_some_and(|served| served.eq_ignore_ascii_case(role)) {
+            return Ok(Vec::new());
+        }
+        // Queue visibility itself follows availability. Otherwise a busy worker's supervisor would
+        // repeatedly discover work it is not allowed to claim, making role routing look broadcast
+        // even though the claim is atomic. A worker renewing its own live lease uses `Claim`, not
+        // this queue listing, so only fresh idle/waiting presence belongs here.
+        let (status, presence_ts): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, ts FROM presence WHERE agent = ?1",
+                params![worker],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None));
+        let available = matches!(status.as_deref(), Some("idle") | Some("waiting"))
+            && presence_ts.is_some_and(|ts| now - ts <= PRESENCE_STALE_MS);
+        if !available {
+            return Ok(Vec::new());
+        }
+        let lim = limit.unwrap_or(50).min(200) as i64;
+        let raws = {
+            let mut stmt = conn.prepare(
+                "SELECT m.seq, m.id, m.room, m.author, m.author_name, m.author_role, m.parts,
+                        m.mentions, m.reply_to, m.ts
+                   FROM service_dispatches d
+                   JOIN messages m ON m.id = d.message AND m.room = d.room
+                   LEFT JOIN service_claims c ON c.room = d.room AND c.message = d.message
+                  WHERE d.room = ?1 AND lower(d.role) = lower(?2)
+                    AND (c.message IS NULL OR (c.state = 'active' AND c.lease_until <= ?3))
+                  ORDER BY d.seq ASC LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(params![room, role, now, lim], |r| {
+                Ok(RawMsg {
+                    seq: r.get(0)?,
+                    id: r.get(1)?,
+                    room: r.get(2)?,
+                    author: r.get(3)?,
+                    name: r.get(4)?,
+                    role: r.get(5)?,
+                    parts: r.get(6)?,
+                    mentions: r.get(7)?,
+                    reply_to: r.get(8)?,
+                    ts: r.get(9)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        raws.iter().map(RawMsg::to_stored).collect()
+    }
+
+    /// Complete a live claim. The lease check prevents a late worker from overwriting the outcome
+    /// after another available worker has reclaimed the task.
+    pub fn complete_service_message(
+        &self,
+        room: &str,
+        message: &str,
+        worker: &str,
+        status: TaskStatus,
+        now: i64,
+    ) -> Result<bool> {
+        if !status.is_terminal() {
+            bail!("a service claim can only be completed with a terminal task status");
+        }
+        let changed = self.w().execute(
+            "UPDATE service_claims SET state = ?5, lease_until = ?4
+              WHERE room = ?1 AND message = ?2 AND worker = ?3 AND state = 'active'
+                AND lease_until >= ?4",
+            params![room, message, worker, now, status.label()],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn is_member(&self, room: &str, agent: &str) -> Result<bool> {
@@ -504,20 +736,23 @@ impl Store {
     pub fn roster(&self, room: &str, now: i64) -> Result<Vec<RosterEntry>> {
         let conn = self.r();
         let mut stmt = conn.prepare(
-            "SELECT a.id, a.name, a.role, p.status, p.activity, p.ts, a.last_seen
+            "SELECT a.id, a.name, a.role, p.status, p.activity, p.attention, p.ts, a.last_seen, sw.role
                FROM members mb JOIN agents a ON a.id = mb.agent
                LEFT JOIN presence p ON p.agent = a.id
+               LEFT JOIN service_workers sw ON sw.room = mb.room AND sw.agent = a.id
               WHERE mb.room = ?1
               ORDER BY a.name",
         )?;
         let rows = stmt
             .query_map(params![room], |r| {
                 let raw_status: Option<String> = r.get(3)?;
-                let p_ts: Option<i64> = r.get(5)?;
-                let last_seen: i64 = r.get(6)?;
+                let raw_attention: Option<String> = r.get(5)?;
+                let p_ts: Option<i64> = r.get(6)?;
+                let last_seen: i64 = r.get(7)?;
                 // Self-reported status, decayed to `offline` once the heartbeat goes stale.
-                let status = match (raw_status, p_ts) {
-                    (Some(s), Some(ts)) if now - ts <= PRESENCE_STALE_MS => s,
+                let fresh = p_ts.is_some_and(|ts| now - ts <= PRESENCE_STALE_MS);
+                let status = match (raw_status, fresh) {
+                    (Some(s), true) => s,
                     _ => "offline".to_string(),
                 };
                 Ok(RosterEntry {
@@ -526,6 +761,8 @@ impl Store {
                     role: r.get(2)?,
                     status,
                     activity: r.get(4)?,
+                    attention: fresh.then(|| raw_attention.and_then(|a| Attention::parse(&a))).flatten(),
+                    service_role: r.get(8)?,
                     last_seen: p_ts.unwrap_or(last_seen),
                 })
             })?
@@ -571,7 +808,14 @@ impl Store {
             params![id, room, from.id, from.name, from.role, parts_json, mentions_json, reply_to, ts, tokens, client_id],
         )?;
         if changed == 1 {
-            return Ok(AppendOutcome { id, seq: conn.last_insert_rowid(), tokens, deduped: false });
+            let seq = conn.last_insert_rowid();
+            for dispatch in parts.iter().filter_map(DispatchRef::from_part) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO service_dispatches (room, message, role, seq) VALUES (?1, ?2, ?3, ?4)",
+                    params![room, id, dispatch.role, seq],
+                )?;
+            }
+            return Ok(AppendOutcome { id, seq, tokens, deduped: false });
         }
         // No row inserted ⇒ a client_id conflict: fetch the original message's id + seq and report it
         // as the same success the first send returned. (Reachable only when client_id is Some.)
@@ -968,7 +1212,7 @@ impl Store {
         let conn = self.r();
         let mut stmt = conn.prepare(
             "SELECT d.card_json, d.visibility, d.card_sig, d.verified,
-                    p.status, p.activity, p.ts, a.first_seen, a.last_seen
+                    p.status, p.activity, p.attention, p.ts, a.first_seen, a.last_seen
                FROM directory d
                JOIN agents a ON a.id = d.agent
                LEFT JOIN presence p ON p.agent = d.agent
@@ -1009,7 +1253,7 @@ impl Store {
         let raw: Option<RawDir> = conn
             .query_row(
                 "SELECT d.card_json, d.visibility, d.card_sig, d.verified,
-                        p.status, p.activity, p.ts, a.first_seen, a.last_seen
+                        p.status, p.activity, p.attention, p.ts, a.first_seen, a.last_seen
                    FROM directory d
                    JOIN agents a ON a.id = d.agent
                    LEFT JOIN presence p ON p.agent = d.agent
@@ -1855,6 +2099,7 @@ struct RawDir {
     verified: i64,
     raw_status: Option<String>,
     activity: Option<String>,
+    attention: Option<String>,
     presence_ts: Option<i64>,
     first_seen: i64,
     last_seen: i64,
@@ -1869,9 +2114,10 @@ impl RawDir {
             verified: r.get(3)?,
             raw_status: r.get(4)?,
             activity: r.get(5)?,
-            presence_ts: r.get(6)?,
-            first_seen: r.get(7)?,
-            last_seen: r.get(8)?,
+            attention: r.get(6)?,
+            presence_ts: r.get(7)?,
+            first_seen: r.get(8)?,
+            last_seen: r.get(9)?,
         })
     }
 
@@ -1882,11 +2128,16 @@ impl RawDir {
             (Some(s), Some(ts)) if now - ts <= PRESENCE_STALE_MS => s.clone(),
             _ => "offline".to_string(),
         };
+        let attention = self
+            .presence_ts
+            .filter(|ts| now - ts <= PRESENCE_STALE_MS)
+            .and_then(|_| self.attention.as_deref().and_then(Attention::parse));
         Ok(DirectoryEntry {
             card,
             visibility: Visibility::parse(&self.visibility).unwrap_or(Visibility::Private),
             status,
             activity: self.activity.clone(),
+            attention,
             hub: hub.to_string(),
             verified: self.verified != 0,
             sig: self.sig.clone(),
@@ -1899,10 +2150,47 @@ impl RawDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parler_protocol::{AgentCard, EndpointKind};
+    use parler_protocol::{AgentCard, DispatchRef, EndpointKind, TaskStatus};
 
     fn eref(id: &str, name: &str) -> EndpointRef {
         EndpointRef { id: id.into(), name: name.into(), role: None }
+    }
+
+    #[test]
+    fn role_queue_claims_once_and_uses_fresh_availability() {
+        let s = Store::open(None).unwrap();
+        let room = "svc.review";
+        s.ensure_room(room, RoomKind::Service, None, 1).unwrap();
+        for (id, name) in [("U_A", "alice"), ("U_B", "bob")] {
+            s.upsert_agent(id, name, Some("reviewer"), 1).unwrap();
+            s.add_member(room, id, 1).unwrap();
+            s.serve_role(room, id, "reviewer", 1).unwrap();
+        }
+        // A working worker remains visible in the roster but cannot take *new* work.
+        s.touch_presence("U_A", "working", None, Some(Attention::Focus), 2).unwrap();
+        s.touch_presence("U_B", "idle", None, Some(Attention::Open), 2).unwrap();
+        let out = s
+            .append_message(
+                room,
+                &eref("U_REQUEST", "requester"),
+                &[Part::Text("review this".into()), DispatchRef { role: "reviewer".into() }.to_part()],
+                None,
+                None,
+                None,
+                3,
+            )
+            .unwrap();
+
+        assert!(s.queued_service_messages(room, "U_A", "reviewer", None, 4).unwrap().is_empty());
+        let ready = s.queued_service_messages(room, "U_B", "reviewer", None, 4).unwrap();
+        assert_eq!(ready.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec![out.id.as_str()]);
+        assert!(s.claim_service_message(room, &out.id, "U_A", 60, 4).unwrap().is_none());
+        assert!(s.claim_service_message(room, &out.id, "U_B", 60, 4).unwrap().is_some());
+        // A second available worker cannot duplicate execution while the lease is live.
+        s.touch_presence("U_A", "idle", None, None, 5).unwrap();
+        assert!(s.claim_service_message(room, &out.id, "U_A", 60, 5).unwrap().is_none());
+        assert!(s.complete_service_message(room, &out.id, "U_B", TaskStatus::Done, 6).unwrap());
+        assert!(s.queued_service_messages(room, "U_A", "reviewer", None, 7).unwrap().is_empty());
     }
 
     #[test]
@@ -1929,7 +2217,7 @@ mod tests {
             // Writes — each must land on the single writer connection.
             s.upsert_agent("U_A", "alice", Some("planner"), 10).unwrap();
             s.upsert_agent("U_B", "bob", None, 10).unwrap();
-            s.touch_presence("U_A", "working", Some("things"), 11).unwrap();
+            s.touch_presence("U_A", "working", Some("things"), None, 11).unwrap();
             s.ensure_room("team", RoomKind::Channel, None, 1).unwrap();
             s.add_member("team", "U_A", 1).unwrap();
             s.add_member("team", "U_B", 1).unwrap();
@@ -2358,7 +2646,7 @@ mod tests {
         let s = Store::open(None).unwrap();
         s.upsert_agent("U_PUB", "alice", Some("planner"), 10).unwrap();
         s.upsert_agent("U_PRIV", "bob", None, 11).unwrap();
-        s.touch_presence("U_PUB", "working", Some("planning"), 12).unwrap();
+        s.touch_presence("U_PUB", "working", Some("planning"), None, 12).unwrap();
 
         s.register_card(&card("U_PUB", "alice", &["planning", "ops"], &["plan"]), Some("sig"), true, Visibility::Public, 12).unwrap();
         s.register_card(&card("U_PRIV", "bob", &["review"], &["audit"]), None, false, Visibility::Private, 13).unwrap();

@@ -10,13 +10,14 @@ low-cost, low-ops: one small hub binary + an embedded SQLite store. No external 
      Hermes    ┘   the parler_* tools       └── SQLite memory (message log + FTS recall)
 ```
 
-The three delivery patterns are all just **rooms** with different membership shapes:
+The delivery patterns are all just **rooms** with different membership shapes:
 
 | Pattern | How | CLI |
 |---|---|---|
 | **1:many** | a channel room with N members | `send --room team` |
 | **1:1** | a 2-member DM room | `send --to <agentId>` |
-| **many:1** | a service room many publishers share with the worker(s) | `serve <svc>` + `send --service <svc>` |
+| **many:1 legacy** | a broadcast service room many publishers share with worker(s) | `serve <svc>` + `send --service <svc>` |
+| **role anycast** | one fresh available worker atomically claims typed role work | `work --role <role> --runner <command>` + `send --role <role>` |
 
 ## Build
 
@@ -264,12 +265,20 @@ parler recv --room team --watch
 #   …prints "🤝 handoff → webdev: build the page structure …" the instant alice hands off
 ```
 
-The honest boundary: "bob continues with zero prompting in his *own separate chat*" still needs the
-host to inject a turn on an incoming event. Parler Protocol delivers the handoff instantly and carries the
-intent; where the host exposes turn injection (or via a `recv --watch` worker as above), end-to-end
-autonomous handoff works today. The full argument for why this is the hard part of agent communication,
-with the `HandoffRef` type and the banner, is in
+The honest boundary: "bob continues with zero prompting in his *own separate chat*" needs a host
+injection seam. Parler Protocol delivers the handoff instantly and carries the intent; where that seam
+does not exist, run an explicit local body agent instead:
+
+```bash
+parler work --room team --runner 'codex exec -'
+```
+
+It continuously receives policy-approved peer messages and runs only that local command, so no human
+has to enter the other chat. Attention modes (`open` / `dnd` / `focus`, quiet/muted rooms) decide what
+may interrupt it. The full argument for why this is the hard part of agent communication, with the
+`HandoffRef` type and the banner, is in
 [The hard part of agent communication is the next turn](https://www.parlerprotocol.com/blog/agent-communication-the-next-turn).
+See also [autonomous-runtime.md](autonomous-runtime.md).
 
 ## How "keep the connection going" works
 
@@ -297,11 +306,13 @@ with the `HandoffRef` type and the banner, is in
 | `parler session open [--context C][--topic T][--no-approval][--ttl][--max-uses]` / `session join <key\|link> [--once]` | open a shared session (prints a key + portable link; approval-gated by default) / join one on the link's hub (prints context, then stays connected; `--once` exits after printing) |
 | `parler session requests --room R` / `session approve --room R <id>` / `session deny --room R <id>` | list pending joiners / admit one / reject one (owner only) |
 | `parler session watch --room R [--ttl]` | mint a read-only watch code to view the session from the website (owner only) |
-| `parler serve <svc>` | join a service queue as a worker |
-| `parler send (--room\|--to\|--service) <text>` | send (1:many / 1:1 / many:1) |
+| `parler serve <svc>` | join a legacy broadcast service room as a worker |
+| `parler work --role R --runner CMD` / `parler work --room R --runner CMD` | optional local supervisor: atomically claim role work / continuously run a body agent for a room |
+| `parler send (--room\|--to\|--service\|--role) <text>` | send (channel / DM / legacy service broadcast / role-addressed anycast) |
 | `parler handoff (--room\|--to\|--service) --next S [--summary S][--for WHO][--bundle ID]` | hand the turn to the next agent ("you're up next") |
 | `parler task <status> (--room\|--to\|--service) [--task ID][--note N][--result BLOB][--tokens N][--elapsed-ms N]` | report task status (accepted/working/awaiting/done/failed/cancelled); a terminal status is a signed receipt |
 | `parler recv --room <r> [--since N\|--all][--limit][--watch]` | pull new messages (advances cursor); `--watch` long-polls/streams |
+| `parler attention [open\|dnd\|focus]` / `attention [quiet\|muted\|inherit] --room R` | set global or receiver-local interruption policy |
 | `parler remember [--key K][--room R] <text>` | write a fact (keyed = idempotent) |
 | `parler recall [--room R][--limit] <query>` | full-text recall |
 | `parler push (--room\|--to\|--service) [--base R][--summary S][--note N] [gitref]` | hand off code as a git bundle |
@@ -314,7 +325,7 @@ with the `HandoffRef` type and the banner, is in
 (`parler_open_session`, `parler_join_session`, `parler_close_session`, `parler_join_requests`,
 `parler_approve_join`, `parler_deny_join`, `parler_watch_session`, `parler_bring`, `parler_invite`, `parler_join`,
 `parler_send`, `parler_recv`, `parler_handoff`, `parler_push`, `parler_fetch`, `parler_remember`, `parler_recall`,
-`parler_rooms`, `parler_roster`, `parler_serve`, `parler_presence`). It self-bootstraps an identity on first launch,
+`parler_rooms`, `parler_roster`, `parler_serve`, `parler_presence`, `parler_attention`). It self-bootstraps an identity on first launch,
 so setup is just wiring the server — no `parler init`, no pasted codes.
 
 **The easy way — wire every agent at once** (the single source of truth; the desktop app runs this too):
@@ -367,13 +378,16 @@ the durable cursor (you still `Pull` to read+advance, which also dedups).
 In Claude Code this is **automatic**: `parler connect` installs a `Stop` hook (`parler hook stop`)
 into `~/.claude/settings.json`, so agents in a session poll for each other and continue on their own
 — nobody runs `parler recv`. On a turn's end the hook blocks up to `PARLER_WAKE_WAIT_SECS` (default
-30) for a peer's message (sub-second via push), advances the durable cursor, and hands the message
-back as `{"decision":"block","reason":…}` so the turn resumes; a quiet timeout lets the turn end. It's
+30) for a peer's message (sub-second via push), applies the receiver's attention policy, and hands an
+eligible message back as `{"decision":"block","reason":…}` so the turn resumes; a held quiet/focus
+batch remains durable for later. A quiet timeout lets the turn end. It's
 gated on an active session, so ordinary solo turns pay nothing. Opt out with `parler connect
 --no-hooks`; remove it with `parler connect --remove`.
 
-Other MCP hosts have no `Stop` hook. There, wire the same behavior yourself against `--watch`
-(requires `jq`):
+Other MCP hosts may have no `Stop` hook. If they expose their own turn-injection API, implement the
+same connector wake contract. Otherwise prefer `parler work --room team --runner '<local-agent-command>'`
+for a real autonomous body agent; the old `--watch` script below only prints a notification and cannot
+make an arbitrary host start a model turn:
 
 ```bash
 #!/usr/bin/env bash

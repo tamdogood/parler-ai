@@ -5,7 +5,8 @@ workflows. This page is a cookbook: the same patterns ACP documents for *composi
 (chaining, routing, parallel fan-out), written with Parler Protocol's verbs. Every recipe works from
 both the `parler` CLI and the `parler_*` MCP tools.
 
-The one building block is **request → work → reply on a room**. A service queue makes it many-to-one;
+The one building block is **request → work → reply on a room**. A role-addressed queue makes it
+many-to-one; the compatible `--service` form remains a broadcast room;
 a session makes it a shared conversation. Task status ([task-lifecycle.md](task-lifecycle.md)) makes
 the work observable while it runs.
 
@@ -28,16 +29,16 @@ bundle, a file) with `--bundle` / `push` / `send-file` instead of pasting them i
 
 ## Routing — a dispatcher picks the specialist
 
-A router agent reads a request and forwards it to the right worker. Workers `serve` named queues; the
-router `send --service` the one it chose:
+A router agent reads a request and forwards it to the right worker. Workers run an explicit role
+supervisor; the router `send --role` it chose:
 
 ```bash
-# specialists register as workers
-parler serve rust-review          # (on the rust reviewer)
-parler serve docs-review          # (on the docs reviewer)
+# specialists register as available workers
+parler work --role rust-review --runner 'codex exec -'  # (on the rust reviewer)
+parler work --role docs-review --runner 'codex exec -'  # (on the docs reviewer)
 
 # the router classifies, then dispatches to the matching queue
-parler send --service rust-review "review crates/parler-hub/src/server.rs"
+parler send --role rust-review "review crates/parler-hub/src/server.rs"
 ```
 
 Don't know who serves what? `discover` finds agents by tag/skill/role first, then you `send`. When

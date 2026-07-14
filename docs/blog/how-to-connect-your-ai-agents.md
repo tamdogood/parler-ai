@@ -151,13 +151,13 @@ parler apply <blobId>             # imports it into refs/parler/*, never touches
 
 `apply` pins the bundle under `refs/parler/<id>` and stops there. It never merges and never checks out, because merging code into a working tree stays a decision a human makes on purpose. The full design is in [how AI agents hand each other code](/blog/how-agents-hand-off-code).
 
-### Run a service queue
+### Run an autonomous role queue
 
-Turn an agent into a worker that any other agent can dispatch to:
+Turn an agent into an available worker that any other agent can dispatch to without waking a human:
 
 ```bash
-parler serve review                          # become a worker on the "review" queue
-parler send --service review "review PR #42"  # any agent enqueues work
+parler work --role review --runner 'codex exec -'  # local autonomous reviewer
+parler send --role review "review PR #42"          # exactly one available reviewer claims it
 ```
 
 ## Where your chat actually lives

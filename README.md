@@ -237,6 +237,8 @@ parler recv --room auth-redesign --watch   # the webdev worker blocks here until
 A CLI **and** an MCP server, so any agent can do all of this. Pick what you need. Want the **full map
 of every communication capability** — sessions, DMs, channels, service queues, discovery, turn/code
 handoff, memory, and real-time wake — in one place? See **[docs/communication.md](docs/communication.md)**.
+For continuous autonomous workers, attention policy, and the honest host-wake boundary, see
+**[docs/autonomous-runtime.md](docs/autonomous-runtime.md)**.
 
 #### 🔑 Share a session — pull another agent into your conversation, no copy‑paste
 ```bash
@@ -298,11 +300,30 @@ parler fetch <blobId> --out ./design.pdf     # …downloads it by id (or --name 
 Files ride the exact blob path code bundles do — off the SQLite hot path, member‑gated, never
 buffered on the wire beyond the caps. Details in **[docs/file-transfer.md](docs/file-transfer.md)**.
 
-#### 🛎️ Run a service queue — become a worker; any agent dispatches to it
+#### 🛎️ Run an autonomous role worker — no human needs to prompt the receiving agent
 ```bash
-parler serve review                          # become a worker on the "review" queue
-parler send --service review "review PR #42" # any agent enqueues work
+# local worker: stays connected, claims one request, runs only your explicit local command
+parler work --role review --runner 'codex exec -'
+
+# dispatcher: role-addressed anycast, exactly one idle/waiting reviewer claims it
+parler send --role review "review PR #42"
 ```
+
+`parler send --service review …` is still supported as the legacy broadcast service room. Use
+`--role` when the request should route to one available worker. The worker posts `accepted`, `working`,
+and terminal signed receipts automatically; a crashed worker's bounded lease can be reclaimed. For a
+self-coordinating body agent in a conversation instead of a queue, run
+`parler work --room <joined-room> --runner 'codex exec -'`.
+
+#### 🔕 Control when work may interrupt an agent
+```bash
+parler attention focus                 # only addressed handoffs / matching role work wakes now
+parler attention quiet --room team     # retain ambient team traffic without interrupting
+parler attention muted --room noisy    # consume this room without a wake
+```
+The global `open` / `dnd` / `focus` mode is visible in presence; quiet/muted room overrides remain
+local. A host-native wake adapter continues a supported host directly; otherwise `parler work` is the
+portable autonomous boundary. Details: **[docs/autonomous-runtime.md](docs/autonomous-runtime.md)**.
 
 #### 🧾 Track dispatched work — status updates + a signed receipt on finish
 ```bash
@@ -310,8 +331,9 @@ parler task working --service review --task <reqId> --note "reviewing auth.rs"
 parler task done    --service review --task <reqId> --result <blobId>   # terminal = a signed receipt
 ```
 Report where a unit of service‑queue work stands (`accepted|working|awaiting|done|failed|cancelled`)
-so a dispatcher can *see* progress; a terminal `done`/`failed` is a **verifiable receipt**. It rides
-the ordinary message wire — no new frames — and agents do the same via the **`parler_task`** tool.
+so a dispatcher can *see* progress; a terminal `done`/`failed` is a **verifiable receipt**. Status
+updates ride the ordinary signed message wire; role-anycast claim/complete frames are additive and
+only used by `parler work`. Agents report statuses through the **`parler_task`** tool.
 Full model in **[docs/task-lifecycle.md](docs/task-lifecycle.md)**.
 
 ---
@@ -401,12 +423,12 @@ It checks local configuration integrity, Ed25519 keypair verification, hub reach
 <details>
 <summary><b>The full MCP tool surface</b></summary>
 
-Once registered, an agent exposes all 27 tools: `parler_open_session`, `parler_join_session`,
+Once registered, an agent exposes all 28 tools: `parler_open_session`, `parler_join_session`,
 `parler_close_session`, `parler_join_requests`, `parler_approve_join`, `parler_deny_join`,
 `parler_watch_session`, `parler_register`, `parler_discover`, `parler_card`, `parler_send`,
 `parler_recv`, `parler_handoff`, `parler_task`, `parler_bring`, `parler_push`, `parler_send_file`,
 `parler_fetch`, `parler_apply`, `parler_invite`, `parler_join`, `parler_serve`, `parler_remember`,
-`parler_recall`, `parler_rooms`, `parler_roster`, `parler_presence`. It also serves two MCP
+`parler_recall`, `parler_rooms`, `parler_roster`, `parler_presence`, `parler_attention`. It also serves two MCP
 **prompts** — `parler_session_handoff` (digest the active session so a joiner catches up cheaply) and
 `parler_consolidate_session` (roll the backlog into a saved `session-digest` fact).
 
@@ -425,7 +447,10 @@ outside a session, so ordinary solo turns are unaffected. Tune the wait with `PA
 (default 30). Don't want it? `parler connect --no-hooks` (or remove it any time with
 `parler connect --remove`).
 
-Other MCP hosts have no `Stop` hook — there, wire it yourself against `parler recv`:
+Other MCP hosts need a host-native wake/injection adapter to resume an agent turn. Without one, use
+the portable local supervisor instead: `parler work --room team --runner '<local-agent-command>'`.
+The sketch below is for a host that already accepts a `{"decision":"block"}` wake response; `parler
+recv` alone can report a message but cannot make an arbitrary host start a model turn:
 
 ```bash
 # .claude/hooks/parler-wake.sh  (only needed for non–Claude Code hosts; requires jq)

@@ -1,3 +1,28 @@
+# Autonomous agent runtime, attention, role queues, and local supervision
+
+## Plan
+- [x] Establish the green Rust baseline and map the current Stop-hook/push/cursor path; preserve its
+      durable-pull invariant while making autonomous delivery host-independent.
+- [x] Add an additive, persisted attention policy (open/dnd/focus plus per-room quiet/muted) and
+      expose it consistently through CLI, MCP, presence, and connector decision helpers.
+- [x] Make service work explicitly role-addressed and atomically claimed by an available worker, with
+      presence driving eligibility; retain the existing service-room behavior for old clients.
+- [x] Add an optional local supervisor/worker that holds a live mesh connection, wakes on delivery,
+      invokes an explicitly configured runner, reports lifecycle/task state, and never sits on the
+      message hot path.
+- [x] Add behavior and end-to-end tests, update all user-facing docs/tool references, run the full
+      Rust gate, and self-review the diff.
+
+## Risks
+- The deployed hub and old clients require additive wire/schema changes only; push remains a latency
+  hint and may never advance a cursor or become a delivery authority.
+- A generic MCP server cannot force every host to start a model turn. The supervisor must therefore
+  provide genuine autonomy for explicitly launched runners while host-native hooks remain adapters.
+- Muting/holding traffic must be an intentional local attention choice, never a lossy hub-side cursor
+  filter; service claim races must yield exactly one executor.
+
+---
+
 # Per-room resource quotas + isolation docs
 
 ## Problem
