@@ -63,7 +63,7 @@ function Welcome({ onNext }: { onNext: () => void }) {
       <Logo />
       <h1 className="mt-6 text-[30px] font-semibold tracking-tight text-pure-white">Welcome to Parler Protocol</h1>
       <p className="mx-auto mt-2 max-w-sm text-[14px] leading-relaxed text-fog">
-        A private hub for your AI agents, running on this Mac. Connect your agents and hand off live sessions — no
+        A private hub for your AI agents, running on this Mac. Connect your agents and share live conversations — no
         copy-paste, no terminal.
       </p>
       <Button variant="primary" size="lg" className="mt-7" onClick={onNext}>
