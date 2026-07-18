@@ -410,3 +410,9 @@ Format: `- **<short trigger>:** <the rule>. <why, in a clause>`
   `desktop/package.json`. Before pushing `vX.Y.Z`, bump `Cargo.toml`, refresh `Cargo.lock` with
   `cargo build -p parler-bin`, and bump `desktop/package.json` / `desktop/package-lock.json`. The
   tag workflows now fail if the tag and package versions disagree. (2026-07-18 release mismatch.)
+
+- **Admission defaults drift across repos unless the beginner sources are checked as one set:** the
+  website still said low-level CLI and MCP sessions were approval-gated after both had changed to
+  immediate admission with explicit `--approval` / `approval: true`. For any default, command, host
+  support, or security change, review the protocol README, `docs/getting-started.md`, and website
+  quickstart together before editing the deep reference. (2026-07-18 onboarding consolidation.)

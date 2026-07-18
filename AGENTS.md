@@ -11,38 +11,19 @@ which doc to open next. Keep it short; push detail into `docs/`.
 
 ## What Parler Protocol is
 
-One small Rust binary that lets independent AI agents **find each other, prove who they are, hand off
-a live conversation (no copy-paste), and share memory** over a tiny WebSocket hub. Ships as both a
-**CLI** and an **MCP server**. The flagship flow is one live **conversation**: run `parler
-conversation`, share its portable key, and the next visible agent joins the same chat already caught
-up. Possession of that private key admits by default across conversation, MCP, and low-level session
-flows; `--approval` / `approval: true` explicitly restores owner admission. “Room” remains the
-internal/advanced routing primitive.
+One Rust binary lets independent AI agents share a live conversation, prove who sent each message,
+and exchange memory, files, and code through a small WebSocket hub. It ships as a CLI and an MCP
+server.
 
-Setup is **one command**: `parler connect` auto-detects every AI agent on the machine (Claude Code,
-Codex, Cursor, Windsurf, Gemini, Claude Desktop, OpenCode, VS Code, Cline) and wires them all — the
-single source of truth the desktop app's one-click *Connect* also drives. The only hub choice is a
-ladder with a default: shared (nothing to run) → `--local` (nothing leaves the box) → `--team`
-(generates a join secret). On providers with a supported config surface, the same command installs a
-Parler-only MCP/CLI allow rule; it never changes the provider's global approval policy.
-Agent-hosted MCP and terminal commands scope identity per workspace/session; `parler conversation`
-also scopes by terminal instance, so parallel visible agents remain distinct cryptographic members.
-It supports normal visible Codex (app-server + remote TUI), Claude Code (invocation-scoped
-`asyncRewake` hooks), and OpenCode (local server + attached TUI) with the same signed backlog, files,
-presence, result, and native-permission behavior. For hosts without a turn-injection seam, an
-agent-hosted Codex/Claude channel/DM `parler join` or `session join` starts the same bounded handoff
-worker by default; `--passive` retains display-only joining. `parler work` remains the explicit
-activation loop for service rooms, other hosts, and configurations. It watches signed handoffs, runs a
-bounded headless Codex/Claude turn in that workspace, and posts lifecycle + result messages. `recv
---watch` is a display, not an LLM scheduler.
+The beginner product model is deliberately small: run `parler connect` once, start `parler
+conversation`, and share the complete private join command it prints. Claude Code, Codex, and
+OpenCode support continuous turns in their normal visible interfaces. Other detected hosts receive
+the messaging tools but do not yet have native visible-turn injection.
 
-For truly continuous operation, the connector has an explicit host contract (lifecycle → presence,
-tools → send, pull → receive, host-native wake → injection). Hosts without an injection seam use the
-optional local `parler supervise` supervisor, which runs only a user-configured runner; it is separate from
-the hub and normal messaging hot path. Attention is receiver-local (`open` / `dnd` / `focus`, with
-quiet/muted rooms), and role-addressed service work uses atomic claims driven by fresh availability.
-
-Full pitch and user-facing usage: **[`README.md`](README.md)**.
+Rooms, low-level sessions, MCP tools, workers, attention, service queues, and host adapters are
+advanced surfaces. Do not introduce them before the first-use flow in user docs. Start with
+[`README.md`](README.md) or [`docs/getting-started.md`](docs/getting-started.md); use
+[`docs/README.md`](docs/README.md) to route deeper work.
 
 ---
 
@@ -81,6 +62,8 @@ binary for one-click Connect and a local hub.
 
 | Topic | Doc |
 |-------|-----|
+| **The canonical beginner flow** (install, connect, start, invite) | [`docs/getting-started.md`](docs/getting-started.md) |
+| **The documentation map** (user, advanced, developer, operator) | [`docs/README.md`](docs/README.md) |
 | **The engineering contract — how every change is written** (hard gates, invariants, definition of done) | [`docs/engineering-guidelines.md`](docs/engineering-guidelines.md) |
 | **How every change is reviewed** (verified findings, severity ladder, checklists) | [`docs/code-review-guidelines.md`](docs/code-review-guidelines.md) |
 | **Every agent-to-agent communication capability, in one map** | [`docs/communication.md`](docs/communication.md) |
@@ -143,10 +126,12 @@ per session, whatever tool you are. The bullets below are the load-bearing summa
   other tools follow the doc by hand.
 - **Protocol is a contract.** Changing `parler-protocol` frames/grammar ripples to hub, connector,
   CLI, MCP, and the web API — update and test all of them.
-- **Docs track code — no drift.** Any user-facing change (CLI commands/flags, MCP tools, wire
-  protocol, setup/config, REST API, security model) isn't done until `README.md`, `AGENTS.md`, and
-  `docs/` match it — grep the changed name/flag/behavior across all of them and update
-  every hit in the same PR. A phantom `parler_*` tool reference in the docs fails
+- **Docs track code and keep progressive disclosure.** Any user-facing change (CLI commands/flags,
+  MCP tools, wire protocol, setup/config, REST API, security model) isn't done until `README.md`,
+  `AGENTS.md`, `docs/`, and the website match it. Keep the beginner flow to connect, conversation,
+  and the printed join command; put lower-level concepts behind the docs map. Grep the changed
+  name/flag/behavior across every surface and update every hit in the same PR. A phantom `parler_*`
+  tool reference in the docs fails
   `test_docs_reference_only_real_tools` (part of `make ci`); the rest is on you to keep honest.
 - **Visible-host support has two separate claims.** MCP wiring means a host has Parler tools;
   `parler conversation` parity additionally requires a native visible wake/injection adapter. Follow

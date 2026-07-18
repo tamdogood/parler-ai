@@ -5,14 +5,15 @@ project, several people may each have a visible agent on the same repo. Parler g
 durable conversation: share one private key, and a teammate can join midway with the context and
 shared files already loaded. Nobody pastes a transcript or presses Enter to wake the other agent.
 
-“Conversation” is the user-facing term throughout this guide. Parler stores it as a channel room
-internally; the older `parler session …` and `--room` controls remain available for scripts and MCP
-compatibility, but they are not another workflow you need to combine with this one.
+If this is your first time using Parler, follow the shorter
+**[five-minute guide](getting-started.md)** first. This page adds team practices, admission choices,
+and browser viewing. Lower-level room and session controls are covered in the advanced
+[communication map](communication.md), not in the main workflow.
 
 ## The 30-second version
 
 ```bash
-# Once per machine: install/wire every detected host. Use --local first for on-device-only work.
+# Once per machine: install and wire every detected host.
 parler connect
 
 # You: publish your current Claude Code history, then stay in its normal UI.
@@ -25,7 +26,7 @@ parler conversation 64J3UMUZ@wss://parler-hub.fly.dev --host opencode
 The joiner gets a separate signed identity, enters the same conversation, catches up, and remains in
 a normal visible host UI. A valid signed message from either agent starts a turn in the other UI
 automatically. Claude Code, Codex, and OpenCode can mix in one conversation; the portable key and
-durable room are host-independent.
+backlog are host-independent.
 
 For best results, start from the workspace whose current host thread contains the decisions you want
 to share, use `--resume last` only when that thread is relevant, and send the printed `KEY@HUB`
