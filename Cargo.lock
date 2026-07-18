@@ -1065,7 +1065,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1145,7 +1145,7 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tower-http",
  "tracing",
@@ -1159,7 +1159,7 @@ version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
