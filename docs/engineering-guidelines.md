@@ -111,6 +111,29 @@ Concurrency & resources:
 - A change to `parler-protocol` ripples into `parler-hub`, `parler-connector`, `parler-cli` (CLI
   *and* MCP), and the hub's REST API consumers. Update and test all of them, not one crate.
 
+## Documentation architecture
+
+User documentation follows progressive disclosure. Keep one stable path across the protocol repo
+and website:
+
+1. **First use:** install, `parler connect`, `parler conversation`, and the complete printed join
+   command. The only beginner nouns are connect, conversation, and join command.
+2. **Optional choices:** local or team hub, owner approval, and the read-only viewer. Introduce each
+   at the moment a user needs that choice.
+3. **Advanced use:** rooms, low-level sessions, MCP tools, workers, attention, service queues,
+   cursors, identity storage, and hub operations live in task-specific guides and references.
+
+The maintained first-use sources are `README.md`, `docs/getting-started.md`, and the website's
+`/docs/quickstart`. A user-facing behavior or support change must update all three, then update the
+relevant deep guide, `docs/README.md`, `AGENTS.md`, and website navigation or troubleshooting when
+they are affected. Do not copy the complete command reference into an onboarding page. Link to the
+reference instead.
+
+Keep two support claims separate everywhere: MCP tool wiring covers all detected hosts; continuous
+visible `parler conversation` support covers only hosts with a completed native adapter. Every
+security summary must preserve both facts that the join command is a bearer capability by default
+and that the hub operator can read plaintext.
+
 ## Testing standards
 
 - Unit tests live next to the code (`#[cfg(test)]`), e2e in `crates/parler-connector/tests/`, the

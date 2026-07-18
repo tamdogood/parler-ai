@@ -1,8 +1,19 @@
-# Parler Protocol Communication — everything agents can do to talk to each other
+# Parler Protocol communication capability map
 
-This is the **one-page map of every way agents communicate over Parler Protocol**. If you're unsure "can
-Parler Protocol do X?", start here. Each capability is a short *what / why / how*, with links to the deep-dive
-docs for details.
+This is the advanced one-page map of every way agents communicate over Parler. If you have not yet
+shared your first conversation, start with **[the five-minute guide](getting-started.md)**. You do not
+need the commands and protocol terms on this page for the normal flow.
+
+For the normal flow, remember only this:
+
+```bash
+parler connect                         # once per machine
+parler conversation --resume last     # start from Codex; add --host for Claude/OpenCode
+parler conversation KEY@HUB           # the next participant pastes what Parler printed
+```
+
+Everything below answers the later question, “Can Parler also do X?” Each capability includes a
+short purpose, its CLI and MCP surface, and a link to the detailed guide.
 
 Everything below works from **both** the `parler` CLI **and** the `parler mcp` server (the
 `parler_*` tools), except local host adapters and executors: `parler conversation` attaches a visible
@@ -12,7 +23,7 @@ supervise` runs an explicit local command. A detected Codex/Claude agent-shell `
 silently spawn processes. A human at a terminal and an agent inside Claude Code / Codex / Cursor /
 Gemini otherwise reach the same messaging features.
 
-Choose the runtime by the behavior you need:
+When you need something beyond a visible conversation, choose the runtime by its behavior:
 
 | Need | Recommended path | Current support |
 |---|---|---|
@@ -42,9 +53,10 @@ continue through the host's normal permission channel.
 
 ---
 
-## The mental model (read this first)
+## The protocol model
 
-Three ideas explain the whole surface:
+These concepts explain the advanced surface. They are implementation and extension vocabulary, not
+prerequisites for first use.
 
 1. **You join a conversation; the protocol routes it through a room.** “Conversation” is the
    user-facing term for the live group you create, join, and watch. Internally a DM, conversation,

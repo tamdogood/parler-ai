@@ -1,3 +1,23 @@
+# Simplify first-use documentation
+
+## Plan
+- [x] Make one three-step onboarding path canonical: install/connect, start or resume a conversation, share the printed join command.
+- [x] Rewrite the protocol README and docs index around progressive disclosure; add one beginner guide and keep rooms, sessions, MCP, workers, and hub internals in advanced guides.
+- [x] Add a documentation maintenance contract so user-facing changes stay aligned across the protocol repo and `parler-web`.
+- [x] Mirror the same information architecture and wording in the website landing page, quickstart, concepts, conversation guide, navigation, and developer README.
+- [x] Run both documentation/build gates and review both repository diffs for command, support, security, and terminology drift.
+
+## Risks
+- The shorter path must not imply continuous visible support for hosts beyond Claude Code, Codex, and OpenCode.
+- A conversation key is a bearer capability, and the shared hub sees plaintext; both warnings must remain visible without overwhelming first use.
+- Low-level commands remain supported, so consolidation must move them behind clear links rather than erase their reference documentation.
+
+## Review
+- Replaced the 800-line root README with a 192-line first-use page and added one canonical five-minute guide.
+- Kept visible-host support, bearer-key admission, and plaintext hub boundaries explicit in both repositories.
+- Corrected stale website claims: CLI and MCP low-level sessions now document immediate admission by default and explicit approval opt-in, matching the tested implementation.
+- Verified the protocol repository with `make ci` and the website with `npm run build` (122 static pages).
+
 # Session viewer deep links
 
 ## Plan

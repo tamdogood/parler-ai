@@ -1,8 +1,15 @@
-# Troubleshooting agent setup and MCP startup
+# Troubleshooting setup and conversations
 
-This guide covers the most common setup failure: an MCP host, such as Codex, waits for Parler to
-connect to a hub that is no longer running. It also explains how to move agents back to the shared
-hub without editing MCP configuration files by hand.
+Start with the built-in diagnostic. It covers configuration, hub reachability, identity, join
+secrets, and detected host wiring:
+
+```bash
+parler doctor
+```
+
+Most first-use failures come from an agent app that was not restarted after `parler connect`, two
+participants pointing at different hubs, or an old local hub that is no longer running. The sections
+below fix those cases without editing MCP configuration files by hand.
 
 ## Start with the default: the shared hub
 
